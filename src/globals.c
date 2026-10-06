@@ -153,18 +153,20 @@ int      ColorHashCount;                /* 0x180BA88 */
 int     *ColorHashPalette;              /* 0x180A56C */
 
 /* deflate block state */
-int      LenPairs[60];             /* 0x1809390: 30 (base, extra) pairs */
-int      DistPairs[56];            /* 0x1809480: 28 (base, extra) pairs */
-unsigned char LenCodeToSlotStore[255 + 256]; /* 0x180BA7F - 255, see pngout.h */
-unsigned char DistCodeToSlot[32768];    /* 0x41CEBF */
+int      CodePairs[CODE_PAIRS * 2];  /* 0x1809390: 59 (extra, base) pairs */
+unsigned char LenCodeToSlotStore[259];    /* 0x180B97D .. 0x180BA7F */
+unsigned char DistCodeToSlot[32768];    /* 0x414EC0 */
 int      LenHuffIndex;                  /* 0x1809560 */
 int      LenHuffCount;                  /* 0x1809564 */
 int      DistTablesDone;                /* 0x18CBEF0 */
 
-unsigned CurMatch;                      /* 0x412678 */
-int      HashPrev[511];                 /* 0x41267C */
-int      HashHead[4096];                /* 0x412EC0 */
-int      DistSlot[32768];               /* 0x41CEC8 */
+/* 0x412678 and 0x41267C are one array of 512 dwords; see the macros in
+   pngout.h.  MatchCost[] is it, and CurMatch/HashPrev are entry 0 and the
+   other 511. */
+int      MatchCost[512];               /* 0x412678 */
+int      MatchLimit;                   /* 0x412668 */
+int      HashHead[4096];                /* 0x412EC0, used as shorts */
+int      DistSlot[32768];               /* 0x41CEC8, used as shorts */
 int      MatchArea[0x8000];             /* 0x6B4968, the LZ work area */
 
 /* the /b block list, 0x42F364: five fields per block record */
@@ -175,7 +177,22 @@ unsigned char *LinBufData;            /* dword_18CBEE4: LinBuf + 4 */
 /* per row match slots */
 int      DistSlots[64];                 /* 0x6D5578 */
 unsigned char SlotOrder[32];              /* 0x185BA90 */
-int      FreqA, FreqB;                 /* 0x6F6678, 0x6F6AF8 */
+int      LitCodes[286];                 /* 0x6F6678 */
+int      DistCodes[32];                /* 0x6F6AF8 */
+
+/* the LZ coder, src/lz.c */
+unsigned char LzWindow[65540];           /* 0x6F6B80, +0x10000 is 0x706B80 */
+int      LzWrite;                       /* 0x6D4968 */
+int      LzScan;                        /* 0x6F6B78 */
+int      RunEnd;                        /* 0x41CEC0 */
+int      RunCount;                      /* 0x411D58 */
+unsigned short RunLen[65536];           /* 0x185BED8 */
+int      MatchStart[32768];             /* 0x6D6670 */
+int      PrevReach;                     /* 0x185BEC8 */
+int      PrevMark;                      /* 0x185BEB8 */
+int      MatchList[0x80000];            /* 0x706B88 */
+unsigned short StepTable[LZ_STEPCAP + 260]; /* 0x806B82 */
+int      BestCost[256];                 /* 0x6D5170 */
 
 /* 0x42E560: the histogram the filter trials fill, 256 dwords */
 int      Entropy[256];
@@ -187,7 +204,7 @@ int      EntropyLutSize;               /* dword_18CBEE4                        *
 int     (*CheckEscHook)(int);            /* dword_6F6670: polled by the trials  */
 int      MinSample;                      /* dword_185BEC0: darkest sample in the image */
 int      unk_185BEC8, unk_180BA84, unk_185BEB8, unk_411D58, unk_41CEC0;
-int      unk_6D4968, unk_6F6B78, unk_42D7C8;
+int      unk_42D7C8;
 unsigned char unk_42E55C;
 
 /* ------------------------------------------------------------------ */

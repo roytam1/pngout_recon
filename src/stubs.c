@@ -47,24 +47,10 @@ int Optimize(SETTINGS *s)
 }
 
 /* ---------------------------------------------------------------- */
-/*  sub_406530: the compressing sink FilterByte() can be pointed at.
-    It updates the Adler-32 and hands the byte to the LZ coder
-    (sub_4065A0), which is the next piece to reconstruct - FilterByte()
-    compares the sink pointer against this one, so it has to exist.  */
-/* ---------------------------------------------------------------- */
-
-int CompressByte(int byte)
-{
-    (void)byte;
-    NotReconstructed("the LZ coder sub_4065A0, via CompressByte()", "0x406530");
-    return 0;
-}
-
-
-/* ---------------------------------------------------------------- */
 /*  0x40E584 - the MSVC user math error handler.  VC6's startup
-   (_setusermatherr in start+7C) picks this up by name.      */
+    (_setusermatherr in start+7C) picks this up by name.      */
 /* ---------------------------------------------------------------- */
+
 
 int _UserMathErrorFunction(void)
 {

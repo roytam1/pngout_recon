@@ -23,13 +23,14 @@ cl.exe /nologo /MD /W3 /D_CRT_SECURE_NO_DEPRECATE /I"%ROOT%\src" /c ^
     "%ROOT%\src\predict.c" ^
     "%ROOT%\src\cpuid.c" ^
     "%ROOT%\src\optimize.c" ^
+    "%ROOT%\src\lz.c" ^
     "%ROOT%\src\globals.c" ^
     "%ROOT%\src\stubs.c" > test.log 2>&1
 if errorlevel 1 goto :failed
 
 link.exe /nologo /OUT:test_chunk.exe ^
     test_chunk.obj test_support.obj chunk.obj ^
-    predict.obj cpuid.obj optimize.obj globals.obj stubs.obj ^
+    predict.obj cpuid.obj optimize.obj lz.obj globals.obj stubs.obj ^
     user32.lib gdi32.lib >> test.log 2>&1
 if errorlevel 1 goto :failed
 

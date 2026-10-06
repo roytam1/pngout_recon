@@ -183,10 +183,184 @@ static int esc_hook(int unused)
     return 1;                     /* the user pressed ESC */
 }
 
+/* ------------------------------------------------------------------ */
+/*  the LZ coder: give the rows a code the test can read back, run the */
+/*  coder over some bytes, and put the symbols back together to see    */
+/*  whether the stream carries the data it was given                   */
+/* ------------------------------------------------------------------ */
+
+/*
+ *  The coder emits a literal as one symbol and a match as four, with no way
+ *  to tell them apart from the bit widths alone.  So the test pins the codes
+ *  to a shape with a tag bit:
+ *
+ *      a literal   1 tag bit 0, then 8 bits of byte
+ *      a length    1 tag bit 1, then 5 bits of slot, then the extra bits
+ *      a distance  1 tag bit 1, then 5 bits of slot, then the extra bits
+ *
+ *  The lengths are the row's own code lengths (field +0x510 for literals,
+ *  +0x89C for the length codes and +0x990 for the distance codes), and the
+ *  codes are what sub_405800 (RankValues) leaves in dword_6F6678 / 6F6A04 /
+ *  6F6AF8 - the test overwrites those three with fixed values, which is the
+ *  only part of the setup that is not what EmitBlock would do.
+ */
+#define LZ_LITBITS 9
+#define LZ_CODEBITS 6
+
+static unsigned char *lzbits;
+static int lzbitpos;
+static int lzfail;
+
+#define LZFAIL(n)  do { lzfail = pos * 100 + (n); return -1; } while (0)
+
+static int lzget(int n)
+{
+    int v = 0, i;
+
+    for (i = 0; i < n; i++) {
+        v |= ((lzbits[lzbitpos >> 3] >> (lzbitpos & 7)) & 1) << i;
+        lzbitpos++;
+    }
+    return v;
+}
+
+/*
+ *  Put the symbols back together.  A match copies its bytes out of what has
+ *  already been rebuilt, exactly as a decoder would, so a match the coder
+ *  invented cannot pass.  Returns the number of bytes, or -1 if the stream
+ *  does not parse.
+ */
+static int lzdecode(int nbits, unsigned char *to, int want,
+                    int *nmatch, int *longest, int *trailing)
+{
+    int pos = 0, i;
+
+    lzbitpos = 0;
+    lzfail = 0;
+    *nmatch = 0;
+    *longest = 0;
+
+    while (pos < want) {
+        if (lzget(1) == 0) {
+            to[pos++] = (unsigned char)lzget(8);
+            continue;
+        }
+        {
+            int lslot;
+            int lslot_dbg;
+            int dslot, mlen, mdist;
+
+            lslot_dbg = lzget(5);
+            lslot = lslot_dbg + 30;         /* the pair index, 30..58 */
+
+            if (lslot - 30 >= LEN_CODES)
+                LZFAIL(1);
+            mlen = lzget(LenCodeExtra(lslot - 30)) + LenCodeBase(lslot - 30);
+
+            if (lzget(1) == 0)
+                LZFAIL(2);
+            dslot = lzget(5);
+            if (dslot >= DIST_CODES)
+                LZFAIL(3);
+            mdist = lzget(DistCodeExtra(dslot)) + DistCodeBase(dslot);
+
+            if (mlen < 3 || mlen > 258)
+                LZFAIL(4);
+            if (mdist < 1 || mdist > pos)
+                LZFAIL(5);
+            if (pos + mlen > want)
+                LZFAIL(6);
+            for (i = 0; i < mlen; i++)
+                to[pos + i] = to[pos - mdist + i];
+            pos += mlen;
+            (*nmatch)++;
+            if (mlen > *longest)
+                *longest = mlen;
+        }
+    }
+    *trailing = nbits - lzbitpos;
+    return pos;
+}
+
+static IMAGEDESC lzimg;
+static unsigned char lzout[1 << 17];
+static unsigned char lzinput[8192];
+static unsigned char lzgot[8192];
+
+/*
+ *  Everything EmitBlock and sub_4058A0 set up, with the row's code pinned to
+ *  the shape above.  `rows` blocks of `limit` bytes each.
+ */
+static void lzsetup(int strategy, int limit)
+{
+    int i;
+
+    memset(&lzimg, 0, sizeof(lzimg));
+    memset(lzout, 0, sizeof(lzout));
+    Image = &lzimg;
+    lzimg.strategy = strategy;
+    lzimg.ndistinct = 2;
+    lzimg.outbuf = lzout;
+    lzimg.outsize = sizeof(lzout);
+
+    RowCount = 1;
+    RowIndex = 0;
+    OutCount = 0;
+    BitBuf = 0;
+    BitCount = 0;
+    BitCrc = 0xFFFFFFFFu;
+    AdlerSum = 1;
+    RowHeaderCode = 0;
+    RowCost = 0;
+    lzbits = lzout;
+
+    for (i = 0; i < ROW_SAMPLE_MAX; i++) {
+        ROWOF(0, ROW_SAMPLES)[i] = 0;
+        ROWOF(0, ROW_SYMBOLS)[i] = LZ_LITBITS;
+    }
+    for (i = 0; i < ROW_SAMPLE_SYMS; i++)
+        ROWOF(0, ROW_SYMBOLS)[i] = LZ_LITBITS;
+    for (i = 0; i < 59; i++)
+        ROWOF(0, ROW_LENBITS)[i] = LZ_CODEBITS;
+    for (i = 0; i < ROW_DISTSLOTS; i++)
+        ROWOF(0, ROW_DISTBITS)[i] = LZ_CODEBITS;
+    *ROWOF(0, ROW_ROWBITS) = 0;
+    *ROWOF(0, ROW_LIMIT) = limit;
+
+    InitCrcTable();
+    BuildDeflateTables();
+    InitBlockTables();
+
+    /*
+     *  The codes RankValues() left behind are replaced by the tagged ones.
+     *  PutBits() sends a code least significant bit first, so the *leading*
+     *  tag bit has to be bit 0 of the code: a literal is 9 bits, bit 0 clear,
+     *  bits 1..8 the byte; a length or distance code is 6 bits, bit 0 set,
+     *  bits 1..5 the slot.
+     */
+    for (i = 0; i < 256; i++)
+        LitCodes[i] = i << 1;                  /* bit 0 clear: a literal */
+    for (i = 0; i < LEN_CODES; i++)
+        LitCodes[257 + i] = 1 | (i << 1);      /* bit 0 set: a match   */
+    for (i = 0; i < ROW_DISTSLOTS; i++)
+        DistCodes[i] = 1 | (i << 1);
+}
+
+/* push `n` bytes through the coder the way FilterByte()'s sink does */
+static void lzfeed(const unsigned char *p, int n)
+{
+    int i;
+
+    for (i = 0; i < n; i++)
+        LzCode(p + i, 1);
+}
+
 int main(void)
 {
     unsigned char buf[4096];
     int w, h, fmt, i;
+
+    setvbuf(stdout, NULL, _IONBF, 0);
 
     /* ---------------- Swap16 ---------------- */
     check("Swap16(0x1234)", Swap16(0x1234), 0x3412);
@@ -690,60 +864,147 @@ int main(void)
 
         BuildDeflateTables();
 
-        printf("info &EmitBlock=%p LenPairs[0..5]=%d,%d,%d,%d,%d,%d\n",
-               (void *)EmitBlock, LenPairs[0], LenPairs[1], LenPairs[2],
-               LenPairs[3], LenPairs[4], LenPairs[5]);
-        printf("info LenBase/Extra:");
+        printf("info &EmitBlock=%p CodePairs[0..5]=%d,%d,%d,%d,%d,%d\n",
+               (void *)EmitBlock, CodePairs[0], CodePairs[1], CodePairs[2],
+               CodePairs[3], CodePairs[4], CodePairs[5]);
+        printf("info distance (extra,base):");
         for (i = 0; i < 12; i++)
-            printf(" (%d,%d)", LenPairs[2*i], LenPairs[2*i+1]);
+            printf(" (%d,%d)", CodePairs[2*i], CodePairs[2*i+1]);
         printf("\n");
-        printf("info DistBase/Extra:");
+        printf("info length (extra,base):");
         for (i = 0; i < 12; i++)
-            printf(" (%d,%d)", DistPairs[2*i], DistPairs[2*i+1]);
+            printf(" (%d,%d)", CodePairs[2*(30+i)], CodePairs[2*(30+i)+1]);
         printf("\n");
-
-        /* bases must increase and extra bits must never decrease */
-        ok = 1;
-        for (i = 1; i < 30; i++) {
-            if (LenPairs[2*i] < LenPairs[2*(i-1)]) ok = 0;
-            if (LenPairs[2*i+1] < LenPairs[2*(i-1)+1]) ok = 0;
-        }
-        check("length table is monotone", ok, 1);
-
-        ok = 1;
-        for (i = 1; i < 28; i++) {
-            if (DistPairs[2*i] < DistPairs[2*(i-1)]) ok = 0;
-            if (DistPairs[2*i+1] < DistPairs[2*(i-1)+1]) ok = 0;
-        }
-        check("distance table is monotone", ok, 1);
 
         /*
-         *  In the length table the *second* field is the cumulative base
-         *  (1,2,3,4,5,7,9,13,17,25,33,49,...) and the first is the number of
-         *  extra bits, stepping up every second code.  So the span of code i
-         *  is base2[i+1] - base2[i] and must equal 2^extra1[i].
+         *  The two halves are RFC 1951's tables, so pin them against it: a
+         *  swapped pair or a missing top code would still be monotone, and
+         *  monotone is not enough - the stream has to be readable by anything
+         *  that implements deflate.
+         */
+        {
+            static const int dist_want[30] = {
+                1, 2, 3, 4, 5, 7, 9, 13, 17, 25,
+                33, 49, 65, 97, 129, 193, 257, 385, 513, 769,
+                1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385,
+                24577
+            };
+            static const int len_want[29] = {
+                3, 4, 5, 6, 7, 8, 9, 10, 11, 13,
+                15, 17, 19, 23, 27, 31, 35, 43, 51, 59,
+                67, 83, 99, 115, 131, 163, 195, 227, 258
+            };
+
+            ok = 1;
+            for (i = 0; i < 30; i++)
+                if (DistCodeBase(i) != dist_want[i])
+                    ok = 0;
+            check("the distance bases are RFC 1951's", ok, 1);
+
+            ok = 1;
+            for (i = 0; i < 29; i++)
+                if (LenCodeBase(i) != len_want[i])
+                    ok = 0;
+            check("the length bases are RFC 1951's", ok, 1);
+
+            ok = 1;
+            for (i = 0; i < 29; i++)
+                if (LenCodeExtra(i) != (i < 8 ? 0 : i < 28 ? (i - 4) / 4 : 0))
+                    ok = 0;
+            check("and so are the length extra bits", ok, 1);
+
+            /*
+             *  And every value has to get RFC's code for it - the table is
+             *  indexed by value-1, and a code is only right if the value sits
+             *  inside that code's own base .. base + 2^extra - 1 range.
+             */
+            ok = 1;
+            for (i = 1; i <= 32768; i++) {
+                int c = DistCodeToSlot[i - 1];
+
+                if (c < 0 || c >= DIST_CODES)
+                    ok = 0;
+                else if (i < DistCodeBase(c) ||
+                         i > DistCodeBase(c) +
+                             (1 << DistCodeExtra(c)) - 1)
+                    ok = 0;
+            }
+            check("every distance gets RFC's code", ok, 1);
+
+            /* the real check: the code's base and extra must span the length */
+            ok = 1;
+            for (i = 3; i <= 258; i++) {
+                int c = LenCodeOf(i) - 30;
+
+                if (i < LenCodeBase(c) ||
+                    i > LenCodeBase(c) + (1 << LenCodeExtra(c)) - 1)
+                    ok = 0;
+            }
+            check("every length gets RFC's code", ok, 1);
+        }
+
+        /*
+         *  Bases increase and extra bits never decrease *within* each half.
+         *  Across the boundary between them they do not - the last distance
+         *  base is 24577 and the first length base is 3 - because the halves
+         *  are two separate tables that happen to be adjacent, which is why a
+         *  reconstruction that reads them as one sequence goes wrong.
+         *
+         *  The length half has one more exception, and it is RFC 1951's: the
+         *  last two codes overlap.  Symbol 284 covers 227..258 with 5 extra
+         *  bits and symbol 285 is 258 with *no* extra bits, so the extra bit
+         *  count drops from 5 to 0 and the span of 284 is one short of 2^5.
+         *  The original stores that last pair by hand (`mov dword_1809564,
+         *  102h`) rather than generating it, which is how it survives its own
+         *  loop.
          */
         ok = 1;
-        for (i = 0; i < 29; i++) {
-            if (LenPairs[2*(i+1)+1] - LenPairs[2*i+1] != (1 << LenPairs[2*i]))
-                ok = 0;
+        for (i = 1; i < DIST_CODES; i++) {
+            if (CodePairs[2*i] < CodePairs[2*(i-1)]) ok = 0;
+            if (CodePairs[2*i+1] < CodePairs[2*(i-1)+1]) ok = 0;
         }
-        check("length spans are 2^extra", ok, 1);
+        for (i = 31; i < CODE_PAIRS - 1; i++) {
+            if (CodePairs[2*i] < CodePairs[2*(i-1)]) ok = 0;
+            if (CodePairs[2*i+1] < CodePairs[2*(i-1)+1]) ok = 0;
+        }
+        check("each half of the table is monotone", ok, 1);
 
+        /* and every code's span is exactly 2^extra, within its half */
         ok = 1;
-        for (i = 0; i < 27; i++) {
-            if (DistPairs[2*(i+1)] - DistPairs[2*i] != (1 << DistPairs[2*i+1])) ok = 0;
-        }
-        check("distance bases step by 2^extra", ok, 1);
+        for (i = 0; i < DIST_CODES - 1; i++)
+            if (DistCodeBase(i + 1) - DistCodeBase(i) !=
+                (1 << DistCodeExtra(i)))
+                ok = 0;
+        for (i = 0; i < LEN_CODES - 2; i++)
+            if (LenCodeBase(i + 1) - LenCodeBase(i) !=
+                (1 << LenCodeExtra(i)))
+                ok = 0;
+        check("every span is 2^extra", ok, 1);
+
+        /* and the two that RFC overlaps are exactly where it says */
+        check("284 and 285 overlap by one, as RFC 1951 has it",
+              LenCodeBase(LEN_CODES - 1), 258);
+        check("284's span is one short of 2^5",
+              LenCodeBase(LEN_CODES - 2) + (1 << LenCodeExtra(LEN_CODES - 2))
+              - LenCodeBase(LEN_CODES - 2), 32);
+
+        /* the last distance code has to reach 32768 and the last length code
+           has to reach 258, or the coder would emit a distance it cannot code */
+        check("the distance table covers the window",
+              DistCodeBase(DIST_CODES - 1) +
+              (1 << DistCodeExtra(DIST_CODES - 1)) - 1, 32768);
+        check("the length table covers 258",
+              LenCodeBase(LEN_CODES - 1) +
+              (1 << LenCodeExtra(LEN_CODES - 1)) - 1 >= 258, 1);
 
         /* the one-shot guard: calling again must not rebuild the tables */
         {
-            int before = LenPairs[14];
+            int before = CodePairs[14];
             DistTablesDone = 1;
-            LenPairs[14] = 0x5A5A;
+            CodePairs[14] = 0x5A5A;
             BuildDeflateTables();
-            check("tables are built only once", LenPairs[14], 0x5A5A);
-            LenPairs[14] = before;
+            check("tables are built only once", CodePairs[14], 0x5A5A);
+            CodePairs[14] = before;
         }
     }
     /* ---- FlushRow: the row writer (sub_4053D0) ---- */
@@ -1866,6 +2127,153 @@ int main(void)
         }
 
         FlushLz = NULL;
+        Image = NULL;
+    }
+
+    /* ---- sub_4065A0: the LZ coder ------------------------------------ */
+    {
+        int strat[4];
+        int s, n, nm, longest, decoded, bad, trail;
+        unsigned seed;
+
+        /*
+         *  The four strategies the coder distinguishes: Xtreme, Intense,
+         *  Longest Match, Huffman only (which skips matching altogether),
+         *  and the uncompressed one on top of that.
+         */
+        strat[0] = 0;
+        strat[1] = 1;
+        strat[2] = 2;
+        strat[3] = 3;
+        strat[4] = 4;
+
+        for (s = 0; s < 5; s++) {
+            char name[64];
+
+            /* ---- incompressible data: literals only ---- */
+            seed = 12345u + (unsigned)s;
+            n = 3000;
+            for (i = 0; i < n; i++) {
+                seed = seed * 1103515245u + 12345u;
+                lzinput[i] = (unsigned char)(seed >> 17);
+            }
+
+            lzsetup(strat[s], 0x7FFFFFFF);
+            lzfeed(lzinput, n);
+            LzCode((const unsigned char *)0, 0);   /* flush */
+
+            
+
+            {
+                extern int LzDbgCand, LzDbgRec, LzDbgLit, LzDbgEmit;
+                extern int LzDbgI, LzDbgF, LzDbgN;
+                printf("   dbg s%d cand=%d rec=%d lit=%d emit=%d out=%d"
+                       " skip=%d@%d/%d\n",
+                       strat[s], LzDbgCand, LzDbgRec, LzDbgLit, LzDbgEmit,
+                       OutCount, LzDbgN, LzDbgI, LzDbgF);
+            }
+            check("the window took the bytes", LzWrite, n);
+            check("the window still holds them",
+                  memcmp(LzWindow, lzinput, n), 0);
+
+            decoded = lzdecode(OutCount * 8, lzgot, n, &nm, &longest, &trail);
+            sprintf(name, "s%d: random data decodes (fail %d)", strat[s], lzfail);
+            check(name, decoded, n);
+            sprintf(name, "s%d: and is the input", strat[s]);
+            check(name, decoded == n ? memcmp(lzgot, lzinput, n) : 1, 0);
+            sprintf(name, "s%d: with almost no matches", strat[s]);
+            check(name, nm < n / 16, 1);
+
+            /* ---- highly compressible data: matches must appear ---- */
+            n = 3000;
+            for (i = 0; i < n; i++)
+                lzinput[i] = (unsigned char)("the quick brown fox "
+                                             "jumps over the lazy dog "[i % 44]);
+
+            lzsetup(strat[s], 0x7FFFFFFF);
+            lzfeed(lzinput, n);
+            LzCode((const unsigned char *)0, 0);
+
+            decoded = lzdecode(OutCount * 8, lzgot, n, &nm, &longest, &trail);
+            sprintf(name, "s%d: repetitive data decodes", strat[s]);
+            check(name, decoded, n);
+            sprintf(name, "s%d: and is the input", strat[s]);
+            check(name, decoded == n ? memcmp(lzgot, lzinput, n) : 1, 0);
+            sprintf(name, "s%d: with matches", strat[s]);
+            check(name, nm > 0, 1);
+            sprintf(name, "s%d: and a long one", strat[s]);
+            check(name, longest >= 40, 1);
+
+/*
+             *  A single byte repeated.  Almost everything is a match at
+             *  distance 1, so the run counters and the run-length skip in both
+             *  searches get exercised hard, and `RunLen` has to saturate at
+             *  0x7FFF rather than counting past it.
+             */
+            n = 4000;
+            memset(lzinput, 0x5A, n);
+            lzsetup(strat[s], 0x7FFFFFFF);
+            lzfeed(lzinput, n);
+            LzCode((const unsigned char *)0, 0);
+            decoded = lzdecode(OutCount * 8, lzgot, n, &nm, &longest, &trail);
+            sprintf(name, "s%d: a solid run decodes", strat[s]);
+            check(name, decoded, n);
+            sprintf(name, "s%d: a solid run is all the same byte", strat[s]);
+            bad = 0;
+            for (i = 0; i < n; i++)
+                if (lzgot[i] != 0x5A)
+                    bad++;
+            check(name, bad, 0);
+            sprintf(name, "s%d: and the run saturates", strat[s]);
+            check(name, RunLen[n - 1] == 0x7FFF, 1);
+        }
+
+        /*
+         *  The codes the coder hands to the row record are the ones
+         *  RankValues() produced, and the row's samples get bit 31 set - the
+         *  lock AdvanceRow() clears - for every literal the coder saw.
+         */
+        {
+            int locked = 0;
+
+            n = 800;
+            for (i = 0; i < n; i++)
+                lzinput[i] = (unsigned char)(i * 7 + (i / 13));
+            lzsetup(1, 0x7FFFFFFF);
+            lzfeed(lzinput, n);
+            LzCode((const unsigned char *)0, 0);
+
+            for (i = 0; i < ROW_SAMPLE_SYMS; i++)
+                if (ROWOF(0, ROW_SAMPLES)[i] & 0x80000000)
+                    locked++;
+            check("every literal locked its sample", locked > 0, 1);
+            check("and the step table was written", MatchCount > 0, 1);
+            check("the hash chains were built", HashHead[0] != 0 ||
+                  HashHead[1] != 0 || HashHead[2] != 0, 1);
+        }
+
+        /*
+         *  The row ends where the /b block ends - `dword_42F370[646 * row]`,
+         *  which in the original is the same storage as the block list's end -
+         *  and the coder closes the row there and opens the next one.
+         */
+        {
+            n = 900;
+            for (i = 0; i < n; i++)
+                lzinput[i] = (unsigned char)(i & 7);
+
+            RowCount = 2;
+            lzsetup(1, n / 2);              /* the first block is half of it */
+            *ROWOF(1, ROW_LIMIT) = n;      /* and the second row the rest   */
+            lzfeed(lzinput, n);
+            LzCode((const unsigned char *)0, 0);
+
+            check("the row ended at the block end", RowIndex, 1);
+            check("and the coder carried on past it", LzScan, n);
+        }
+
+        RowCount = 1;
+        RowIndex = 0;
         Image = NULL;
     }
 

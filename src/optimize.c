@@ -521,97 +521,94 @@ canonicalise:
 /* ------------------------------------------------------------------ */
 
 /*
- *  sub_4058A0.  The base/extra-bit tables are generated rather than stored,
- *  once, guarded by dword_18CBEF0.  They are the standard deflate tables:
+ *  sub_4058A0 generates the base/extra-bit table rather than storing it, once,
+ *  guarded by dword_18CBEF0 - and it is **one** array of 59 (extra bits,
+ *  smallest value) pairs, which is what makes RFC 1951 fall out:
  *
- *      LenBase[i]  / LenExtra[i]   30 length codes, lengths 3 .. 258
- *      DistBase[j] / DistExtra[j]  56 distance codes, distances 1 .. 32768
+ *      pairs  0..29  the distance codes, 1,2,3,4,5,7,9,13,17,25,33,49,...24577
+ *      pairs 30..58  the length codes,   3,4,5,6,7,8,9,10,11,13,15,...,227,258
  *
- *  LenCodeToSlot maps a length code back to its position and
- *  DistCodeToSlot does the same for distance codes, giving O(1) decoding in
- *  the trial loops.
+ *  The first loop seeds the cumulative base at 1 and steps the extra-bit count
+ *  up every second code from the third; the second seeds it at 3 and steps up
+ *  every fourth code from the eighth.  Pair 58 - symbol 285, the single length
+ *  with no extra bits - is not generated but stored by hand.
  *
- *  The arrays themselves live in globals.c; see the extern declarations in
- *  pngout.h for the addresses.
+ *  Both reverse-slot builders below walk one of these halves *downwards* from
+ *  its top code, comparing the value being stored with the code's base one
+ *  step early, which is why the code a value gets is exactly the RFC one and
+ *  why `value - base` always fits in the code's extra bits.  (The top length
+ *  group is one value short because 258 belongs to the pair above it; that is
+ *  RFC's own overlap, and the value it sends is still in range.)
  */
 
 /*
- *  Generate the length table: 30 codes, one extra bit more for every other
- *  code from the third onwards, which is what makes the groups come out in
- *  the RFC 1951 pattern.
+ *  0x4058C5: pairs 0..29.  The loop variables are volatile on purpose - VC6
+ *  /O2 miscompiles the block-scoped form of this loop, stopping honouring the
+ *  store after the fourth pair, which the BuildDeflateTables checks in
+ *  tools\selftest.cmd caught.  See README.md.
  */
-/*
- *  dword_1809390 is 30 (base, extra) pairs: base at [2*i], extra at
- *  [2*i+1], which IDA also names dword_1809394[2*i].
- *
- *  The loop variables are volatile on purpose.  VC6 /O2 miscompiles the
- *  block-scoped form of this loop - it stops honouring the store after the
- *  fourth pair, which the BuildDeflateTables checks in tools\selftest.cmd
- *  caught.  See README.md.
- */
-static void BuildLengthTable(void)
+static void BuildDistanceCodes(void)
 {
     volatile int base;
     volatile int extra;
     int i;
 
-    LenPairs[0] = 0;
-    LenPairs[1] = 1;
+    CodePairs[0] = 0;                  /* extra bits */
+    CodePairs[1] = 1;                  /* smallest distance */
 
-    for (i = 1; i < 30; i++) {
-        base = LenPairs[2 * i - 2];
-        extra = LenPairs[2 * i - 1];
-        extra = extra + (1 << base);
+    for (i = 1; i < DIST_CODES; i++) {
+        extra = CodePairs[2 * i - 2];
+        base = CodePairs[2 * i - 1];
+        base += 1 << extra;
         if (((i - 1) & 1) != 0 && (i - 1) >= 2)
-            base = base + 1;
-        LenPairs[2 * i] = base;
-        LenPairs[2 * i + 1] = extra;
+            extra++;
+        CodePairs[2 * i] = extra;
+        CodePairs[2 * i + 1] = base;
     }
+}
+
+/* 0x405907: pairs 30..57, the length codes */
+static void BuildLengthCodes(void)
+{
+    int base = 3;
+    int extra = 0;
+    int counter = 0x101;
+    int i;
+
+    for (i = 0; i < LEN_CODES - 1; i++) {
+        CodePairs[2 * (30 + i)] = extra;
+        CodePairs[2 * (30 + i) + 1] = base;
+        base += 1 << extra;
+        if (((counter + i) & 3) == 0 && i >= 7)
+            extra++;
+    }
+
+    /* pair 58, stored by hand at 0x40593C: symbol 285, 258, no extra bits */
+    CodePairs[2 * (30 + LEN_CODES - 1)] = 0;
+    CodePairs[2 * (30 + LEN_CODES - 1) + 1] = 258;
 }
 
 /*
- *  Generate the distance table: 28 code pairs.  The original tests the loop
- *  counter *and* the loop pointer against a threshold (unk_18094B8), which
- *  is the same as "every fourth code, but not before the eighth", so the
- *  extra-bit count steps up at i = 7, 11, 15, ...
- *
- *  Note the first group of zero-extra-bit codes is wider than RFC 1951
- *  allows.  PNGOUT's deflate is its own, so these tables are NOT assumed to
- *  match the RFC; see README.md.
+ *  Which length code covers a given length, walking the table backwards.  The
+ *  original walks from 258 down to 3 with the code starting at the top pair and
+ *  stepping down whenever the value falls below the code's base, so length 258
+ *  lands on 0x180BA7F - one byte past the byte_180B980 IDA names - and that is
+ *  why the array needs 259 entries here.  A code is stored as its *pair*
+ *  index, 30..58.
  */
-static void BuildDistanceTable(void)
-{
-    int i;
-
-    DistPairs[0] = 3;
-    DistPairs[1] = 0;
-
-    for (i = 1; i < 28; i++) {
-        int base = DistPairs[2 * (i - 1)];
-        int extra = DistPairs[2 * (i - 1) + 1];
-
-        base += 1 << extra;
-        if (((i - 1) & 3) == 3 && (i - 1) >= 7)
-            extra++;
-        DistPairs[2 * i] = base;
-        DistPairs[2 * i + 1] = extra;
-    }
-}
-
-/* Which length code covers a given length, walking the table backwards. */
 static void BuildLenCodeToSlot(void)
 {
-    int slot = 258;
-    int code = 58;
+    int len = 258;
+    int code = 30 + LEN_CODES - 1;           /* pair 58 */
 
-    while (slot >= 3) {
-        int extra = LenPairs[2 * code + 1];
+    while (len >= 3) {
+        int base = CodePairs[2 * code + 1];
 
-        LenCodeToSlot[slot - 258] = (unsigned char)code;
-        slot--;
-        if (slot < extra)
+        LenCodeToSlot[len] = (unsigned char)code;
+        len--;
+        if (len < base)
             code--;
-        if (code < 0)
+        if (code < 30)
             break;
     }
 }
@@ -620,14 +617,14 @@ static void BuildLenCodeToSlot(void)
 static void BuildDistCodeToSlot(void)
 {
     int slot = 32768;
-    int code = 29;
+    int code = DIST_CODES - 1;
 
     while (slot > 0) {
-        int extra = LenPairs[2 * code + 1];
+        int base = CodePairs[2 * code + 1];
 
         DistCodeToSlot[slot - 1] = (unsigned char)code;
         slot--;
-        if (slot < extra)
+        if (slot < base)
             code--;
         if (code < 0)
             break;
@@ -638,33 +635,16 @@ static void BuildDistCodeToSlot(void)
  *  The one-shot part of sub_4058A0, split out so it can be exercised on its
  *  own.  Returns 1 if it actually built them.
  */
-/*
- *  Order matters, and it is not arbitrary.
- *
- *  The original's two reverse-slot builders index the length table with codes
- *  up to 58 (dword_1809394[2 * 58]) while that table only holds 30 pairs, so
- *  those reads deliberately fall through into the *distance* table that the
- *  linker has placed immediately after.  Reproduced verbatim they overwrite
- *  the length table instead, because this build lays the arrays out
- *  differently, so the length table is built last.  The values produced are
- *  the ones the loops generate:
- *
- *      (0,1) (0,2) (0,3) (0,4) (1,5) (1,7) (2,9) (2,13) (3,17) (3,25) ...
- *
- *  which is the RFC 1951 length pattern shifted so that the group width is
- *  2^extra.  Verified by the BuildDeflateTables checks in
- *  tools\selftest.cmd; see README.md for the aliasing note.
- */
 int BuildDeflateTables(void)
 {
     if (DistTablesDone)
         return 0;
 
     DistTablesDone = 1;
+    BuildDistanceCodes();
+    BuildLengthCodes();
     BuildLenCodeToSlot();
     BuildDistCodeToSlot();
-    BuildDistanceTable();
-    BuildLengthTable();
     LenHuffCount = 258;
     LenHuffIndex = 0;
     return 1;
@@ -676,10 +656,10 @@ int InitBlockTables(void)
     BuildDeflateTables();
 
     /* per block reset */
-    CurMatch = 0x80000000u;                        /* dword_412678 */
-    memset32(HashPrev, 0x7FFFFFFF, 511);            /* unk_41267C */
-    memset(HashHead, 0, 0x2000);                   /* word_412EC0 */
-    memset(DistSlot, 0, 0x10000);                  /* word_41CEC8 */
+    CurMatch = 0x80000000;                        /* dword_412678[0] */
+    memset32(HashPrev, 0x7FFFFFFF, 511);           /* unk_41267C[1..511] */
+    memset(HashHead, 0, sizeof(HashHead));         /* word_412EC0[4096] */
+    memset(DistSlot, 0, sizeof(DistSlot));         /* word_41CEC8[32768] */
 
     /*
      *  Strategies 3 (Huffman only) and 4 (uncompressed) never build the LZ
@@ -747,28 +727,34 @@ int BuildDistanceSlots(int row)
 
     memset(ROWOF(row, ROW_SAMPLES), 0, 4 * MAX_WIDTH);
 
+    /*
+     *  Slots 0..29 are the *distance* codes: the row's bit count for the
+     *  distance code (field +0x990) plus that code's extra bit count.  Slots
+     *  30..58 are the *length* codes, off the row's other bit count array
+     *  (field +0x89C) which AdvanceRow fills at the same 30..58 indices.
+     */
     do {
         if (ROWOF(row, ROW_DISTBITS)[n])
-            DistSlots[n] = ROWOF(row, ROW_DISTBITS)[n] + LenPairs[2 * n];
+            DistSlots[n] = ROWOF(row, ROW_DISTBITS)[n] + DistCodeExtra(n);
         else
             DistSlots[n] = 4096;                /* 0x1000, "no match" */
         n++;
-    } while (n < 30);
+    } while (n < DIST_CODES);
 
-    if (n < 59) {
+    if (n < CODE_PAIRS) {
         int *slot = &DistSlots[n];
-        int *pair = DistPairs;
+        int k = 0;
         int *in = ROWOF(row, ROW_LENBITS) + n;
 
         do {
             if (*in)
-                *slot = *in + *pair;
+                *slot = *in + LenCodeExtra(k);
             else
                 *slot = 4096;
-            pair += 2;
+            k++;
             in++;
             slot++;
-        } while (pair < &DistPairs[58]);        /* 0x1809480 .. 0x1809568 */
+        } while (n + k < CODE_PAIRS);          /* 0x1809480 .. 0x1809568 */
     }
 
     if (Image->strategy == 0) {
@@ -778,18 +764,18 @@ int BuildDistanceSlots(int row)
         do {
             int i;
 
-            for (i = v8; i < 30; i++) {
+            for (i = v8; i < DIST_CODES; i++) {
                 if (DistSlots[i] < *v9)
                     break;
             }
             SlotOrder[v8 - 1] = (unsigned char)i;
             v8++;
             v9++;
-        } while (v8 - 1 < 30);
+        } while (v8 - 1 < DIST_CODES);
     }
 
-    RankValues(ROWOF(row, ROW_SYMBOLS), 286, &FreqA);
-    return RankValues(ROWOF(row, ROW_DISTBITS), 30, &FreqB);
+    RankValues(ROWOF(row, ROW_SYMBOLS), ROW_SAMPLE_SYMS, LitCodes);
+    return RankValues(ROWOF(row, ROW_DISTBITS), ROW_DISTSLOTS, DistCodes);
 }
 
 /* ------------------------------------------------------------------ */

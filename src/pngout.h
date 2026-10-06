@@ -59,8 +59,14 @@
 #define ROW_BLOCKS    (0x410 / 4)      /* 1 dword, bumped once per block;
                                            it is also sample 256, the first
                                            length code                       */
-#define ROW_LENCNT    (0x44C / 4)      /* 30: a counter per length code    */
-#define ROW_DISTFREQ  (0x490 / 4)      /* 30: frequency per distance code,
+/*
+ *  dword_42ECF4 is at +0x39C, not +0x44C: 0x42ECF4 - 0x42E958 = 0x39C and the
+ *  LZ coder bumps it once per length code it emits (0x406F64).  It is indexed
+ *  by the *pair* index 30..58, so it needs 59 entries, which reach +0x484 -
+ *  still short of the distance frequencies at +0x490.
+ */
+#define ROW_LENCNT    (0x39C / 4)      /* 59: a counter per length code    */
+#define ROW_DISTFREQ  (0x490 / 4)      /* 32: frequency per distance code,
                                            sitting just past the 286 literal
                                            and length samples               */
 #define ROW_SYMBOLS   (0x510 / 4)      /* 318: the symbol stream           */
@@ -68,6 +74,14 @@
                                            symbol costs in this row         */
 #define ROW_ROWBITS   (0x910 / 4)      /* 1 dword: bits the row needs      */
 #define ROW_DISTBITS  (0x990 / 4)      /* 30: bits a distance symbol costs*/
+/*
+ *  dword_42F370[646 * row] is the position in the window at which this row's
+ *  data stops.  In the original that address is *also* the `/b` block list's
+ *  `end` field - row index and block index are the same counter (dword_6D5570
+ *  is both NumBlockList and RowCount) - which is why the LZ coder closes a row
+ *  exactly when a block ends.
+ */
+#define ROW_LIMIT     (0x1018 / 4)     /* 1 dword: the end of this row     */
 #define ROW_SAMPLE_MAX 320             /* the samples really are this long */
 #define ROW_SAMPLE_SYMS 286            /* how many of them the code covers */
 
@@ -330,30 +344,65 @@ extern int *ColorHashPalette;
 extern int      RowRecord[MAX_ROWS * ROW_STRIDE];
 
 /* --- deflate block state, src/optimize.c -------------------------- */
-extern int      LenPairs[60];   /* 0x1809390: 30 (extra, base) pairs */
-extern int      DistPairs[56];  /* 0x1809480: 28 (extra, base) pairs */
 /*
- *  sub_4058A0 fills the length slot table *backwards* from its end:
+ *  0x1809390 is ONE array of 59 (extra bit count, smallest value) pairs:
  *
- *      mov eax, 102h              ; 258
- *      mov esi, offset unk_180BA7F
- *      sub esi, eax
- *      ...
- *      mov [esi+eax], cl          ; a byte at (unk_180BA7F - 258 + slot)
+ *      pairs  0 .. 29   the RFC 1951 *distance* codes, bases 1 .. 24577
+ *      pairs 30 .. 58   the RFC 1951 *length* codes,   bases 3 .. 258
  *
- *  so it writes 255 bytes *below* the table as well.  In the original those
- *  bytes are the tail of the palette area and nothing else, so the store is
- *  deliberate and harmless.  Here they would land on whichever global the
- *  linker happened to put next, so the array carries its own 255 bytes of
- *  slack in front and the under-run lands there.
+ *  sub_4058A0 builds the two halves in two loops - 0x1809390..0x180947F with
+ *  the extra-bit count stepping up every second code, and 0x1809480..0x180955F
+ *  with it stepping up every fourth code from the eighth - and then stores the
+ *  last length pair by hand:
+ *
+ *      mov dword_1809564, 102h      ; pair 58's base, 258
+ *      mov dword_1809560, ebx       ; and its extra bit count, 0
+ *
+ *  Pair 58 is deflate length symbol 285, which is why 258 is coded with no
+ *  extra bits at all.  IDA splits the halves into `dword_1809390` and
+ *  `unk_1809480` and the two stores into `dword_1809560`/`dword_1809564`.
+ *
+ *  Getting this the right way round matters: the length half really is RFC's
+ *  length table and the distance half RFC's distance table, and the values are
+ *  the standard ones, so a reconstruction that swaps them produces a stream no
+ *  decoder can read.  `tools\selftest.cmd` now pins both against RFC 1951.
  */
-extern unsigned char LenCodeToSlotStore[255 + 256];
-#define LenCodeToSlot   (LenCodeToSlotStore + 255)
-extern unsigned char DistCodeToSlot[32768];
+#define CODE_PAIRS     59
+#define DIST_CODES     30
+#define LEN_CODES      29              /* pairs 30..58, symbols 257..285 */
+extern int CodePairs[CODE_PAIRS * 2];
+
+#define DistCodeBase(i)  CodePairs[2 * (i) + 1]
+#define DistCodeExtra(i) CodePairs[2 * (i)]
+#define LenCodeBase(i)   CodePairs[2 * (30 + (i)) + 1]
+#define LenCodeExtra(i)  CodePairs[2 * (30 + (i))]
+
+/*
+ *  sub_4058A0 fills the two code tables backwards: `byte_180B97D` is the array
+ *  of length codes indexed by the length itself and `byte_414EC0` the array of
+ *  distance codes indexed by the distance, and IDA reaches both at -1 because
+ *  it names the symbol one byte below the array.
+ *
+ *  A *length* code is stored as its **pair** index, 30..58, because that is
+ *  what indexes DistSlots[] and the row's bit counts; a *distance* code is
+ *  0..29.  The length array therefore has to be 259 entries, not 256: the
+ *  original writes it from `unk_180BA7F` *downwards*, which for length 258
+ *  lands on `unk_180BA7F` itself - one byte past the byte_180B980 IDA names -
+ *  and it is the pair's `base`, not its byte count.
+ */
+extern unsigned char LenCodeToSlotStore[259];   /* 0x180B97D .. 0x180BA7F */
+#define LenCodeToSlot   LenCodeToSlotStore
+extern unsigned char DistCodeToSlot[32768];     /* 0x414EC0 */
 extern int      LenHuffIndex, LenHuffCount, DistTablesDone;
 
-extern unsigned CurMatch;        /* 0x412678 */
-extern int      HashPrev[511];   /* 0x41267C */
+
+/*
+ *  dword_412678[] is one array of 512 dwords, indexed by position & 0x1FF.
+ *  sub_4058A0 seeds entry 0 with 0x80000000 and the other 511 with 0x7FFFFFFF,
+ *  which is why IDA shows `dword_412678` and `unk_41267C` as two symbols.
+ */
+#define CurMatch     MatchCost[0]     /* 0x412678 */
+#define HashPrev     (MatchCost + 1)  /* 0x41267C, 511 entries */
 extern int      HashHead[4096];  /* 0x412EC0, used as shorts */
 extern int      DistSlot[32768]; /* 0x41CEC8, used as shorts */
 extern int      MatchArea[0x8000];   /* 0x6B4968 */
@@ -375,7 +424,14 @@ extern int     (*CheckEscHook)(int);    /* dword_6F6670, polled by the trials */
 #define MAX_BLOCKS     1024            /* the original's cap, `cmp eax, 400h` */
 #define BLOCK_STRIDE   32              /* dwords per block record            */
 extern int BlockRecord[MAX_BLOCKS * BLOCK_STRIDE];
-extern int NumBlockList;               /* dword_6D5570, see the note below   */
+/*
+ *  dword_6D5570 is ONE variable in the original.  sub_408000 (PlanBlocks)
+ *  counts blocks into it and sub_407090 (AdvanceRow) counts rows into it, and
+ *  the LZ coder indexes the *block* ends by row index - so a row and a block
+ *  are the same thing here.  It used to be declared twice, once under each
+ *  name, which quietly gave the build two counters.
+ */
+#define NumBlockList   RowCount
 extern unsigned char *LinBufData;      /* dword_18CBEE4, the buffer's data   */
 
 #define BlockSplit(n)   (&BlockRecord[(n) * BLOCK_STRIDE + 0])
@@ -391,7 +447,7 @@ void SortBlockEnds(int count);
 int  BestSplit(unsigned char *data, int len, double *score);
 extern int      MinSample;        /* dword_185BEC0, the darkest sample */
 extern int      unk_185BEC8, unk_180BA84, unk_185BEB8, unk_411D58, unk_41CEC0;
-extern int      unk_6D4968, unk_6F6B78, unk_42D7C8;
+extern int      unk_42D7C8;
 extern unsigned char unk_42E55C;
 
 int  BuildDeflateTables(void);
@@ -399,9 +455,97 @@ int  InitBlockTables(void);
 int  BuildDistanceSlots(int row);
 extern int      DistSlots[64];        /* dword_6D5578 */
 extern unsigned char SlotOrder[32];      /* byte_185BA90 */
-extern int      FreqA, FreqB;          /* dword_6F6678, dword_6F6AF8 */
+/*
+ *  dword_6F6678 and dword_6F6AF8 are the two arrays sub_405800 (RankValues)
+ *  fills: the codes for all 286 symbols of the row's code, and the codes for
+ *  the 30 distance codes.  dword_6F6A04, the third symbol, is dword_6F6678 + 227
+ *  dwords - see LenCodeOut() - so there are only two of them.
+ */
+extern int      LitCodes[286];         /* dword_6F6678 */
+extern int      DistCodes[32];        /* dword_6F6AF8 */
 int  RankValues(int *vals, int count, int *out);
 void FlushRow(int *row);
+
+/* ------------------------------------------------------------------ */
+/*  sub_4065A0, the LZ coder, and the state it keeps                   */
+/* ------------------------------------------------------------------ */
+
+/*
+ *  The window is 64KB, one byte per position, indexed by position & 0xFFFF.
+ *  dword_706B80 is the dword *overlapping* the last three bytes of it - the
+ *  original keeps window[0..3] there so it can slide - and the only thing the
+ *  coder ever does with it is that store; nothing in .text reads it back.
+ */
+extern unsigned char LzWindow[65540];  /* 0x6F6B80 */
+extern int      LzScan;               /* 0x6F6B78: how far the matcher got  */
+extern int      LzWrite;              /* 0x6D4968: where the next byte goes */
+extern int      RunEnd;               /* 0x41CEC0: end of the current run   */
+extern int      RunCount;             /* 0x411D58: its length, saturating   */
+extern unsigned short RunLen[65536];  /* 0x185BED8: the run each position is
+                                            part of                            */
+extern int      MatchCost[512];       /* 0x412678: best cost per position   */
+extern int      MatchLimit;           /* 0x412668: the furthest one so far  */
+extern int      MatchStart[32768];    /* 0x6D6670: where a position's matches
+                                            start in the step table            */
+extern int      PrevReach;            /* dword_185BEC8 */
+extern int      PrevMark;             /* dword_185BEB8 */
+extern int      MatchList[0x80000];   /* 0x706B88: length, then distance    */
+/*
+ *  The step table is indexed by MatchStart[] plus a length, and MatchStart is
+ *  the match list count, which the coder only clamps at `cmp eax, offset
+ *  unk_7FFF00` before wrapping it to zero.  So the array really does have to
+ *  be LZ_STEPCAP entries - the original's runs from 0x806B82 to 0x1806B86,
+ *  just short of the colour hash that follows it, and IDA's guess of 331559
+ *  entries for word_806D86 is simply wrong.  It is 16MB of .bss that nothing
+ *  touches until a block actually gets that big.
+ */
+#define LZ_STEPCAP    0x7FFF00         /* `cmp eax, offset unk_7FFF00` */
+extern unsigned short StepTable[LZ_STEPCAP + 260];
+extern int      BestCost[256];        /* dword_6D5170 */
+#define MatchReach MatchArea          /* 0x6B4968: how far a position's list
+                                            is still good for                    */
+#define MatchCount unk_180BA84
+#define unk_6D4968 LzWrite
+#define unk_6F6B78 LzScan
+
+/* one window byte, the dword that starts there, and the saved first dword */
+#define LzByte(i)      (LzWindow[(i) & 0xFFFF])
+#define LzDword(i)     (*(unsigned int *)(LzWindow + ((i) & 0xFFFF)))
+#define LzHead         (*(unsigned int *)(LzWindow + 0x10000))
+
+/*
+ *  The step table.  The recorded distance for match-list entry k lands at
+ *  0x806B88 + 2k; the reads are one and 1026 entries either side of that, and
+ *  that is exactly what IDA's three symbols word_806B82, word_806B88 and
+ *  word_806D86 are - they are one array, not three.
+ */
+#define LzStepWrite(k)  (StepTable[(k) + 3])
+#define LzStepPairAt(k) ((unsigned)StepTable[(k) + 2] | \
+                         ((unsigned)StepTable[(k) + 3] << 16))
+
+/*
+ *  Which code a length or a distance costs.  byte_180B980 and byte_414EC0 are
+ *  both one below the array sub_4058A0 built, which is why the LZ coder reaches
+ *  them at index -1.  A length's code is a *pair* index, 30..58.
+ */
+#define LenCodeOf(len)   LenCodeToSlot[len]
+#define LenSlotOf(len)   (LenCodeToSlot[len] - 30)     /* 0..28 */
+#define DistCodeOf(dist) DistCodeToSlot[(dist) - 1]
+
+/* the code that goes on the wire for one length slot.  dword_6F6A04 is
+   dword_6F6678 + 227 dwords, so it is the same array one code on. */
+#define LenCodeOut(slot) LitCodes[227 + (slot)]
+
+/* the match list: length in the low half, distance (or the literal itself) in
+   the high half, written as two separate 16 bit stores as the original does */
+#define SetMatch(p, l, v)   (MatchList[2 * ((p) & 0x3FFFF)]     = \
+                              (unsigned short)(l),                 \
+                              MatchList[2 * ((p) & 0x3FFFF) + 1] = \
+                              (unsigned short)(v))
+#define MatchLenAt(p)       ((int)MatchList[2 * ((p) & 0x3FFFF)])
+#define MatchValAt(p)       ((int)MatchList[2 * ((p) & 0x3FFFF) + 1])
+
+int  LzCode(const unsigned char *data, int len);
 
 
 /* sub_407D80: filter one image byte and hand it to the trial''s sink */

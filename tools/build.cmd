@@ -27,11 +27,11 @@ rem Compile only the real translation units; tools\selftest.cmd leaves its
 rem own objects here and they must not end up in the program.
 cl.exe /nologo /c /W3 /O2 /MD /D_CRT_SECURE_NO_DEPRECATE /I"%ROOT%\src" ^
     "%ROOT%\src\pngout.c" "%ROOT%\src\chunk.c" "%ROOT%\src\clipboard.c" ^
-    "%ROOT%\src\globals.c" "%ROOT%\src\stubs.c" "%ROOT%\src\predict.c" "%ROOT%\src\cpuid.c" "%ROOT%\src\optimize.c" > build.log 2>&1
+    "%ROOT%\src\globals.c" "%ROOT%\src\stubs.c" "%ROOT%\src\predict.c" "%ROOT%\src\cpuid.c" "%ROOT%\src\optimize.c" "%ROOT%\src\lz.c" > build.log 2>&1
 if errorlevel 1 goto :failed
 
 link.exe /nologo /SUBSYSTEM:CONSOLE /OUT:pngout.exe ^
-    pngout.obj chunk.obj clipboard.obj globals.obj stubs.obj predict.obj cpuid.obj optimize.obj ^
+    pngout.obj chunk.obj clipboard.obj globals.obj stubs.obj predict.obj cpuid.obj optimize.obj lz.obj ^
     user32.lib gdi32.lib >> build.log 2>&1
 if errorlevel 1 goto :failed
 
