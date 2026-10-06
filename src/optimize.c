@@ -16,6 +16,7 @@
  *      0x407FC0  FindColor()
  */
 
+#include <math.h>
 #include <string.h>
 
 #include "pngout.h"
@@ -47,9 +48,8 @@
 #define PNGOUT_MARK 0x5E78           /* the placeholder CRC, = 24184       */
 
 
-/* dword_42EE68: the symbol stream for one row, 256 literal slots, 30 length
-   slots at +256 and 30 distance slots at +288. */
-extern int ImageBuffer[MAX_ROWS * ROW_STRIDE];
+/* one row record: the fields are picked out by the offsets in pngout.h */
+#define ROWOF(row, field)   (&RowRecord[ROW_STRIDE * (row) + (field)])
 
 int  BuildDistanceSlots(int row);
 void FlushRow(int *row);
@@ -106,7 +106,7 @@ int EmitBlock(unsigned width, unsigned height, int coltype, int bitdepth,
         PutBits(0, 1);
     PutBits(2, 2);
 
-    FlushRow(&ImageBuffer[ROW_STRIDE * RowIndex]);
+    FlushRow(ROWOF(RowIndex, ROW_SYMBOLS));
     return 1;
 }
 
@@ -703,7 +703,7 @@ int InitBlockTables(void)
     unk_42D7C8 = 0;
     unk_18CBEEC = 0;
     RowIndex = 0;
-    RowSlot[ROW_SLOTS * RowCount] = 0x7FFFFFFF;   /* dword_42E958[] */
+    RowRecord[ROW_STRIDE * RowCount + ROW_SLOT] = 0x7FFFFFFF;
 
     return BuildDistanceSlots(0);
 }
@@ -726,7 +726,7 @@ int InitBlockTables(void)
  *      PutBits(dword_6F6AF8[code], dword_42F2E8[646*row + code]);  // distance
  *      PutBits(value - DistBase[code], DistExtra[code]);
  *
- *  so LenSymBits[] (row field +0x89C) and DistSymBits[] (row field +0x990)
+ *  so row field +0x89C and row field +0x990
  *  hold how many bits each symbol costs in this row, and what is added here
  *  is the number of extra bits it takes - which is why the entries stay
  *  small enough to be coded by the row's own 19 symbol code.
@@ -747,11 +747,11 @@ int BuildDistanceSlots(int row)
 {
     int n = 0;
 
-    memset(&DistWork[ROW_STRIDE * row], 0, 4 * MAX_WIDTH);
+    memset(ROWOF(row, ROW_SAMPLES), 0, 4 * MAX_WIDTH);
 
     do {
-        if (DistSymBits[ROW_SLOTS * row + n])
-            DistSlots[n] = DistSymBits[ROW_SLOTS * row + n] + LenPairs[2 * n];
+        if (ROWOF(row, ROW_DISTBITS)[n])
+            DistSlots[n] = ROWOF(row, ROW_DISTBITS)[n] + LenPairs[2 * n];
         else
             DistSlots[n] = 4096;                /* 0x1000, "no match" */
         n++;
@@ -760,7 +760,7 @@ int BuildDistanceSlots(int row)
     if (n < 59) {
         int *slot = &DistSlots[n];
         int *pair = DistPairs;
-        int *in = &LenSymBits[ROW_SLOTS * row + n];
+        int *in = ROWOF(row, ROW_LENBITS) + n;
 
         do {
             if (*in)
@@ -790,8 +790,8 @@ int BuildDistanceSlots(int row)
         } while (v8 - 1 < 30);
     }
 
-    RankValues(&ImageBuffer[ROW_STRIDE * row], 286, &FreqA);
-    return RankValues(&DistSymBits[ROW_SLOTS * row], 30, &FreqB);
+    RankValues(ROWOF(row, ROW_SYMBOLS), 286, &FreqA);
+    return RankValues(ROWOF(row, ROW_DISTBITS), 30, &FreqB);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1304,6 +1304,84 @@ int WritePngHeader(int width, int height, int coltype, int bitdepth,
 }
 
 /* ------------------------------------------------------------------ */
+/*  the entropy estimate the trials are scored with                    */
+/* ------------------------------------------------------------------ */
+
+/*
+ *  sub_4063F0: how many bits would this symbol histogram cost?
+ *
+ *  The answer is built from `sum(count * ln(count))` over the histogram,
+ *  scaled so that the commonest symbol - whose count is one more than
+ *  `EntropyMax` - comes out at exactly 0x7FFFFFFF, i.e. the whole 31 bit
+ *  range.  So the result is a *score* and not a byte count: the bigger the
+ *  sum, the smaller the answer, and the trial loops keep the smallest.
+ *
+ *  The table of `count * ln(count)` values is built once per distinct maximum
+ *  count and cached, because the filter trials ask the same question once per
+ *  candidate and only the histogram changes.  0x80000000 is the failure value:
+ *  the message goes out, the LZ work buffer is freed (so the caller has to
+ *  stop) and the estimate is impossible.
+ *
+ *  Two things worth keeping as they are:
+ *
+ *    - the first thing it does is undo one entry of the shared histogram at
+ *      index `CurFilter`, which is the filter the trial just used.  What that
+ *      is for only becomes clear with the filter trials, so it is reproduced
+ *      rather than explained.
+ *    - `EntropyMax` is decremented *before* it is compared with the cached
+ *      size, and it is the size minus one that sizes the new table, so a
+ *      histogram whose largest count is 1 gives a table of -1 entries and
+ *      every read lands on the zero at index 0.
+ */
+unsigned int EstimateEntropy(int *hist, int buckets)
+{
+    int *lut = EntropyLut;
+    int n = --EntropyMax;
+    unsigned int result = 0x7FFFFFFEu;
+    int i;
+
+    Entropy[CurFilter]--;
+
+    if (n != EntropyLutSize || lut == NULL) {
+        double scale;
+
+        EntropyLutSize = n;
+
+        if (lut != NULL) {
+            free(lut);
+            EntropyLut = NULL;
+        }
+
+        lut = (int *)malloc(4 * (size_t)n + 4);
+        EntropyLut = lut;
+
+        if (lut == NULL) {
+            if (ProgressMsg != NULL)
+                ProgressMsg("\rmalloc failed (entropylut)\n");
+            if (LinBuf != NULL)
+                free(LinBuf);
+            return 0x80000000u;
+        }
+
+        if (n > 0) {
+            scale = 2147483647.0 / ((double)n * log((double)n));
+            for (i = n; i > 0; i--)
+                lut[i] = (int)((log((double)i) * (double)i) * scale);
+        }
+
+        lut[0] = 0;
+    }
+
+    for (i = buckets - 1; i >= 0; i--)
+        result -= (unsigned int)lut[hist[i]];
+
+    return result;
+}
+
+/* ------------------------------------------------------------------ */
+/*  colour hash                                                       */
+/* ------------------------------------------------------------------ */
+
 /*  2048 bucket heads over a 256 entry chain, so looking a colour up costs
  *  one hash and a short walk.  The hash is
  *      (((color ^ (color >> 11)) >> 11) & 0xFFFF) - (color & 0xFFFF)

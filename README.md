@@ -256,10 +256,12 @@ why they all share the stride and why they overlap:
 
 `sub_4065A0` settles it: it computes `4 * (0x286 * row + column)` and uses the
 result as a *dword* index, and `0x286 * 4 == 0xA18`. The record is 0xA18 dwords
-but only the first 0x930 of them are touched, so `src/pngout.h` gives the small
-fields a compact stride of their own and keeps 0xA18 for the two big ones
-(the samples and the symbol stream). Nothing in the reconstruction relies on
-the fields overlapping.
+and only the first 0x930 of them are touched, so `src/pngout.h` defines the
+field offsets and `src/globals.c` has the lot as **one** `RowRecord[]` array
+rather than one array per field. That is not cosmetic: modelled separately the
+reconstruction needed two full records - 21MB of `.bss` - and the fields *do*
+overlap on purpose (`sub_407090` reads the previous row's samples as
+`samples[i] - 320`, which is inside the record in front of it).
 
 ### sub_4053D0, the row writer
 
@@ -373,6 +375,33 @@ bKGD chunk can't fit palette index. Try higher bitdepth, /c2 or /c6 instead
 The search for the index afterwards stops one entry early (`m > 0`, not
 `m >= 0`), which is harmless only because the appended entry is the last one.
 
+### sub_4063F0, the entropy estimate
+
+`EstimateEntropy()` is how the filter trials are scored: given the symbol
+histogram the trial produced, how many bits would it cost? It answers with
+`0x7FFFFFFE - sum(count * ln(count))`, scaled so that the commonest symbol -
+whose count is one more than `EntropyMax` - comes out at exactly `0x7FFFFFFF`,
+the whole 31 bit range. So it is a *score*, not a byte count: a more skewed
+histogram sums higher, scores lower, and the trial loops keep the smallest.
+It saturates, because the commonest symbol alone can spend the whole range.
+
+The table of `count * ln(count)` values is cached and rebuilt only when
+`EntropyMax` changes, since the trials ask the same question once per candidate
+and only the histogram moves. `0x80000000` is the failure value: the
+"malloc failed (entropylut)" message goes out, the LZ work buffer is freed so
+the caller has to stop, and no estimate is possible.
+
+Two details are reproduced rather than explained, because they only make sense
+once the filter trials are in:
+
+* the first thing it does is undo one entry of the shared histogram at index
+  `CurFilter` - `dword_185BEBC` is the filter in use, 0 .. 4, which the filter
+  trials set;
+* `EntropyMax` is decremented *before* it is compared against the cached table
+  size, and it is that value *minus one* which sizes the new table. A histogram
+  whose largest count is 1 therefore asks for a table of -1 entries and every
+  read lands on the zero at index 0.
+
 ### Still open
 
 * `sub_405A60` (`BuildDistanceSlots()`) fills `dword_6D5578[]` with 30 slots
@@ -388,8 +417,8 @@ The search for the index afterwards stops one entry early (`m > 0`, not
 
 `sub_402AD0` itself (5 983 listing lines), the four filter trials
 `sub_4071D0`/`4077C0`/`407B00`/`407D80`, the min-sum filter `sub_4086E0`, the
-entropy estimate `sub_408000`/`sub_408390`, the timing `sub_4063F0`, and the
-`.bss` globals they all use.
+other entropy estimate `sub_408000`/`sub_408390`, the timing `sub_4063F0`, the
+LZ coder `sub_4065A0` and its helpers, and the `.bss` globals they all use.
 
 ## DecodeImage (0x409560): how it fits together
 
@@ -492,11 +521,11 @@ Two independent checks, both runnable.
 
 ### tools\selftest.cmd
 
-190 checks over the recovered code: `Swap16`, `GetImageSize` for all
+200 checks over the recovered code: `Swap16`, `GetImageSize` for all
 eight format codes, the `/k` list handling in `ScanChunks`, `FilterPredict()`,
 `CpuFeatures()`, and the optimiser primitives (CRC table, Huffman heap, colour
-hash, `PutBits()`/`EmitBytes()`, `RankValues()`, `FlushRow()` and `WritePngHeader()`).
-They caught eight real defects, all now fixed:
+hash, `PutBits()`/`EmitBytes()`, `RankValues()`, `FlushRow()`, `WritePngHeader()` and `EstimateEntropy()`).
+They caught nine real defects, all now fixed:
 
 * PNG dimensions are **4 byte** big endian, not 2 byte. `GetImageSize` was
   using `Swap16` where the original calls `_byteswap_ulong` on a DWORD.
@@ -531,6 +560,16 @@ They caught eight real defects, all now fixed:
 * **`FlushRow()`'s two slot-count walks were off by one.** The original reads
   the slot, *then* decrements, then tests the value; the transcription tested
   before decrementing, so a row always claimed one slot too many.
+* **`BuildLenCodeToSlot()` was scribbling over unrelated globals.** It fills
+  the table *backwards* from its end - `mov esi, offset unk_180BA7F; sub esi,
+  eax` with `eax = 258`, then `mov [esi+eax], cl` - so 255 bytes *below* the
+  table are overwritten with 58 as well. In the original that is the tail of
+  the palette area and nothing else; here it landed on whatever the linker put
+  next, and the entropy histogram plus the colour hash counters came back as
+  `0x3A3A3A3A`. It is now found by the tests reading a global before writing
+  it, and the array carries its own 255 bytes of slack in front. This one ran
+  at the start of every deflate block, so it would have corrupted the optimiser
+  mid-run.
 
 They also exposed that the original's `strtok` loop in `ScanChunks` steps one
 byte past the terminating NUL after the last token, because it restores the
@@ -561,7 +600,12 @@ Everything the original imports from the CRT stays visible in a partial build,
 so `dumpbin /imports build\pngout.exe` can be compared against the `extrn` list
 in `reference/idata.lst` even with the engines missing:
 
-* **51 of the original's 55 imports are present, with nothing extra.**
+* **51 of the original's 55 imports are present.** The only name this build
+  has that the original does not is `time`, which every stock VC6 `/MD` program
+  picks up from the CRT as soon as it uses `atof` or `printf("%f")` - a three
+  line program with just those two already imports it, so it says nothing about
+  the reconstruction. (IDA spells the ten `start` helpers `__imp_*` where
+  `dumpbin` says `*`; they are the same imports.)
 * **USER32 and GDI32 match exactly**, in the same order: `OpenClipboard`,
   `GetClipboardData`, `CloseClipboard` / `DeleteDC`, `GetObjectA`,
   `CreateCompatibleDC`, `GetDIBits`.

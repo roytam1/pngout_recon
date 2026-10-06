@@ -143,7 +143,7 @@ int     *ColorHashPalette;              /* 0x180A56C */
 /* deflate block state */
 int      LenPairs[60];             /* 0x1809390: 30 (base, extra) pairs */
 int      DistPairs[56];            /* 0x1809480: 28 (base, extra) pairs */
-unsigned char LenCodeToSlot[256];       /* 0x180BA7F */
+unsigned char LenCodeToSlotStore[255 + 256]; /* 0x180BA7F - 255, see pngout.h */
 unsigned char DistCodeToSlot[32768];    /* 0x41CEBF */
 int      LenHuffIndex;                  /* 0x1809560 */
 int      LenHuffCount;                  /* 0x1809564 */
@@ -154,15 +154,18 @@ int      HashPrev[511];                 /* 0x41267C */
 int      HashHead[4096];                /* 0x412EC0 */
 int      DistSlot[32768];               /* 0x41CEC8 */
 int      MatchArea[0x8000];             /* 0x6B4968, the LZ work area */
-int      RowSlot[(MAX_ROWS + 1) * ROW_SLOTS];   /* 0x42E958 */
 
 /* per row match slots */
 int      DistSlots[64];                 /* 0x6D5578 */
-int      DistWork[MAX_ROWS * ROW_STRIDE];  /* 0x42E968 */
-int      DistSymBits[(MAX_ROWS + 1) * ROW_SLOTS]; /* 0x42F2E8 */
-int      LenSymBits[(MAX_ROWS + 1) * ROW_SLOTS];  /* 0x42F1F4 */
 unsigned char SlotOrder[32];              /* 0x185BA90 */
 int      FreqA, FreqB;                 /* 0x6F6678, 0x6F6AF8 */
+
+/* 0x42E560: the histogram the filter trials fill, 256 dwords */
+int      Entropy[256];
+int      CurFilter;                   /* dword_185BEBC: 0 .. 4, the filter in use */
+int      EntropyMax;                   /* dword_180A568: the largest count in it   */
+int     *EntropyLut;                   /* dword_18CBEE8: count * ln(count) * scale */
+int      EntropyLutSize;               /* dword_18CBEE4                        */
 
 int      MinSample;                      /* dword_185BEC0: darkest sample in the image */
 int      unk_185BEC8, unk_180BA84, unk_185BEB8, unk_411D58, unk_41CEC0;
@@ -170,12 +173,12 @@ int      unk_6D4968, unk_6F6B78, unk_412668, unk_42D7C8, unk_18CBEEC;
 unsigned char unk_42E55C;
 
 /* ------------------------------------------------------------------ */
-/*  .bss symbols that still have to be placed                          */
+/*  the row records, 0x42E958                                            */
 /* ------------------------------------------------------------------ */
 
 /*
- *  0x42EE68: one record per row, field +0x510 - the symbol stream a row is
- *  coded from.  256 literal slots, 30 length slots, 30 distance slots; see
- *  FlushRow() and the ROW_STRIDE notes in pngout.h.
+ *  One 2584 dword record per row, with the fields at the offsets the original
+ *  puts them at - see ROW_STRIDE and friends in pngout.h.  It is a single
+ *  allocation because the fields overlap on purpose.
  */
-int      ImageBuffer[MAX_ROWS * ROW_STRIDE];
+int      RowRecord[MAX_ROWS * ROW_STRIDE];

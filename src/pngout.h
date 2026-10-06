@@ -43,27 +43,28 @@
  *  which is 646 * 4: Hex-Rays printed that as `646 * dword_42D7CC`, which
  *  reads like a dword count of 646 and is what earlier revisions of this
  *  reconstruction used.  The records start at dword_42E958 and the fields
- *  sit at these offsets inside one:
+ *  sit at these offsets inside one - which is also how they are modelled here,
+ *  as one array with the fields picked out by the offsets below.
  *
- *      +0x000  dword_42E958   one dword, set to 0x7FFFFFFF per block
- *      +0x010  dword_42E968   320 dwords: the row's samples
- *      +0x410  dword_42ED68   one dword: a counter the row coder bumps
- *      +0x44C  dword_42ECF4   30 dwords: a counter per length code
- *      +0x480  dword_42EDE8   30 dwords: frequency per distance code
- *      +0x510  dword_42EE68   318 dwords: the symbol stream sub_4053D0 eats
- *      +0x89C  dword_42F1F4   bits per length symbol, then 29 more entries
- *      +0x910  dword_42F268   one dword: how many bits the row needs
- *      +0x990  dword_42F2E8   30 dwords: bits per distance symbol
- *
- *  The record is 0xA18 dwords but only the first ~0x930 of them are touched,
- *  so the small fields are modelled here with a compact stride of their own.
- *  Nothing in the reconstruction relies on the fields overlapping.
+ *  Modelled as separate arrays the reconstruction needed 21MB of .bss, two
+ *  full records, and the linker ran out of image: a record really is one
+ *  allocation, and the fields inside it do overlap on purpose.
  */
 #define ROW_STRIDE     2584            /* 0xA18 dwords per row record */
 #define MAX_ROWS       1024            /* the original's .bss allows 1331 */
-#define ROW_SLOTS      32              /* 30 slots + slack                */
 
-/*  the symbol stream at field +0x510, i.e. sub_4053D0's argument layout */
+/* the fields of one record, as dword indices into it */
+#define ROW_SLOT      (0x000 / 4)      /* 1 dword, 0x7FFFFFFF per block    */
+#define ROW_SAMPLES   (0x010 / 4)      /* 320 dwords: the row's samples    */
+#define ROW_LENCNT    (0x44C / 4)      /* 30: a counter per length code    */
+#define ROW_DISTFREQ  (0x480 / 4)      /* 30: frequency per distance code */
+#define ROW_SYMBOLS   (0x510 / 4)      /* 318: the symbol stream           */
+#define ROW_LENBITS   (0x89C / 4)      /* 30, then 29 more: bits a length
+                                          symbol costs in this row         */
+#define ROW_ROWBITS   (0x910 / 4)      /* 1 dword: bits the row needs      */
+#define ROW_DISTBITS  (0x990 / 4)      /* 30: bits a distance symbol costs*/
+
+/* the symbol stream at field +0x510, i.e. sub_4053D0's argument layout */
 #define ROW_LITERALS   256             /* literal slots, values 0 .. 15   */
 #define ROW_LENSLOTS   30              /* length slots, at +256          */
 #define ROW_DISTSLOTS  30              /* distance slots, at +288        */
@@ -278,16 +279,32 @@ extern int ColorHashNext[MAX_COLORS];
 extern int ColorHashCount;
 extern int *ColorHashPalette;
 
-/* --- the symbol stream one row is coded from ------------------------ */
-/*  0x42EE68, field +0x510 of the row record: 256 literal slots, then 30
- *  length slots at +256, then 30 distance slots at +288.  sub_4053D0 eats
- *  it; see FlushRow() in src/optimize.c. */
-extern int      ImageBuffer[MAX_ROWS * ROW_STRIDE];
+/* --- the row records ------------------------------------------------- */
+/*  One 2584 dword record per row, laid out exactly as the original's fields
+    are; see the offsets above.  The symbol stream a row is coded from is
+    field +0x510: 256 literal slots, 30 length slots, 30 distance slots. */
+extern int      RowRecord[MAX_ROWS * ROW_STRIDE];
 
 /* --- deflate block state, src/optimize.c -------------------------- */
-extern int      LenPairs[60];   /* 0x1809390: 30 (base, extra) pairs */
-extern int      DistPairs[56];  /* 0x1809480: 28 (base, extra) pairs */
-extern unsigned char LenCodeToSlot[256];
+extern int      LenPairs[60];   /* 0x1809390: 30 (extra, base) pairs */
+extern int      DistPairs[56];  /* 0x1809480: 28 (extra, base) pairs */
+/*
+ *  sub_4058A0 fills the length slot table *backwards* from its end:
+ *
+ *      mov eax, 102h              ; 258
+ *      mov esi, offset unk_180BA7F
+ *      sub esi, eax
+ *      ...
+ *      mov [esi+eax], cl          ; a byte at (unk_180BA7F - 258 + slot)
+ *
+ *  so it writes 255 bytes *below* the table as well.  In the original those
+ *  bytes are the tail of the palette area and nothing else, so the store is
+ *  deliberate and harmless.  Here they would land on whichever global the
+ *  linker happened to put next, so the array carries its own 255 bytes of
+ *  slack in front and the under-run lands there.
+ */
+extern unsigned char LenCodeToSlotStore[255 + 256];
+#define LenCodeToSlot   (LenCodeToSlotStore + 255)
 extern unsigned char DistCodeToSlot[32768];
 extern int      LenHuffIndex, LenHuffCount, DistTablesDone;
 
@@ -296,7 +313,13 @@ extern int      HashPrev[511];   /* 0x41267C */
 extern int      HashHead[4096];  /* 0x412EC0, used as shorts */
 extern int      DistSlot[32768]; /* 0x41CEC8, used as shorts */
 extern int      MatchArea[0x8000];   /* 0x6B4968 */
-extern int      RowSlot[(MAX_ROWS + 1) * ROW_SLOTS];  /* 0x42E958 */
+
+extern int      Entropy[256];        /* dword_42E560, the trial histogram */
+extern int      CurFilter;           /* dword_185BEBC, the filter in use    */
+extern int      EntropyMax;           /* dword_180A568, its largest count    */
+extern int     *EntropyLut;           /* dword_18CBEE8                        */
+extern int      EntropyLutSize;       /* dword_18CBEE4                        */
+unsigned int EstimateEntropy(int *hist, int buckets);
 
 extern int      MinSample;        /* dword_185BEC0, the darkest sample */
 extern int      unk_185BEC8, unk_180BA84, unk_185BEB8, unk_411D58, unk_41CEC0;
@@ -307,9 +330,6 @@ int  BuildDeflateTables(void);
 int  InitBlockTables(void);
 int  BuildDistanceSlots(int row);
 extern int      DistSlots[64];        /* dword_6D5578 */
-extern int      DistWork[MAX_ROWS * ROW_STRIDE];  /* dword_42E968 */
-extern int      DistSymBits[(MAX_ROWS + 1) * ROW_SLOTS]; /* dword_42F2E8 */
-extern int      LenSymBits[(MAX_ROWS + 1) * ROW_SLOTS];  /* dword_42F1F4 */
 extern unsigned char SlotOrder[32];      /* byte_185BA90 */
 extern int      FreqA, FreqB;          /* dword_6F6678, dword_6F6AF8 */
 int  RankValues(int *vals, int count, int *out);

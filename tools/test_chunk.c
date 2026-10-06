@@ -560,7 +560,6 @@ int main(void)
         check("two used symbols both get 1 bit", lens[0] + lens[1], 2);
         (void)expect;
     }
-
     /* ---- RankValues: code lengths in, deflate codes out (sub_405800) ---- */
     {
         static int lens[19];
@@ -643,7 +642,6 @@ int main(void)
         RankValues(lens, 19, codes);
         check("unused symbols are not written", codes[0], -1);
     }
-
     /* ---- deflate length / distance tables (sub_4058A0) ---- */
     {
         static IMAGEDESC img;
@@ -713,7 +711,6 @@ int main(void)
             LenPairs[14] = before;
         }
     }
-
     /* ---- FlushRow: the row writer (sub_4053D0) ---- */
     {
         static unsigned char out[4096];
@@ -756,7 +753,6 @@ int main(void)
         check("one literal: byte 6", out[6], 0x3F);
         check("one literal: the padded byte", out[7], 0x1B);
         check("one literal: bytes written", OutCount, 8);
-
         n = tdecode(out, got, &nlen, &ndist, &nsent, &bits);
         check("one literal: decodes", n, 258);
         check("one literal: one length slot used", nlen, 257);
@@ -869,7 +865,6 @@ int main(void)
             check("zero runs: all of it came back", ok, 1);
             check("zero runs: costs far less than 175 bits", OutCount < 24, 1);
         }
-
         /* the scan-backs: how many slots are in use is found by walking down
            over the first zero, and never drops below one */
         {
@@ -906,7 +901,6 @@ int main(void)
             check("one distance slot at the bottom", ndist, 1);
         }
     }
-
     /* ---- WritePngHeader (sub_405B80) ---- */
     {
         static unsigned char out[8192];
@@ -1024,12 +1018,7 @@ int main(void)
         img.bkgd = 0x00112233u;
         MinSample = 0x00010203;            /* 0xAARRGGBB, so R G B = 1 2 3 */
         check("RGB header returns 1", WritePngHeader(64, 32, 2, 8, NULL, 0), 1);
-        /* 33 + tRNS(12 + 6) + bKGD(12 + 6) */
         check("RGB tRNS and bKGD size", OutCount, 33 + 12 + 6 + 12 + 6);
-        printf("info bytes 33..:");
-        for (i = 33; i < OutCount; i++)
-            printf(" %02x", out[i]);
-        printf("\n");
         check("tRNS length is six", (out[33] << 24) | (out[34] << 16) |
                                     (out[35] << 8) | out[36], 6);
         check("tRNS tag", memcmp(out + 37, "tRNS", 4), 0);
@@ -1068,7 +1057,6 @@ int main(void)
               WritePngHeader(64, 32, 6, 8, NULL, 0), 1);
         check("header only", OutCount, 33);
     }
-
     /* ---- the kept chunks ---- */
     {
         static unsigned char out[8192];
@@ -1117,6 +1105,95 @@ int main(void)
                                        (out[51] << 8) | out[52], 3);
         check("sBIT keeps its values", out[57], 8);
         check("sBIT last value", out[59], 8);
+    }
+
+    /* ---- EstimateEntropy (sub_4063F0) ---- */
+    {
+        static int hist[256];
+        unsigned int a, b, c;
+        int i;
+
+        memset(hist, 0, sizeof(hist));
+
+        /* nothing in the histogram at all: the score is the starting value */
+        CurFilter = 0;
+        EntropyMax = 1;
+        Entropy[0] = 1;
+        check("empty histogram", EstimateEntropy(hist, 256), 0x7FFFFFFEu);
+        check("the shared histogram was touched", Entropy[0], 0);
+
+        /*
+         *  The score is scaled so that the commonest symbol, whose count is
+         *  one past EntropyMax, comes out at the top of the 31 bit range.  So
+         *  one symbol used nine times is the worst case there is - there is
+         *  nothing left to predict it from - and eight symbols used nine times
+         *  each cannot be any worse.
+         */
+        memset(hist, 0, sizeof(hist));
+        hist[0] = 9;
+        CurFilter = 0;
+        Entropy[0] = 1;
+        EntropyMax = 10;
+        a = EstimateEntropy(hist, 256);
+        check("one symbol nine times uses the whole range", a, 0x7FFFFFFEu -
+              0x7FFFFFFFu);
+
+        memset(hist, 0, sizeof(hist));
+        for (i = 0; i < 8; i++)
+            hist[i] = 9;
+        CurFilter = 0;
+        Entropy[0] = 1;
+        EntropyMax = 10;
+        b = EstimateEntropy(hist, 256);
+        check("eight symbols nine times scores better", b < a, 1);
+
+        /* and a flatter histogram is worse still: the score goes up */
+        memset(hist, 0, sizeof(hist));
+        hist[0] = 36;
+        CurFilter = 0;
+        Entropy[0] = 1;
+        EntropyMax = 37;
+        c = EstimateEntropy(hist, 256);
+        memset(hist, 0, sizeof(hist));
+        for (i = 0; i < 4; i++)
+            hist[i] = 9;
+        CurFilter = 0;
+        Entropy[0] = 1;
+        EntropyMax = 10;
+        check("four symbols nine times is worse than eight",
+              c > EstimateEntropy(hist, 256), 1);
+
+        /* counts of zero and one cost nothing at all */
+        memset(hist, 0, sizeof(hist));
+        hist[0] = 9;
+        hist[1] = 0;
+        hist[2] = 1;
+        CurFilter = 0;
+        Entropy[0] = 1;
+        EntropyMax = 10;
+        check("a count of one is free", EstimateEntropy(hist, 256), a);
+
+        /* the table is cached, so the same question twice gives the same
+           answer, and a different maximum count rebuilds it */
+        memset(hist, 0, sizeof(hist));
+        hist[3] = 9;
+        CurFilter = 0;
+        Entropy[0] = 1;
+        EntropyMax = 10;
+        b = EstimateEntropy(hist, 256);
+        check("the same histogram scores the same", b, a);
+
+        memset(hist, 0, sizeof(hist));
+        hist[3] = 12;
+        CurFilter = 0;
+        Entropy[0] = 1;
+        EntropyMax = 13;
+        c = EstimateEntropy(hist, 256);
+        printf("info entropy scores: 9 in one %u, 9 in eight %u, 12 in one %u\n",
+               a, b, c);
+        check("a different maximum count rebuilds the table",
+              EntropyLutSize, 12);
+        check("the table reaches the commonest count", EntropyLut[12] > 0, 1);
     }
 
     printf("\n%s  (%d failure%s)\n", failures ? "FAILED" : "PASSED",
