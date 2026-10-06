@@ -791,7 +791,7 @@ Two independent checks, both runnable.
 
 ### tools\selftest.cmd
 
-323 checks over the recovered code: `Swap16`, `GetImageSize` for all
+351 checks over the recovered code: `Swap16`, `GetImageSize` for all
 eight format codes, the `/k` list handling in `ScanChunks`, `FilterPredict()`,
 `CpuFeatures()`, and the optimiser primitives (CRC table, Huffman heap, colour
 hash, `PutBits()`/`EmitBytes()`, `RankValues()`, `FlushRow()`, `WritePngHeader()`, `EstimateEntropy()`, `BestSplit()`, `PlanBlocks()` with its block-end sort, `FilterByte()` with `Adler32Update()`, and `AdvanceRow()`).

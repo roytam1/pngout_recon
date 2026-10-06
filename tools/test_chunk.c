@@ -1869,6 +1869,53 @@ int main(void)
         Image = NULL;
     }
 
+    /* ---- the IMAGEDESC layout, read off the original's field accesses ---- */
+    {
+        static IMAGEDESC img;
+        static unsigned char base[1024];
+
+#define FIELD_OFFSET(field) \
+    ((int)((unsigned char *)&img.field - (unsigned char *)&img))
+
+        check("width", FIELD_OFFSET(width), 0x08);
+        check("height", FIELD_OFFSET(height), 0x0C);
+        check("the pixel buffer", FIELD_OFFSET(outbuf), 0x10);
+        check("and the decoded image", FIELD_OFFSET(pixels), 0x00);
+        check("its row stride", FIELD_OFFSET(stride), 0x04);
+        check("its size", FIELD_OFFSET(outsize), 0x14);
+        check("the bKGD colour", FIELD_OFFSET(bkgd), 0x30);
+        check("the distinct colour count", FIELD_OFFSET(ndistinct), 0x34);
+        check("the strategy", FIELD_OFFSET(strategy), 0x4C);
+        check("maxblocks", FIELD_OFFSET(maxblocks), 0x54);
+        check("splitthreshold", FIELD_OFFSET(splitthreshold), 0x58);
+        check("the first chunk after IHDR", FIELD_OFFSET(chunkbeg), 0x60);
+        check("the first chunk after PLTE", FIELD_OFFSET(chunkmid), 0x64);
+        check("the first chunk after the image", FIELD_OFFSET(chunktail),
+              0x68);
+        check("one past the last chunk", FIELD_OFFSET(chunkend), 0x6C);
+        check("the chunk records", FIELD_OFFSET(chunks), 0x70);
+        check("the filter trial", FIELD_OFFSET(trial), 0x74);
+        check("progress", FIELD_OFFSET(percent), 0x78);
+        check("the best size so far", FIELD_OFFSET(best), 0xC8);
+
+        /* and the row record fields, which are offsets into one array */
+        check("a row record is one allocation", ROW_STRIDE, 0xA18);
+        check("its samples", ROW_SAMPLES * 4, 0x010);
+        check("the block counter, which is sample 256", ROW_BLOCKS * 4, 0x410);
+        check("the distance samples, at sample 288", ROW_DISTFREQ * 4, 0x490);
+        check("the length array", ROW_SYMBOLS * 4, 0x510);
+        check("the distance samples really are 288 in",
+              ROW_DISTFREQ - ROW_SAMPLES, 288);
+        check("and just past the 286 the code covers",
+              ROW_DISTFREQ - ROW_SAMPLES - ROW_SAMPLE_SYMS, 2);
+        check("the row's own bit count", ROW_ROWBITS * 4, 0x910);
+        check("1024 rows fit the stride",
+              MAX_ROWS * ROW_STRIDE * 4 < 11 * 1024 * 1024, 1);
+
+        (void)base;
+#undef FIELD_OFFSET
+    }
+
     printf("\n%s  (%d failure%s)\n", failures ? "FAILED" : "PASSED",
            failures, failures == 1 ? "" : "s");
     return failures != 0;
