@@ -92,6 +92,8 @@ listing line counts, which is how the remaining work gets sized.
 | `0x405A60` `sub_405A60` | `BuildDistanceSlots()` | `src/optimize.c` |
 | `0x405B80` `sub_405B80` | `WritePngHeader()` | `src/optimize.c` |
 | `0x4063F0` `sub_4063F0` | `EstimateEntropy()` | `src/optimize.c` |
+| `0x406560` `sub_406560` | `Adler32Update()` | `src/optimize.c` |
+| `0x407D80` `sub_407D80` | `FilterByte()` | `src/optimize.c` |
 | `0x408000` `sub_408000` | `PlanBlocks()` + `SortBlockEnds()` | `src/optimize.c` |
 | `0x408390` `sub_408390` | `BestSplit()` | `src/optimize.c` |
 | `0x40E584` `UserMathErrorFunction` | `_UserMathErrorFunction()` | `src/stubs.c` |
@@ -501,6 +503,51 @@ the ends ascending in every case; `/b2`, `/b4` and `/b1` give their block counts
 `/b5000` is clamped to 1024; and the sort itself is checked on a reversed and a
 stride-7 scrambled set of ends.
 
+### sub_407D80, the per byte filter callback
+
+`FilterByte(byte)` is what the filter trials run the image through. It is
+handed one image byte and
+
+* at the start of a row, emits the **filter type** through the sink first —
+  that is PNG's per-row filter byte — and sets `CurFilter` from `TrialFilter`.
+  Filter 3 (average) needs the row above, and there is none on the first row,
+  so the original substitutes filter 1 there. The substitution is sticky: the
+  switch reads `CurFilter`, so the whole row is filtered as sub;
+* stores the **raw** byte into the work buffer, one dword per byte;
+* emits `raw - predictor` through the sink;
+* remembers the raw byte as the left neighbour, advances the position, and at
+  the end of a row wraps it and counts the row — except under the histogram
+  sink, which is driven row by row by its own loop and must not be counted.
+
+The sink is a function pointer (`dword_6D6668`) and there are two of them:
+
+| sink | what it does |
+|---|---|
+| `loc_406510` `CountByte()` | `FilterHistogram[b]++`, `FilterByteCount++` — measure only |
+| `sub_406530` `CompressByte()` | Adler-32, then the LZ coder `sub_4065A0` — compress |
+
+That is the whole trick behind the trials: the same walk over the image can
+either count or compress, once per filter type.
+
+The buffer holds **two rows**, one dword per byte, and `LinBufUsed`'s low bit
+says which of the two slots the row being written owns, so the store always
+lands in the slot the filter is *not* reading. The second slot starts a dword
+past the end of the first to keep it aligned. In dword indices into the data
+area:
+
+```
+LinBufUsed odd  : words[pos] = byte,       the byte above is words[stride+pos+1]
+LinBufUsed even : words[stride+pos+1] = byte,   the byte above is words[pos]
+```
+
+At the first byte of an even row the predictor's left-of-above byte is
+`words[-1]`, i.e. the dword *in front* of the data area — the original reads it
+too, and the tests pin what comes out.
+
+`sub_406530` is stubbed in `src/stubs.c`: `FilterByte()` compares the sink
+pointer against it, so it has to exist, but it needs the LZ coder
+(`sub_4065A0`, 1721 listing lines), which is the next piece.
+
 ### Still to do inside Optimize
 
 `sub_402AD0` itself (5 983 listing lines), the four filter trials
@@ -609,10 +656,10 @@ Two independent checks, both runnable.
 
 ### tools\selftest.cmd
 
-242 checks over the recovered code: `Swap16`, `GetImageSize` for all
+284 checks over the recovered code: `Swap16`, `GetImageSize` for all
 eight format codes, the `/k` list handling in `ScanChunks`, `FilterPredict()`,
 `CpuFeatures()`, and the optimiser primitives (CRC table, Huffman heap, colour
-hash, `PutBits()`/`EmitBytes()`, `RankValues()`, `FlushRow()`, `WritePngHeader()`, `EstimateEntropy()`, `BestSplit()`, `PlanBlocks()` and its block-end sort).
+hash, `PutBits()`/`EmitBytes()`, `RankValues()`, `FlushRow()`, `WritePngHeader()`, `EstimateEntropy()`, `BestSplit()`, `PlanBlocks()` with its block-end sort, and `FilterByte()` with `Adler32Update()`).
 They caught ten real defects, all now fixed:
 
 * PNG dimensions are **4 byte** big endian, not 2 byte. `GetImageSize` was

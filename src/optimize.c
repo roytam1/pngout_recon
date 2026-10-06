@@ -96,7 +96,7 @@ int EmitBlock(unsigned width, unsigned height, int coltype, int bitdepth,
     PutBits(PNGOUT_MARK >> 8, 8);              /* 0x78 */
     PutBits(PNGOUT_MARK & 0xFF, 8);            /* 0x5E */
 
-    CrcPending = 1;                            /* "the CRC has to be patched" */
+    AdlerSum = 1;                              /* the Adler-32 seed */
     InitBlockTables();
 
     /* deflate's BFINAL, then the end-of-block code 256 in 2 bits */
@@ -1716,4 +1716,131 @@ int FindColor(int color)
     }
 
     return i;
+}
+
+/* ------------------------------------------------------------------ */
+/*  sub_407D80: filter one byte and hand it to the trial''s sink         */
+/* ------------------------------------------------------------------ */
+
+/*
+ *  One image byte in, one filtered byte out - and the trial''s sink decides
+ *  where the result goes.  The sink is a function pointer (dword_6D6668) which
+ *  is one of
+ *
+ *      loc_406510    a bare histogram: FilterHistogram[b]++, FilterByteCount++
+ *      sub_406530    Adler-32 plus the LZ coder, i.e. real compression
+ *
+ *  so the same walk over the image can either measure or compress, and that is
+ *  how the filter trials work: they run the image through with one filter type
+ *  each and compare what comes out.
+ *
+ *  The raw byte is written into the work buffer as it goes, one dword per byte,
+ *  because the filters need the byte above.  Two row slots are used in turn -
+ *  the row being written and the row above it - and LinBufUsed''s low bit says
+ *  which slot this row owns, so the store always lands in the slot the filter
+ *  is not reading.  Both slots are dword-aligned, which is why the second one
+ *  starts a dword past the end of the first.
+ *
+ *  `above` is therefore a dword index into the data area and the predictor's
+ *  left-of-above byte is one below it.  On the first byte of an even row that
+ *  lands in the word in front of the data - the original reads it too.
+ */
+void FilterByte(int byte)
+{
+    int *words = (int *)LinBufData;
+    int above;
+
+    if (BitBufPos == 0) {
+        /*
+         *  Start of a row: PNG wants the filter type first, so it goes to the
+         *  sink before any data byte.  Filter 3 is the average, which reads the
+         *  byte above, and there is no row above the first one - the original
+         *  substitutes filter 1 there rather than read whatever is in the slot.
+         */
+        CurFilter = TrialFilter;
+        if (CurFilter == 3 && LinBufUsed == 0)
+            CurFilter = 1;
+        ByteSink(CurFilter);
+        FilterLeft = 0;
+    }
+
+    if (LinBufUsed & 1) {
+        words[BitBufPos] = byte;
+        above = LinBufBytes + BitBufPos + 1;
+    } else {
+        words[LinBufBytes + BitBufPos + 1] = byte;
+        above = BitBufPos;
+    }
+
+    switch (CurFilter) {
+    case 0:                                       /* none */
+        ByteSink(byte);
+        break;
+    case 1:                                       /* sub: the byte to the left */
+        ByteSink(byte - FilterLeft);
+        break;
+    case 2:                                       /* up: the byte above */
+        ByteSink(byte - words[above]);
+        break;
+    case 3:                                       /* average of the two */
+        ByteSink(byte - (((words[above] & 0xFF) + (FilterLeft & 0xFF)) >> 1));
+        break;
+    case 4:                                       /* the predictor */
+        ByteSink(byte - FilterPredict(FilterLeft, words[above] & 0xFF,
+                                      words[above - 1] & 0xFF));
+        break;
+    }
+
+    /*
+     *  The byte to the left is the *raw* one, not the filtered one, and it is
+     *  taken from the argument after the filter has run.
+     */
+    FilterLeft = byte;
+    BitBufPos++;
+    if (BitBufPos < LinBufBytes)
+        return;
+    BitBufPos = 0;
+
+    /*
+     *  Row finished.  The histogram sink is driven row by row by its own loop,
+     *  so only the other sinks count rows here - and only the compressing one
+     *  cares that a block has filled up.
+     */
+    if (ByteSink == CountByte)
+        return;
+
+    LinBufUsed++;
+    if (ByteSink == CompressByte && LinBufUsed >= BlockSymbols &&
+        BlockFullHook != NULL)
+        BlockFullHook();
+}
+
+/*
+ *  loc_406510: the measuring sink.  All it does is count, so that the filter
+ *  trials can see how compressible a filtered row is without compressing it.
+ */
+int CountByte(int byte)
+{
+    FilterHistogram[byte & 0xFF]++;
+    FilterByteCount++;
+    return 0;
+}
+
+/*
+ *  sub_406560: one Adler-32 step.  Both halves are mod 65521, and the halves
+ *  are tested against the modulus separately so the sums never overflow.
+ */
+unsigned int Adler32Update(unsigned int sum, int byte)
+{
+    unsigned int lo = (sum & 0xFFFF) + (unsigned int)(byte & 0xFF);
+    unsigned int hi;
+
+    if (lo >= 65521)
+        lo -= 65521;
+
+    hi = lo + (sum >> 16);
+    if (hi >= 65521)
+        hi -= 65521;
+
+    return lo | (hi << 16);
 }

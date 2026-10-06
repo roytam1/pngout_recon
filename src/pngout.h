@@ -269,7 +269,27 @@ extern int      ChunkStart;       /* dword_412160, start of the IDAT header */
 extern unsigned char Scratch[64];  /* dword_412E78: the chunk staging area  */
 extern int      RowIndex;         /* dword_42D7CC */
 extern int      RowCount;         /* dword_6D5570 */
-extern int      CrcPending;       /* dword_706B84 */
+extern int      AdlerSum;         /* dword_706B84: Adler-32 of the raw data */
+
+/* --- the per byte filter callback, sub_407D80 ---------------------- */
+/*
+ *  dword_6D6668 points at whichever of the sinks below the trial wants, and
+ *  sub_407D80 both filters the byte and hands the result to it.  It returns
+ *  int because the original does, but every caller discards the value.
+ */
+typedef int (*ByteSinkFn)(int byte);
+extern ByteSinkFn ByteSink;       /* dword_6D6668 */
+extern int      TrialFilter;      /* dword_6D5664, the filter this trial is on */
+extern int      FilterLeft;       /* dword_6D496C, the previous raw byte */
+extern int      FilterHistogram[256];    /* dword_42E560 */
+extern int      FilterByteCount;  /* dword_180A568 */
+/*
+ *  The original jumps straight into the row loop's block-full handler
+ *  (loc_4075B0, inside sub_4071D0) when a compressing sink has taken as many
+ *  bytes as the block allows.  That handler is not reconstructed yet, so the
+ *  jump is a hook the row loop installs.
+ */
+extern void   (*BlockFullHook)(void);
 
 /* --- the Huffman work area --------------------------------------- */
 extern unsigned CrcTable[256];
@@ -363,6 +383,12 @@ extern unsigned char SlotOrder[32];      /* byte_185BA90 */
 extern int      FreqA, FreqB;          /* dword_6F6678, dword_6F6AF8 */
 int  RankValues(int *vals, int count, int *out);
 void FlushRow(int *row);
+
+/* sub_407D80: filter one image byte and hand it to the trial's sink */
+void FilterByte(int byte);
+int  CountByte(int byte);                  /* loc_406510, the histogram sink */
+unsigned int Adler32Update(unsigned int sum, int byte);   /* sub_406560 */
+int  CompressByte(int byte);               /* sub_406530, the LZ coder's sink */
 
 /* fill `dest` with a 32 bit pattern; the CRT memset only does bytes */
 void memset32(void *dest, int value, int count);

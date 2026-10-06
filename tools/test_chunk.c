@@ -154,6 +154,17 @@ static int tdecode(const unsigned char *out, int *got, int *nlen,
 
 static int esc_calls;
 
+static unsigned char got[128];        /* what record_sink() was handed */
+static int gotn;
+
+static int record_sink(int byte)
+{
+    if (gotn < (int)sizeof(got))
+        got[gotn] = (unsigned char)byte;
+    gotn++;
+    return 0;
+}
+
 static int esc_hook(int unused)
 {
     (void)unused;
@@ -1399,6 +1410,178 @@ int main(void)
         SortBlockEnds(3);
         check("three ends sort", *BlockEnd(0) * 100 + *BlockEnd(1) * 10 +
               *BlockEnd(2), 359);
+    }
+    /* ---- FilterByte: sub_407D80, one byte in and one byte out -------- */
+    {
+        static int words[1024];        /* LinBufData, one dword per byte */
+        static IMAGEDESC img;
+        int i;
+
+        memset(&img, 0, sizeof(img));
+        memset(words, 0, sizeof(words));
+        memset(FilterHistogram, 0, sizeof(FilterHistogram));
+        memset(got, 0, sizeof(got));
+        Image = &img;
+        LinBufData = (unsigned char *)words;
+        LinBuf = (unsigned char *)words - 4;    /* the base pointer sits low */
+        LinBufBytes = 4;                         /* four bytes to a row       */
+        LinBufUsed = 0;
+        BitBufPos = 0;
+        FilterLeft = 0x99;                       /* must not leak into a row  */
+        FilterByteCount = 0;
+        BlockSymbols = 0x7FFFFFFF;
+        BlockFullHook = NULL;
+        ByteSink = record_sink;
+
+        /*
+         *  Row 0, no filter: the filter type comes out first because that is
+         *  what PNG wants, then the bytes untouched.
+         */
+        TrialFilter = 0;
+        for (i = 0; i < 4; i++)
+            FilterByte((unsigned char)(10 * (i + 1)));
+        check("the row emits its filter type first", got[0], 0);
+        check("an unfiltered row passes the bytes through", got[1], 10);
+        check("all of them", got[2] * 100 + got[3] * 10 + got[4], 2340);
+        check("the row counter wrapped to the start", BitBufPos, 0);
+        check("the row was counted", LinBufUsed, 1);
+        check("the left byte does not survive a row", FilterLeft, 40);
+
+        /*
+         *  Row 1, sub: each byte against the raw byte to its left.  This row
+         *  owns the lower slot, so it also overwrites the row above it.
+         */
+        TrialFilter = 1;
+        for (i = 0; i < 4; i++)
+            FilterByte((unsigned char)(1 + 10 * i));
+        check("the sub filter announces itself", got[5], 1);
+        check("sub uses a zero left byte at the row start", got[6], 1);
+        check("sub uses the byte to the left after that", got[7], 10);
+        check("sub keeps doing it", got[8] + got[9], 20);
+
+        /* Row 2, up: against row 1, which is now in the lower slot */
+        TrialFilter = 2;
+        for (i = 0; i < 4; i++)
+            FilterByte((unsigned char)(5 + 10 * i));
+        check("the up filter announces itself", got[10], 2);
+        check("up subtracts the row above", got[11], 4);
+        check("every byte of it", got[12] + got[13] + got[14], 12);
+
+        /* Row 3, average: against row 2, the first byte has a zero left */
+        TrialFilter = 3;
+        for (i = 0; i < 4; i++)
+            FilterByte((unsigned char)(40 + 10 * i));
+        check("the average filter announces itself", got[15], 3);
+        check("the average of a zero and five is two", got[16], 38);
+        check("and of 40 and 15 is 27", got[17], 23);
+        check("and again", got[18] + got[19], 46);
+
+        /*
+         *  Row 4, the predictor, fed the same bytes as row 3 so that the row
+         *  above matches it.  This is not PNG's Paeth - it picks whichever of
+         *  the three candidates is closest - and on a ramp the left byte wins,
+         *  which turns the row into a constant.  The first byte reads the word
+         *  in front of the data area for its left-of-above byte, as the
+         *  original does.
+         */
+        TrialFilter = 4;
+        for (i = 0; i < 4; i++)
+            FilterByte((unsigned char)(40 + 10 * i));
+        check("the predictor announces itself", got[20], 4);
+        check("the first byte of an even row reads below the data",
+              got[21], 40);
+        check("a ramp becomes a constant", got[22], 10);
+        check("all of it", got[23] + got[24], 20);
+
+        check("everything the sink saw", gotn, 25);
+
+        /* the average filter is only replaced on the very first row */
+        LinBufUsed = 0;
+        BitBufPos = 0;
+        gotn = 0;
+        TrialFilter = 3;
+        FilterByte(1);
+        check("the average becomes sub on the first row", CurFilter, 1);
+        check("and the row says so", got[0], 1);
+        BitBufPos = 2;
+        FilterByte(1);
+        check("and it stays for the rest of the row", CurFilter, 1);
+
+        /*
+         *  A filter type outside 0..4 emits no data at all - but only the start
+         *  of a row copies TrialFilter into CurFilter, so the row has to be
+         *  started with it first.
+         */
+        LinBufUsed = 0;
+        BitBufPos = 0;
+        gotn = 0;
+        TrialFilter = 9;
+        FilterByte(7);
+        check("an unknown filter type is still announced", got[0], 9);
+        gotn = 0;
+        FilterByte(7);
+        check("but it emits no data", gotn, 0);
+        check("the byte is still stored", words[LinBufBytes + 1], 7);
+        check("and the position still moves", BitBufPos, 2);
+
+        /* the raw byte is kept one dword per byte, in the other slot */
+        words[LinBufBytes + 1] = 0;
+        BitBufPos = 0;
+        LinBufUsed = 1;
+        TrialFilter = 0;
+        gotn = 0;
+        FilterByte(0xAB);
+        check("an odd row writes the lower slot", words[0], 0xAB);
+        check("and leaves the upper slot for the row above",
+              words[LinBufBytes + 1], 0);
+        LinBufUsed = 0;
+        BitBufPos = 0;
+        FilterByte(0xCD);
+        check("an even row writes the upper slot",
+              words[LinBufBytes + 1], 0xCD);
+        check("and leaves the lower slot alone", words[0], 0xAB);
+
+        /* the histogram sink, which does not count rows */
+        ByteSink = CountByte;
+        LinBufUsed = 0;
+        BitBufPos = 0;
+        FilterByte(3);
+        FilterByte(3);
+        FilterByte(9);
+        check("the histogram counts bytes", FilterByteCount, 4);
+        check("it counted the filter type", FilterHistogram[0], 1);
+        check("and both threes", FilterHistogram[3], 2);
+        check("and the nine", FilterHistogram[9], 1);
+        check("the histogram sink leaves the row counter alone",
+              LinBufUsed, 0);
+
+        /* Adler-32, against the same sum worked out here */
+        {
+            unsigned int sum = 1;
+            unsigned long a = 1, b = 0;
+            int k;
+
+            for (k = 0; k < 64; k++) {
+                unsigned char c = (unsigned char)(k * 37 + (k >> 2));
+
+                sum = Adler32Update(sum, c);
+                a += c;
+                if (a >= 65521) a -= 65521;
+                b += a;
+                if (b >= 65521) b -= 65521;
+            }
+            check("Adler-32 after one byte", Adler32Update(1, 255) & 0xFFFF,
+                  256);
+            check("Adler-32 of 64 bytes", sum, (unsigned int)(b << 16 | a));
+            check("Adler-32 wraps its low half",
+                  Adler32Update(65520, 5) & 0xFFFF, 4);
+            check("Adler-32 wraps its high half",
+                  Adler32Update((65520u << 16) | 1, 1) >> 16, 1);
+        }
+
+        ByteSink = NULL;
+        LinBuf = NULL;
+        LinBufData = NULL;
     }
 
     printf("\n%s  (%d failure%s)\n", failures ? "FAILED" : "PASSED",

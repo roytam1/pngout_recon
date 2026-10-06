@@ -126,7 +126,15 @@ int      ChunkStart;           /* 0x412160, where the IDAT header starts  */
 unsigned char Scratch[64];
 int      RowIndex;             /* 0x42D7CC */
 int      RowCount;             /* 0x6D5570 */
-int      CrcPending;           /* 0x706B84 */
+int      AdlerSum;             /* 0x706B84: Adler-32 of the unfiltered data */
+
+/* the per byte filter callback, src/optimize.c */
+ByteSinkFn ByteSink;           /* 0x6D6668 */
+int      TrialFilter;          /* 0x6D5664 */
+int      FilterLeft;           /* 0x6D496C, the previous raw byte */
+int      FilterHistogram[256]; /* 0x42E560: unk_42E55C is four bytes below */
+int      FilterByteCount;      /* 0x180A568 */
+void   (*BlockFullHook)(void); /* where sub_407D80's jump to loc_4075B0 goes */
 
 /* the Huffman work area, src/optimize.c */
 int      Freq[HUFF_MAXSYMS];           /* 0x42CEC8 */
