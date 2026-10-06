@@ -157,6 +157,17 @@ static int esc_calls;
 static unsigned char got[128];        /* what record_sink() was handed */
 static int gotn;
 
+/* the little endian sample a run of filtered bytes makes */
+static unsigned bpack(int n, const unsigned char *b)
+{
+    unsigned v = 0;
+    int i;
+
+    for (i = 0; i < n; i++)
+        v |= (unsigned)b[i] << (8 * i);
+    return v;
+}
+
 static int record_sink(int byte)
 {
     if (gotn < (int)sizeof(got))
@@ -1415,7 +1426,6 @@ int main(void)
     {
         static int words[1024];        /* LinBufData, one dword per byte */
         static IMAGEDESC img;
-        int i;
 
         memset(&img, 0, sizeof(img));
         memset(words, 0, sizeof(words));
@@ -1582,6 +1592,281 @@ int main(void)
         ByteSink = NULL;
         LinBuf = NULL;
         LinBufData = NULL;
+    }
+
+    /* ---- the wider samples: 16, 24 and 32 bit ----------------------- */
+    {
+        static int words[1024];
+        static IMAGEDESC img;
+
+        memset(&img, 0, sizeof(img));
+        memset(words, 0, sizeof(words));
+        Image = &img;
+        LinBufData = (unsigned char *)words;
+        LinBuf = (unsigned char *)words - 4;
+        LinBufBytes = 2;                     /* two samples to a row        */
+        LinBufUsed = 0;
+        BitBufPos = 0;
+        BlockSymbols = 0x7FFFFFFF;
+        BlockFullHook = NULL;
+        ByteSink = record_sink;
+
+        /*
+         *  Two rows of two samples.  The sub filter uses the *same* byte of
+         *  the sample to the left, so the second sample of a row comes out as
+         *  one repeated byte rather than as a little endian subtraction.
+         */
+        TrialFilter = 1;
+        gotn = 0;
+        FilterPixel32(0x20304010);
+        FilterPixel32(0x50607080);
+        check("32 bit: the filter type comes first", got[0], 1);
+        check("and four bytes go out per sample", gotn, 9);
+        check("the first sample has nothing to its left",
+              bpack(4, got + 1), 0x20304010);
+        check("the second is the first, byte by byte",
+              bpack(4, got + 5), 0x30303070);
+
+        /* 16 bit: two bytes a sample */
+        LinBufUsed = 0;
+        BitBufPos = 0;
+        gotn = 0;
+        FilterPixel16(0x1234);
+        FilterPixel16(0x5678);
+        check("16 bit: two bytes per sample", gotn, 5);
+        check("the first sample passes through", bpack(2, got + 1), 0x1234);
+        check("and the second minus the first", bpack(2, got + 3), 0x4444);
+
+        /* 24 bit: three bytes a sample, and the argument's high byte is not
+           one of them */
+        LinBufUsed = 0;
+        BitBufPos = 0;
+        gotn = 0;
+        FilterPixel24(0x112233);
+        FilterPixel24(0x445566);
+        check("24 bit: three bytes per sample", gotn, 7);
+        check("the top byte of the argument is ignored",
+              bpack(3, got + 1), 0x112233);
+        check("and only the low three are filtered",
+              bpack(3, got + 4), 0x333333);
+
+        /*
+         *  The up filter, across two rows: row 0 lands in the upper slot and
+         *  row 1 reads it from there, so the second row comes out as zeroes.
+         */
+        LinBufUsed = 0;
+        BitBufPos = 0;
+        gotn = 0;
+        TrialFilter = 2;
+        FilterPixel32(0x20304010);
+        FilterPixel32(0x50607080);
+        check("the first row has nothing above it",
+              (int)bpack(4, got + 1), 0x20304010);
+        check("in either sample", (int)bpack(4, got + 5), 0x50607080);
+        BitBufPos = 0;
+        gotn = 0;
+        FilterPixel32(0x01020304);
+        FilterPixel32(0x50607080);
+        check("32 bit up: against the row above, byte by byte",
+              (int)bpack(4, got + 1), (int)0xE1D2C3F4u);
+        check("a sample equal to the row above comes out as zeroes",
+              (int)bpack(4, got + 5), 0);
+
+        ByteSink = NULL;
+        LinBuf = NULL;
+        LinBufData = NULL;
+    }
+
+    /* ---- AdvanceRow: sub_407090, close a row and open the next ------- */
+    {
+        static IMAGEDESC img;
+        static int oldlens[ROW_SAMPLE_MAX];
+        int *samples, *lens, i, want, got;
+
+        memset(&img, 0, sizeof(img));
+        memset(LensScratch, 0, sizeof(LensScratch));
+        Image = &img;
+
+        RowIndex = 0;
+        RowCount = 1;                 /* so the tail returns straight away  */
+        RowCost = 0;
+        RowHeaderCode = 5;
+        BitBuf = 0;
+        BitCount = 0;
+
+        samples = ROWOF(0, ROW_SAMPLES);
+        lens = ROWOF(0, ROW_SYMBOLS);
+
+        for (i = 0; i < ROW_SAMPLE_MAX; i++) {
+            samples[i] = 0;
+            lens[i] = 0;
+        }
+        samples[0] = 100;
+        samples[1] = 60;
+        samples[2] = 30;
+        samples[3] = 10;
+        samples[4] = 0x80000000;      /* locked: a count of one afterwards  */
+        samples[5] = 0xC0000007;      /* only bit 31 goes                  */
+        samples[ROW_LITERALS] = 3;    /* sample 256, the first length code  */
+        *ROWOF(0, ROW_BLOCKS) = 0;
+        *ROWOF(0, ROW_ROWBITS) = 7;
+        for (i = 0; i < ROW_DISTSLOTS; i++)
+            ROWOF(0, ROW_DISTFREQ)[i] = i + 1;
+
+        memcpy(oldlens, lens, sizeof(oldlens));
+        check("AdvanceRow returns the row count", AdvanceRow(), 1);
+        check("it counted the block", *ROWOF(0, ROW_BLOCKS), 1);
+        check("it put out the row's code", BitCount, 7);
+        check("which is the code it was given", BitBuf & 0x7F, 5);
+        check("the locked sample became one", samples[4], 1);
+        check("the other one lost only bit 31", samples[5], 0x40000007);
+        check("the row index moved on", RowIndex, 1);
+
+        /* the lengths came from the samples, and the distance ones from
+           sample 288 on */
+        {
+            static int want_dist[ROW_DISTSLOTS];
+            int want_lit[ROW_SAMPLE_SYMS];
+
+            BuildCodeLengths(samples, ROW_SAMPLE_SYMS, want_lit, 16);
+            check("the literal and length codes were rebuilt",
+                  memcmp(LensScratch, want_lit,
+                         ROW_SAMPLE_SYMS * sizeof(int)), 0);
+
+            /* the distance samples are untouched by the literal build, so
+               rebuild them from a copy taken before it */
+            for (i = 0; i < ROW_SAMPLE_SYMS; i++)
+                want_lit[i] = samples[i];
+            BuildCodeLengths(samples, ROW_SAMPLE_SYMS, LensScratch, 16);
+            BuildCodeLengths(ROWOF(0, ROW_DISTFREQ), ROW_DISTSLOTS,
+                             want_dist, 16);
+            check("the distance codes were rebuilt too",
+                  memcmp(LensScratch + (ROW_DISTFREQ - ROW_SAMPLES), want_dist,
+                         ROW_DISTSLOTS * sizeof(int)), 0);
+        }
+
+        /* the record's own lengths were replaced by the mirror, and the cost
+           is how far each one moved times how often the symbol occurred */
+        want = 0;
+        for (i = 0; i < ROW_SAMPLE_MAX; i++)
+            want += (LensScratch[i] - oldlens[i]) * samples[i];
+        check("the cost moved by the length change times the frequency",
+              RowCost, want);
+        check("and it is not free", RowCost > 0, 1);
+
+        /* the four samples neither build covers keep the mirror */
+        for (i = 0; i < ROW_SAMPLE_MAX; i++)
+            if (ROWOF(0, ROW_SYMBOLS)[i] != LensScratch[i])
+                break;
+        check("every sample's length was written back", i, ROW_SAMPLE_MAX);
+
+        /*
+         *  With a second row to go it opens it: the row index moves on, the
+         *  distance slots are rebuilt for it, one bit says whether this is
+         *  the last row and two bits of BFINAL-style marker follow.
+         */
+        BitBuf = 0;
+        BitCount = 0;
+        RowCount = 2;
+        img.width = 4;
+        img.height = 2;
+        for (i = 0; i < ROW_SAMPLE_MAX; i++)
+            ROWOF(1, ROW_SAMPLES)[i] = 1;
+        got = AdvanceRow();
+        check("it returns the row count", got, 2);
+        check("and the index is on the last row", RowIndex, 2);
+        check("row 1 of 2 is the last row", BitBuf & 1, 1);
+        check("and the marker is two", (BitBuf >> 1) & 3, 2);
+        RowCount = 1;
+        RowIndex = 0;
+    }
+
+    /* ---- FinishBlock: loc_4075B0, close the block -------------------- */
+    {
+        static IMAGEDESC img;
+        static unsigned char out[512];
+        unsigned char *before;
+        int n, i;
+
+        memset(&img, 0, sizeof(img));
+        memset(out, 0, sizeof(out));
+        Image = &img;
+        img.outbuf = out;
+        img.outsize = sizeof(out);
+
+        OutCount = 0;
+        BitBuf = 0;
+        BitCount = 0;
+        BitCrc = 0xFFFFFFFFu;
+        AdlerSum = 0x12345678u;
+        ChunkStart = 12;              /* pretend an IDAT header went out   */
+        RowIndex = 0;
+        RowCount = 1;                 /* so AdvanceRow() stops after it     */
+        FlushLz = NULL;
+        RowHeaderCode = 0;
+        *ROWOF(0, ROW_ROWBITS) = 0;
+        *ROWOF(1, ROW_ROWBITS) = 0;
+
+        /* some bits already in the buffer, so the padding has to make up
+           the difference to a whole byte */
+        PutBits(0x2A, 5);
+        n = OutCount;
+        FinishBlock();
+        i = OutCount - 4;         /* just before the length field went out */
+
+        /* five bits went out, then padding, then the Adler-32 and the block
+           CRC, then the IDAT length - and the length has to come out right */
+        check("the block closed", OutCount > n, 1);
+        check("the trailer is the adler and the two lengths",
+              OutCount - n, 1 + 4 + 4 + 4);
+
+        before = out + n;
+        check("the padding is the rest of the byte", (before[0] >> 5) & 7,
+              0x2A >> 5);
+        check("and the byte is complete", BitCount, 0);
+        check("the adler-32 went out big endian",
+              (unsigned)before[1] << 24 | before[2] << 16 |
+              before[3] << 8 | before[4], 0x12345678u);
+        check("the block crc is the complement, big endian",
+              (unsigned)before[5] << 24 | before[6] << 16 |
+              before[7] << 8 | before[8], (unsigned)~BitCrc);
+        {
+            unsigned int len = (unsigned)before[9] << 24 |
+                               before[10] << 16 | before[11] << 8 |
+                               before[12];
+
+            /* the length does not count itself, so it is taken against */
+            /* the output size before those four bytes went out */
+            check("the IDAT length counts what was written",
+                  len, (unsigned)(i - ChunkStart - 12));
+        }
+
+        /* the chunks after the image data go out whole */
+        {
+            static unsigned char tail[16];
+            static unsigned int *list[1];
+
+            /* a chunk record is [length][tag][data][crc], little endian */
+            *(unsigned int *)tail = Swap32(1);   /* the record holds it little endian */
+            memcpy(tail + 4, "tEXt", 4);
+            memcpy(tail + 8, "\0\0\0\0", 4);
+            memcpy(tail + 12, "x", 1);
+            list[0] = (unsigned int *)tail;
+            img.chunks = list;
+            img.chunktail = 0;
+            img.chunkend = 1;
+            n = OutCount;
+            FinishBlock();
+            /* the block's own trailer goes out first - it has no padding
+               this time - and then the chunk, whole */
+            check("a trailing chunk goes out whole", OutCount - n,
+                  4 + 4 + 4 + 13);
+            check("and it comes out unchanged",
+                  memcmp(out + n + 12, tail, 13), 0);
+        }
+
+        FlushLz = NULL;
+        Image = NULL;
     }
 
     printf("\n%s  (%d failure%s)\n", failures ? "FAILED" : "PASSED",

@@ -69,7 +69,7 @@ unsigned short Swap16(unsigned short x)
  *  endian values, so these all need the 32 bit version rather than Swap16.
  *  JPEG's SOF dimensions are the 16 bit one.
  */
-static unsigned int Swap32(unsigned int x)
+unsigned int Swap32(unsigned int x)
 {
     return ((x & 0x000000FFu) << 24) | ((x & 0x0000FF00u) <<  8) |
            ((x & 0x00FF0000u) >>  8) | ((x & 0xFF000000u) >> 24);

@@ -127,6 +127,9 @@ unsigned char Scratch[64];
 int      RowIndex;             /* 0x42D7CC */
 int      RowCount;             /* 0x6D5570 */
 int      AdlerSum;             /* 0x706B84: Adler-32 of the unfiltered data */
+int      RowHeaderCode;        /* 0x6F6A78 */
+int      RowCost;              /* 0x18CBEEC */
+int      LensScratch[ROW_SAMPLE_MAX];    /* 0x412168 */
 
 /* the per byte filter callback, src/optimize.c */
 ByteSinkFn ByteSink;           /* 0x6D6668 */
@@ -134,7 +137,8 @@ int      TrialFilter;          /* 0x6D5664 */
 int      FilterLeft;           /* 0x6D496C, the previous raw byte */
 int      FilterHistogram[256]; /* 0x42E560: unk_42E55C is four bytes below */
 int      FilterByteCount;      /* 0x180A568 */
-void   (*BlockFullHook)(void); /* where sub_407D80's jump to loc_4075B0 goes */
+void   (*BlockFullHook)(void); /* where FilterByte()'s jump to loc_4075B0 goes */
+void   (*FlushLz)(void);      /* the LZ coder's own flush, sub_4065A0(0, 0) */
 
 /* the Huffman work area, src/optimize.c */
 int      Freq[HUFF_MAXSYMS];           /* 0x42CEC8 */
@@ -183,7 +187,7 @@ int      EntropyLutSize;               /* dword_18CBEE4                        *
 int     (*CheckEscHook)(int);            /* dword_6F6670: polled by the trials  */
 int      MinSample;                      /* dword_185BEC0: darkest sample in the image */
 int      unk_185BEC8, unk_180BA84, unk_185BEB8, unk_411D58, unk_41CEC0;
-int      unk_6D4968, unk_6F6B78, unk_412668, unk_42D7C8, unk_18CBEEC;
+int      unk_6D4968, unk_6F6B78, unk_42D7C8;
 unsigned char unk_42E55C;
 
 /* ------------------------------------------------------------------ */

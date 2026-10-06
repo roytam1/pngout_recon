@@ -48,8 +48,6 @@
 #define PNGOUT_MARK 0x5E78           /* the placeholder CRC, = 24184       */
 
 
-/* one row record: the fields are picked out by the offsets in pngout.h */
-#define ROWOF(row, field)   (&RowRecord[ROW_STRIDE * (row) + (field)])
 
 int  BuildDistanceSlots(int row);
 void FlushRow(int *row);
@@ -699,9 +697,9 @@ int InitBlockTables(void)
 
     unk_6D4968 = 0;
     unk_6F6B78 = 0;
-    unk_412668 = 0;
+    LensScratch[ROW_SAMPLE_MAX - 1] = 0;
     unk_42D7C8 = 0;
-    unk_18CBEEC = 0;
+    RowCost = 0;
     RowIndex = 0;
     RowRecord[ROW_STRIDE * RowCount + ROW_SLOT] = 0x7FFFFFFF;
 
@@ -1288,7 +1286,7 @@ int WritePngHeader(int width, int height, int coltype, int bitdepth,
 
     /* ---------------- the chunks from after PLTE ---------------- */
 
-    for (i = Image->chunkmid; i < Image->chunkend; i++) {
+    for (i = Image->chunkmid; i < Image->chunktail; i++) {
         unsigned char *c = (unsigned char *)Image->chunks[i];
         unsigned tag = *(unsigned int *)(c + 4);
 
@@ -1745,10 +1743,10 @@ int FindColor(int color)
  *  left-of-above byte is one below it.  On the first byte of an even row that
  *  lands in the word in front of the data - the original reads it too.
  */
-void FilterByte(int byte)
+void FilterSample(int pixel, int nbytes)
 {
     int *words = (int *)LinBufData;
-    int above;
+    int above, aboveLeft, i;
 
     if (BitBufPos == 0) {
         /*
@@ -1765,37 +1763,50 @@ void FilterByte(int byte)
     }
 
     if (LinBufUsed & 1) {
-        words[BitBufPos] = byte;
+        words[BitBufPos] = pixel;
         above = LinBufBytes + BitBufPos + 1;
     } else {
-        words[LinBufBytes + BitBufPos + 1] = byte;
+        words[LinBufBytes + BitBufPos + 1] = pixel;
         above = BitBufPos;
     }
+    aboveLeft = above - 1;
 
-    switch (CurFilter) {
-    case 0:                                       /* none */
-        ByteSink(byte);
-        break;
-    case 1:                                       /* sub: the byte to the left */
-        ByteSink(byte - FilterLeft);
-        break;
-    case 2:                                       /* up: the byte above */
-        ByteSink(byte - words[above]);
-        break;
-    case 3:                                       /* average of the two */
-        ByteSink(byte - (((words[above] & 0xFF) + (FilterLeft & 0xFF)) >> 1));
-        break;
-    case 4:                                       /* the predictor */
-        ByteSink(byte - FilterPredict(FilterLeft, words[above] & 0xFF,
-                                      words[above - 1] & 0xFF));
-        break;
+    /*
+     *  Every byte of the sample is filtered on its own, against the *same*
+     *  byte of its neighbours - so for a 24 bit image the sub filter uses the
+     *  sample to the left's third byte for the third byte, and the predictor
+     *  gets the sample diagonally above and to the left.
+     */
+    for (i = 0; i < nbytes; i++) {
+        int cur = (pixel >> (8 * i)) & 0xFF;
+        int left = (FilterLeft >> (8 * i)) & 0xFF;
+        int up = (words[above] >> (8 * i)) & 0xFF;
+        int ul = (words[aboveLeft] >> (8 * i)) & 0xFF;
+
+        switch (CurFilter) {
+        case 0:                                   /* none */
+            ByteSink(cur);
+            break;
+        case 1:                                   /* sub */
+            ByteSink(cur - left);
+            break;
+        case 2:                                   /* up */
+            ByteSink(cur - up);
+            break;
+        case 3:                                   /* average of the two */
+            ByteSink(cur - ((left + up) >> 1));
+            break;
+        case 4:                                   /* the predictor */
+            ByteSink(cur - FilterPredict(left, up, ul));
+            break;
+        }
     }
 
     /*
-     *  The byte to the left is the *raw* one, not the filtered one, and it is
-     *  taken from the argument after the filter has run.
+     *  The sample to the left is the *raw* one, not the filtered one, and it
+     *  is taken from the argument after the filter has run.
      */
-    FilterLeft = byte;
+    FilterLeft = pixel;
     BitBufPos++;
     if (BitBufPos < LinBufBytes)
         return;
@@ -1813,6 +1824,26 @@ void FilterByte(int byte)
     if (ByteSink == CompressByte && LinBufUsed >= BlockSymbols &&
         BlockFullHook != NULL)
         BlockFullHook();
+}
+
+void FilterByte(int pixel)            /* sub_407D80, 8 bit: one byte a call */
+{
+    FilterSample(pixel, 1);
+}
+
+void FilterPixel16(int pixel)         /* sub_407B00, 16 bit: two bytes a call */
+{
+    FilterSample(pixel, 2);
+}
+
+void FilterPixel24(int pixel)         /* sub_4077C0, 24 bit: three bytes      */
+{
+    FilterSample(pixel, 3);
+}
+
+void FilterPixel32(int pixel)         /* sub_4071D0, 32 bit: four bytes       */
+{
+    FilterSample(pixel, 4);
 }
 
 /*
@@ -1843,4 +1874,116 @@ unsigned int Adler32Update(unsigned int sum, int byte)
         hi -= 65521;
 
     return lo | (hi << 16);
+}
+
+/* ------------------------------------------------------------------ */
+/*  sub_407090: close the row that filled up, start the next one        */
+/* ------------------------------------------------------------------ */
+
+/*
+ *  Called when the LZ coder has filled a block.  It closes the *row record*
+ *  - the per row Huffman machinery - and then, if there are rows left, opens
+ *  the next one.
+ *
+ *  Closing a row means: count the block in the record, put out the code the
+ *  row needs, drop the "locked" bit the encoder sets on the samples it wants
+ *  to keep in the next code, rebuild the literal/length and distance code
+ *  lengths from the samples, and copy the result back into the record.  The
+ *  running cost is the sum, over every sample, of how far its code length
+ *  moved times how often the symbol occurred - which is the whole point of
+ *  trying one filter at a time: a row whose samples need longer codes makes
+ *  the cost go up and the trial lose.
+ *
+ *  The code lengths are built into a 320 entry scratch mirror of the sample
+ *  array first, 286 entries from the literal/length samples and 30 more at
+ *  offset 288 for the distances - which is where the distance samples already
+ *  are.  The copy back then runs over all 320, so the four entries the two
+ *  builds do not cover keep whatever the mirror held.
+ */
+int AdvanceRow(void)
+{
+    int *samples = ROWOF(RowIndex, ROW_SAMPLES);
+    int *lens = ROWOF(RowIndex, ROW_SYMBOLS);
+    int total = RowCost;
+    int i;
+
+    (*ROWOF(RowIndex, ROW_BLOCKS))++;
+    PutBits(RowHeaderCode, *ROWOF(RowIndex, ROW_ROWBITS));
+
+    /* a locked sample goes back to a count of one, anything else loses the bit */
+    for (i = 0; i < ROW_SAMPLE_MAX; i++)
+        samples[i] = (samples[i] == 0x80000000) ? 1
+                                                : (samples[i] & 0x7FFFFFFF);
+
+    BuildCodeLengths(samples, ROW_SAMPLE_SYMS, LensScratch, 16);
+    BuildCodeLengths(ROWOF(RowIndex, ROW_DISTFREQ), ROW_DISTSLOTS,
+                     LensScratch + (ROW_DISTFREQ - ROW_SAMPLES), 16);
+
+    for (i = 0; i < ROW_SAMPLE_MAX; i++) {
+        total += (LensScratch[i] - lens[i]) * samples[i];
+        lens[i] = LensScratch[i];
+    }
+    RowCost = total;
+
+    RowIndex++;
+    if (RowIndex >= RowCount)
+        return RowCount;
+
+    BuildDistanceSlots(RowIndex);
+    PutBits(RowIndex >= RowCount - 1, 1);
+    PutBits(2, 2);
+    FlushRow(ROWOF(RowIndex, ROW_SYMBOLS));
+    return RowCount;
+}
+
+/* ------------------------------------------------------------------ */
+/*  loc_4075B0: close the deflate block that has just filled up          */
+/* ------------------------------------------------------------------ */
+
+/*
+ *  What FilterByte() jumps to when the compressing sink has taken as many
+ *  bytes as the block allows, and what the LZ coder asks for when it is
+ *  flushed.  The order matters:
+ *
+ *      1. flush the LZ coder, so the last match is emitted;
+ *      2. AdvanceRow(), which closes the row record and opens the next one;
+ *      3. pad the bit stream out to a byte boundary;
+ *      4. the Adler-32 of the *unfiltered* data, big endian - step 2 has to
+ *         come first because it is the LZ flush that leaves the Adler in
+ *         AdlerSum;
+ *      5. the block's CRC, which is the complement of the running one and the
+ *         four bytes that close the deflate block;
+ *      6. the IDAT's length, now that its contents are all written;
+ *      7. whatever chunks belong after the image data.
+ *
+ *  Step 1 is the LZ coder, which is not reconstructed yet, so it is a hook;
+ *  with none installed the rest still runs, which is what the tests want.
+ */
+void FinishBlock(void)
+{
+    unsigned int len;
+    int i;
+
+    if (FlushLz != NULL)
+        FlushLz();
+
+    AdvanceRow();
+
+    PutBits(0, (-BitCount) & 7);
+    PutBits(Swap32(AdlerSum), 32);
+
+    PutBE(Scratch, ~BitCrc);
+    EmitBytes(Scratch, 4);
+
+    /* the IDAT's length is everything written since its chunk header, less the
+       8 byte header and the 4 byte CRC just added */
+    len = Swap32((unsigned int)(OutCount - ChunkStart - 12));
+    memcpy(Scratch, &len, 4);
+    EmitBytes(Scratch, 4);
+
+    for (i = Image->chunktail; i < Image->chunkend; i++) {
+        unsigned char *c = (unsigned char *)Image->chunks[i];
+
+        EmitBytes(c, Swap32(*(unsigned int *)c) + 12);
+    }
 }

@@ -93,7 +93,12 @@ listing line counts, which is how the remaining work gets sized.
 | `0x405B80` `sub_405B80` | `WritePngHeader()` | `src/optimize.c` |
 | `0x4063F0` `sub_4063F0` | `EstimateEntropy()` | `src/optimize.c` |
 | `0x406560` `sub_406560` | `Adler32Update()` | `src/optimize.c` |
+| `0x407090` `sub_407090` | `AdvanceRow()` | `src/optimize.c` |
+| `0x4071D0` `sub_4071D0` | `FilterPixel32()` | `src/optimize.c` |
+| `0x4077C0` `sub_4077C0` | `FilterPixel24()` | `src/optimize.c` |
+| `0x407B00` `sub_407B00` | `FilterPixel16()` | `src/optimize.c` |
 | `0x407D80` `sub_407D80` | `FilterByte()` | `src/optimize.c` |
+| `loc_4075B0` | `FinishBlock()` | `src/optimize.c` |
 | `0x408000` `sub_408000` | `PlanBlocks()` + `SortBlockEnds()` | `src/optimize.c` |
 | `0x408390` `sub_408390` | `BestSplit()` | `src/optimize.c` |
 | `0x40E584` `UserMathErrorFunction` | `_UserMathErrorFunction()` | `src/stubs.c` |
@@ -503,7 +508,7 @@ the ends ascending in every case; `/b2`, `/b4` and `/b1` give their block counts
 `/b5000` is clamped to 1024; and the sort itself is checked on a reversed and a
 stride-7 scrambled set of ends.
 
-### sub_407D80, the per byte filter callback
+### sub_407D80 and friends, the per byte filter callback
 
 `FilterByte(byte)` is what the filter trials run the image through. It is
 handed one image byte and
@@ -544,16 +549,146 @@ At the first byte of an even row the predictor's left-of-above byte is
 `words[-1]`, i.e. the dword *in front* of the data area — the original reads it
 too, and the tests pin what comes out.
 
+The four "filter trials" in the driver are this **one function for 8, 16, 24
+and 32 bit images**, differing only in how many bytes of the sample it filters:
+
+| original | ours | bytes a call |
+|---|---|---|
+| `sub_407D80` | `FilterByte()` | 1 |
+| `sub_407B00` | `FilterPixel16()` | 2 |
+| `sub_4077C0` | `FilterPixel24()` | 3 |
+| `sub_4071D0` | `FilterPixel32()` | 4 |
+
+Each byte is filtered against the *same* byte of its neighbours, so a 24 bit
+sample's sub filter uses the sample to the left's third byte for its own third
+byte — and the 24 bit version simply never looks at the argument's top byte.
+`FilterSample(pixel, nbytes)` is the shared body. Only the byte count differs
+between the four; the row-start, store and row-end code is identical.
+
 `sub_406530` is stubbed in `src/stubs.c`: `FilterByte()` compares the sink
 pointer against it, so it has to exist, but it needs the LZ coder
-(`sub_4065A0`, 1721 listing lines), which is the next piece.
+(`sub_4065A0`, 1721 listing lines), which is described below and not yet done.
+
+### sub_407090, closing a row
+
+`AdvanceRow()` is what the LZ coder calls when it has filled a block. It closes
+the row record — the per row Huffman machinery — and opens the next one.
+
+Closing means: count the block in the record, emit the code the row needs,
+**unlock** the samples, rebuild the code lengths, and total the damage.
+
+* the unlock is `samples[i] = samples[i] == 0x80000000 ? 1 :
+  samples[i] & 0x7FFFFFFF`. Only bit 31 is the lock; the encoder sets it on
+  samples it wants kept in the next code, and a locked sample goes back to a
+  count of one rather than to zero.
+* the code lengths are built into a 320 entry scratch mirror (`0x412168`) —
+  286 entries from the literal/length samples, then 30 more at offset **288**
+  for the distances, which is where the distance samples already are
+  (`ROW_DISTFREQ`). The original's `dword_412668` is nothing but the loop's end
+  sentinel, one past the last entry.
+* the copy back runs over all 320 entries, so the four neither build covers
+  keep whatever the mirror held — faithful, and harmless.
+* the running cost (`0x18CBEEC`) is
+  `Σ (new length − old length) × frequency`, i.e. how much worse this row's code
+  got. That number is what the filter trials compare.
+
+The tail is straight-line: `RowIndex++`, and if there is a row left,
+`BuildDistanceSlots()`, one bit saying whether this is the last row, a two bit
+`2`, then `FlushRow()` for the new record. Both calls were already
+reconstructed, which is what made this one cheap.
+
+It also pinned the record layout: with `RowRecord[0]` at `0x42E968` the
+frequency array is field `+0x010`, the length array `+0x510`, the distance
+samples `+0x490` (they sit at sample 288, just past the 286 the literal build
+covers) and the block counter `+0x410` — **which is sample 256**, the first
+length code, so every finished block nudges that symbol's frequency. `ROWOF()`
+also moved from `optimize.c` into `pngout.h` so the tests can build records.
+
+### sub_4065A0, the LZ coder
+
+Not yet reconstructed — it is the largest single piece left and a wrong version
+would silently produce bad PNGs, so it stays a loud stub until it can be done
+properly. What the listing does say, recorded here so the work is not repeated:
+
+`sub_4065A0(data, len)` appends `len` bytes to a **32K sliding window** and then
+lifts matches out of it. `len == 0` means "flush", which is how `loc_4075B0`
+closes a block.
+
+| what | where | role |
+|---|---|---|
+| window | `dword_6F6B80` | the filtered image, indexed by a 16 bit position; `dword_706B80` saves its first dword so it can slide |
+| write position | `dword_6D4968` | where the next byte goes |
+| scan position | `dword_6F6B78` | how far the matcher has looked |
+| hash | `((dword >> 12) - (WORD)dword) & 0xFFF` | 12 bits of the 4 bytes at a position |
+| hash heads | `word_412EC0[4096]` | the newest position with that hash |
+| hash chain | `word_41CEC8[32768]` | the previous one, per position |
+| run lengths | `word_185BED8[32768]`, `dword_411D58` | `byte_42E55C` is the last byte seen; the counter saturates at `0x7FFF` |
+| match lengths | `dword_6D6670[32768]`, `dword_6B4968[32768]` | the length found at a position, and how far it is still valid |
+| best cost | `dword_412678[512]`, `dword_412668` | indexed by `position & 0x1FF`; `dword_412668` is the furthest position with a cost |
+| match list | `dword_706B88[0x40000]`, `dword_180BA84` | length in the low half, distance in the high half |
+| length slots | `byte_414EC0[4096]`, `byte_180B980[256]`, `byte_185BA90[32]` | which length code a match length costs; the last is `SlotOrder[]`, already reconstructed |
+| distance slots | `dword_6D5578[64]` | `DistSlots[]`, already reconstructed |
+| extra bits | `word_806B82[]`, `word_806D86[]` | per length and per distance |
+
+How it fits the pieces already reconstructed together:
+
+* a literal is recorded as `rowrec.samples[byte] |= 0x80000000` — the sample is
+  counted **and locked**, which is exactly the bit `AdvanceRow()` clears. So the
+  coder both fills the row record's sample array and decides what the next code
+  must keep;
+* the current row's cost comes from `rowrec+0x510` (the length array
+  `AdvanceRow()` writes) added to the running total `dword_96`, and matches are
+  only worth recording while the position is at or before `dword_412668`;
+* whether to keep scanning at all is `strategy == 2`, or
+  `position + 258 <= furthest`, or `(position - rowStart + 260) >= 0x40000`;
+* `dword_1809394[2 * slot]` and `byte_414EBF[]` map a length slot to its base
+  length, so the "extra bits" tables are indexed by slot.
+
+The matching itself is lazy with a cost heuristic: it tries length 3 upwards,
+compares the cost of the match against `literal cost + DistSlots[...]`, keeps
+walking the hash chain while the length is growing (`word_185BED8[]` lets it
+step over a run in one go), and only then decides whether to take the match or
+the literal. There are four or five interleaved heuristics in there — the
+`v35 - 3 >= dword_6B4968[...]` and `byte_185BA90[...]` loops — which is why it
+needs all 1721 lines rather than a tidy 200.
+
+### loc_4075B0, closing a block
+
+`FinishBlock()` is the other half of what a full block needs — the half that
+puts bytes on the wire. `FilterByte()` jumps here when the compressing sink has
+taken as many bytes as the block allows, and the LZ coder asks for it when it is
+flushed. The order is not arbitrary:
+
+1. flush the LZ coder, so the last match is emitted;
+2. `AdvanceRow()`, which closes the row record and opens the next one;
+3. pad the bit stream out to a byte boundary — `PutBits(0, (-BitCount) & 7)`;
+4. the **Adler-32** of the unfiltered data, big endian, so
+   `PutBits(Swap32(AdlerSum), 32)`; step 2 has to come first because it is the
+   flush that leaves the Adler sum in `AdlerSum`;
+5. the block's CRC: `PutBE(Scratch, ~BitCrc)` and four bytes out. That is what
+   closes a deflate block;
+6. the IDAT's length — `OutCount - ChunkStart - 12`, big endian — now that its
+   contents are all written. The 12 is the 8 byte chunk header and the 4 byte
+   CRC just added, and the length deliberately does not count itself;
+7. whatever chunks belong after the image data, each emitted whole as
+   `length + 12` bytes.
+
+This also settled the chunk indices. The trailing loop runs
+`[Image->+0x68, Image->+0x6C)` over `Image->+0x70`, so there are **four** chunk
+indices, not three: `chunkbeg` (+0x60), `chunkmid` (+0x64), `chunktail` (+0x68)
+and `chunkend` (+0x6C). The model had `chunkend` at +0x68 with +0x6C as
+padding, which would have made step 7 emit the chunks that belong *before* the
+image data. `WritePngHeader()`'s second run is now `[chunkmid, chunktail)` — the
+chunks that go between PLTE and IDAT — and the rest follow the image.
+
+Step 1 is the LZ coder, still a stub, so it is a hook (`FlushLz`) and with none
+installed the rest still runs, which is what the tests exercise.
 
 ### Still to do inside Optimize
 
-`sub_402AD0` itself (5 983 listing lines), the four filter trials
-`sub_4071D0`/`4077C0`/`407B00`/`407D80`, the min-sum filter `sub_4086E0`, the
-timing `sub_4063F0`'s caller, the LZ coder `sub_4065A0` and its helpers, and the
-`.bss` globals they all use.
+`sub_402AD0` itself (5 983 listing lines), the min-sum filter
+`sub_4086E0`, the timing `sub_4063F0`'s caller, the LZ coder `sub_4065A0`
+described above and its helpers, and the `.bss` globals they all use.
 
 ## DecodeImage (0x409560): how it fits together
 
@@ -656,10 +791,10 @@ Two independent checks, both runnable.
 
 ### tools\selftest.cmd
 
-284 checks over the recovered code: `Swap16`, `GetImageSize` for all
+323 checks over the recovered code: `Swap16`, `GetImageSize` for all
 eight format codes, the `/k` list handling in `ScanChunks`, `FilterPredict()`,
 `CpuFeatures()`, and the optimiser primitives (CRC table, Huffman heap, colour
-hash, `PutBits()`/`EmitBytes()`, `RankValues()`, `FlushRow()`, `WritePngHeader()`, `EstimateEntropy()`, `BestSplit()`, `PlanBlocks()` with its block-end sort, and `FilterByte()` with `Adler32Update()`).
+hash, `PutBits()`/`EmitBytes()`, `RankValues()`, `FlushRow()`, `WritePngHeader()`, `EstimateEntropy()`, `BestSplit()`, `PlanBlocks()` with its block-end sort, `FilterByte()` with `Adler32Update()`, and `AdvanceRow()`).
 They caught ten real defects, all now fixed:
 
 * PNG dimensions are **4 byte** big endian, not 2 byte. `GetImageSize` was
@@ -816,7 +951,7 @@ original's message and exit 1.
 src/defs.h        IDA type compatibility layer (_DWORD, qmemcpy, __noreturn, ...)
 src/pngout.h      SETTINGS, IMAGEDESC, format codes, globals, prototypes
 src/pngout.c      driver: Msg, CheckEsc, ShowUsage, main
-src/chunk.c       PNG chunk walk, format sniffer, Swap16
+src/chunk.c       PNG chunk walk, format sniffer, Swap16/Swap32
 src/clipboard.c   ReadClipboard
 src/globals.c     .data
 src/optimize.c    CRC table, Huffman heap, colour hash, bit/byte output,

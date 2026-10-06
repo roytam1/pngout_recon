@@ -56,13 +56,23 @@
 /* the fields of one record, as dword indices into it */
 #define ROW_SLOT      (0x000 / 4)      /* 1 dword, 0x7FFFFFFF per block    */
 #define ROW_SAMPLES   (0x010 / 4)      /* 320 dwords: the row's samples    */
+#define ROW_BLOCKS    (0x410 / 4)      /* 1 dword, bumped once per block;
+                                           it is also sample 256, the first
+                                           length code                       */
 #define ROW_LENCNT    (0x44C / 4)      /* 30: a counter per length code    */
-#define ROW_DISTFREQ  (0x480 / 4)      /* 30: frequency per distance code */
+#define ROW_DISTFREQ  (0x490 / 4)      /* 30: frequency per distance code,
+                                           sitting just past the 286 literal
+                                           and length samples               */
 #define ROW_SYMBOLS   (0x510 / 4)      /* 318: the symbol stream           */
 #define ROW_LENBITS   (0x89C / 4)      /* 30, then 29 more: bits a length
-                                          symbol costs in this row         */
+                                           symbol costs in this row         */
 #define ROW_ROWBITS   (0x910 / 4)      /* 1 dword: bits the row needs      */
 #define ROW_DISTBITS  (0x990 / 4)      /* 30: bits a distance symbol costs*/
+#define ROW_SAMPLE_MAX 320             /* the samples really are this long */
+#define ROW_SAMPLE_SYMS 286            /* how many of them the code covers */
+
+/* the address of one field of one record */
+#define ROWOF(row, field)   (&RowRecord[ROW_STRIDE * (row) + (field)])
 
 /* the symbol stream at field +0x510, i.e. sub_4053D0's argument layout */
 #define ROW_LITERALS   256             /* literal slots, values 0 .. 15   */
@@ -170,8 +180,8 @@ typedef struct ImageDescStruct {
        [length][tag][data][crc] - split in two runs around PLTE */
     int           chunkbeg; /* +60  first chunk after IHDR               */
     int           chunkmid; /* +64  first chunk after PLTE               */
-    int           chunkend; /* +68  one past the last chunk              */
-    int           pad3;     /* +6C */
+    int           chunktail;/* +68  the chunks that follow the image data*/
+    int           chunkend; /* +6C  one past the last chunk              */
     unsigned int **chunks;  /* +70  the records themselves               */
 
     int           trial;    /* +74  which filter trial is running        */
@@ -270,6 +280,15 @@ extern unsigned char Scratch[64];  /* dword_412E78: the chunk staging area  */
 extern int      RowIndex;         /* dword_42D7CC */
 extern int      RowCount;         /* dword_6D5570 */
 extern int      AdlerSum;         /* dword_706B84: Adler-32 of the raw data */
+extern int      RowHeaderCode;    /* dword_6F6A78, the code for one row tag */
+extern int      RowCost;          /* dword_18CBEEC, the rows' cost so far  */
+/*
+ *  dword_412168: 320 code lengths as dwords, a mirror of a row's sample
+ *  array.  The distance lengths are built 0x480 bytes further in, which is
+ *  sample 288 - and the original's `dword_412668` is the loop's end sentinel,
+ *  one past the last entry.
+ */
+extern int      LensScratch[ROW_SAMPLE_MAX];
 
 /* --- the per byte filter callback, sub_407D80 ---------------------- */
 /*
@@ -372,7 +391,7 @@ void SortBlockEnds(int count);
 int  BestSplit(unsigned char *data, int len, double *score);
 extern int      MinSample;        /* dword_185BEC0, the darkest sample */
 extern int      unk_185BEC8, unk_180BA84, unk_185BEB8, unk_411D58, unk_41CEC0;
-extern int      unk_6D4968, unk_6F6B78, unk_412668, unk_42D7C8, unk_18CBEEC;
+extern int      unk_6D4968, unk_6F6B78, unk_42D7C8;
 extern unsigned char unk_42E55C;
 
 int  BuildDeflateTables(void);
@@ -384,11 +403,20 @@ extern int      FreqA, FreqB;          /* dword_6F6678, dword_6F6AF8 */
 int  RankValues(int *vals, int count, int *out);
 void FlushRow(int *row);
 
-/* sub_407D80: filter one image byte and hand it to the trial's sink */
+
+/* sub_407D80: filter one image byte and hand it to the trial''s sink */
 void FilterByte(int byte);
 int  CountByte(int byte);                  /* loc_406510, the histogram sink */
 unsigned int Adler32Update(unsigned int sum, int byte);   /* sub_406560 */
-int  CompressByte(int byte);               /* sub_406530, the LZ coder's sink */
+int  CompressByte(int byte);               /* sub_406530, the LZ coder''s sink */
+
+/* sub_407090: close the row just filled and start the next one */
+int  AdvanceRow(void);
+
+/* loc_4075B0: flush the LZ coder, close the block, write its trailer */
+void FinishBlock(void);
+extern void   (*FlushLz)(void);   /* where step 1 above goes: sub_4065A0(0,0) */
+unsigned int Swap32(unsigned int x);
 
 /* fill `dest` with a 32 bit pattern; the CRT memset only does bytes */
 void memset32(void *dest, int value, int count);
