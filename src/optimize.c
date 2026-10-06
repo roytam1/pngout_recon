@@ -51,19 +51,19 @@
    slots at +256 and 30 distance slots at +288. */
 extern int ImageBuffer[MAX_ROWS * ROW_STRIDE];
 
-int CompressBlock(unsigned Number, unsigned symbols, int a3, int bitspersym,
-                  int a5, int a6);
 int  BuildDistanceSlots(int row);
 void FlushRow(int *row);
+int  WritePngHeader(int width, int height, int coltype, int bitdepth,
+                    int *palette, int palcount);
 
-int EmitBlock(unsigned Number, unsigned symbols, int a3, int bitspersym,
-              int a5, int a6)
+int EmitBlock(unsigned width, unsigned height, int coltype, int bitdepth,
+              int *palette, int palcount)
 {
-    BlockSymbols = (int)symbols;
+    BlockSymbols = (int)height;
 
-    /* a4 * Number bits of payload, rounded up to whole bytes, and the
-       work buffer is 8 bytes per output byte */
-    LinBufBytes = (int)(bitspersym * Number + 7) >> 3;
+    /* one row's worth of filtered samples, and the work buffer is 8 bytes
+       per output byte */
+    LinBufBytes = (int)(bitdepth * width + 7) >> 3;
     LinBufUsed = 0;
     BitBufPos = 0;
 
@@ -80,12 +80,13 @@ int EmitBlock(unsigned Number, unsigned symbols, int a3, int bitspersym,
     }
     memset(LinBuf, 0, 4 * (size_t)LinBufBytes + 8);
 
-    if (!CompressBlock(Number, symbols, a3, bitspersym, a5, a6))
+    if (!WritePngHeader((int)width, (int)height, coltype, bitdepth,
+                        palette, palcount))
         return 0;
 
     /* the chunk header */
     ChunkStart = OutCount;
-    EmitBytes((unsigned char *)&Scratch, 4);   /* the length, staged for us */
+    EmitBytes(Scratch, 4);                   /* the length, staged for us  */
 
     BitCrc = 0xFFFFFFFFu;
     BitCount = 0;
@@ -1013,8 +1014,297 @@ void FlushRow(int *row)
     }
 }
 
+/* ------------------------------------------------------------------ */
+/*  the PNG in front of the image data                                */
+/* ------------------------------------------------------------------ */
+
 /*
- *  2048 bucket heads over a 256 entry chain, so looking a colour up costs
+ *  sub_405B80 is not the compressor: it writes everything that comes before
+ *  the IDAT, and returns 0 only when a bKGD index will not fit the bit depth.
+ *  `EmitBlock()` calls it first and only goes on to the IDAT when it succeeds.
+ *
+ *      the signature and a fresh IHDR
+ *      the kept chunks from before PLTE, minus bKGD, with sBIT rebuilt
+ *      for a palette: PLTE, and a tRNS holding the alpha of each entry
+ *      for other colour types: a tRNS holding the darkest sample
+ *      bKGD, if the image has a background colour
+ *      the kept chunks from after PLTE, minus bKGD and hIST
+ *
+ *  Two byte orders meet here and it is worth keeping them apart.  The decoded
+ *  image is 0xFFBBGGRR - bytes R, G, B, FF - while the palette and the bKGD
+ *  colour are 0xAARRGGBB, so PLTE takes bytes 2, 1, 0 of a palette entry and
+ *  tRNS takes byte 3, which is the alpha.  0xFF in that byte means opaque,
+ *  which is how the tRNS scan finds where the transparency stops.
+ *
+ *  Every chunk is staged in Scratch[] (dword_412E78) and the CRC is computed
+ *  over the tag and the data, never over the length.
+ */
+
+#define TAG_IHDR   0x52444849u      /* the tag as it is written, LE dword */
+#define TAG_bKGD   0x44474B62u
+#define TAG_sBIT   0x54494273u
+#define TAG_PLTE   0x45544C50u
+#define TAG_tRNS   0x534E5274u
+#define TAG_hIST   0x54534968u
+
+/* the length of a chunk record: four bytes, big endian */
+static int ChunkLen(unsigned char *c)
+{
+    return ((int)c[0] << 24) | ((int)c[1] << 16) | ((int)c[2] << 8) | c[3];
+}
+
+/* how many samples sBIT and bKGD carry for each colour type: nibbles of
+   0x04023301 and 0x06021602 indexed by the colour type */
+#define SBIT_LEN(coltype)   (((0x04023301u >> (4 * (coltype))) & 0xFu))
+#define BKGD_LEN(coltype)   (((0x06021602u >> (4 * (coltype))) & 0xFu))
+
+static void PutBE(unsigned char *p, unsigned v)
+{
+    p[0] = (unsigned char)(v >> 24);
+    p[1] = (unsigned char)(v >> 16);
+    p[2] = (unsigned char)(v >> 8);
+    p[3] = (unsigned char)v;
+}
+
+/* the PNG chunk CRC: over [from, to), seeded and finished as usual */
+static unsigned ChunkCrc(unsigned char *p, int from, int to)
+{
+    unsigned c = 0xFFFFFFFFu;
+    int i;
+
+    for (i = from; i < to; i++)
+        c = CrcTable[(unsigned char)(c ^ p[i])] ^ (c >> 8);
+
+    return ~c;
+}
+
+/* one sample of the bKGD / tRNS chunk, as two big endian bytes */
+static void PutSample(unsigned char *p, int value, int bitdepth)
+{
+    if (bitdepth != 8)
+        value = value * ((1 << bitdepth) - 1) / 255;
+    p[0] = (unsigned char)(value >> 8);
+    p[1] = (unsigned char)value;
+}
+
+int WritePngHeader(int width, int height, int coltype, int bitdepth,
+                   int *palette, int palcount)
+{
+    int i, n, last, crc;
+
+    OutCount = 0;
+
+    /* ---------------- the signature and IHDR ---------------- */
+
+    memcpy(Scratch, "\x89PNG\x0D\x0A\x1A\x0A", 8);
+    PutBE(Scratch + 8, 13);
+    memcpy(Scratch + 12, "IHDR", 4);
+    PutBE(Scratch + 16, (unsigned)width);
+    PutBE(Scratch + 20, (unsigned)height);
+    Scratch[24] = (unsigned char)bitdepth;
+    Scratch[25] = (unsigned char)coltype;
+    Scratch[26] = 0;                 /* compression method */
+    Scratch[27] = 0;                 /* filter method      */
+    Scratch[28] = 0;                 /* interlace          */
+    PutBE(Scratch + 29, ChunkCrc(Scratch, 12, 29));
+    EmitBytes(Scratch, 33);
+
+    /* ---------------- the chunks from before PLTE ---------------- */
+
+    for (i = Image->chunkbeg; i < Image->chunkmid; i++) {
+        unsigned char *c = (unsigned char *)Image->chunks[i];
+        unsigned tag = *(unsigned int *)(c + 4);
+        unsigned char sbit[4];
+
+        if (tag == TAG_bKGD)
+            continue;               /* written again further down */
+
+        if (tag != TAG_sBIT) {
+            EmitBytes(c, ChunkLen(c) + 12);
+            continue;
+        }
+
+        /*
+         *  sBIT has to be rebuilt, because the colour type may have changed
+         *  and the number of samples with it.  The values are kept - they
+         *  say how many bits each sample really uses - but a chunk too short
+         *  for the new colour type has its missing entries filled with the
+         *  first one, which is what the original does.
+         */
+        sbit[0] = (unsigned char)width;   /* the argument slot is the scratch,
+                                            so an empty chunk starts out with
+                                            the low byte of the width */
+        n = ChunkLen(c);
+        for (last = 0; last < n && last < 4; last++)
+            sbit[last] = c[8 + last];
+        if (n < 4)
+            sbit[3] = sbit[0];
+        if (n < 3) {
+            sbit[2] = sbit[0];
+            sbit[1] = sbit[0];
+        }
+
+        PutBE(Scratch, SBIT_LEN(coltype));
+        memcpy(Scratch + 4, "sBIT", 4);
+        n = 8;
+        Scratch[n++] = sbit[0];
+        if ((coltype & 3) != 0) {
+            Scratch[n++] = sbit[1];
+            Scratch[n++] = sbit[2];
+        }
+        if (coltype >= 4)
+            Scratch[n++] = sbit[3];
+        PutBE(Scratch + n, ChunkCrc(Scratch, 4, n));
+        EmitBytes(Scratch, n + 4);
+    }
+
+    /* ---------------- PLTE and tRNS ---------------- */
+
+    if (coltype == 3) {
+        unsigned char sample[2];
+
+        /*
+         *  A palette image's background colour is an index, so the colour has
+         *  to be in the palette: look for it and add it if it is not there.
+         */
+        if (Image->bkgd != 0) {
+            for (last = palcount - 1; last >= 0; last--)
+                if (((palette[last] ^ Image->bkgd) & 0xFFFFFF) == 0)
+                    break;
+
+            if (last < 0) {
+                if (palcount >= (1 << bitdepth)) {
+                    if (ProgressMsg != NULL)
+                        ProgressMsg("\rbKGD chunk can't fit palette index. "
+                                    "Try higher bitdepth, /c2 or /c6 instead\n");
+                    return 0;
+                }
+                palette[palcount++] = Image->bkgd | 0xFF000000;
+            }
+        }
+
+        PutBE(Scratch, 3 * (unsigned)palcount);
+        memcpy(Scratch + 4, "PLTE", 4);
+        crc = ChunkCrc(Scratch, 4, 8);
+        EmitBytes(Scratch, 8);
+
+        for (i = 0; i < palcount; i++) {
+            /* bytes 2, 1, 0 of the entry: R, G, B */
+            sample[0] = (unsigned char)(palette[i] >> 16);
+            sample[1] = (unsigned char)(palette[i] >> 8);
+            sample[2] = (unsigned char)palette[i];
+            EmitBytes(sample, 3);
+            crc = CrcTable[(unsigned char)(crc ^ sample[0])] ^ (crc >> 8);
+            crc = CrcTable[(unsigned char)(crc ^ sample[1])] ^ (crc >> 8);
+            crc = CrcTable[(unsigned char)(crc ^ sample[2])] ^ (crc >> 8);
+        }
+
+        PutBE(Scratch, ~crc);
+        EmitBytes(Scratch, 4);
+
+        /*
+         *  tRNS for a palette is one alpha per entry, taken from byte 3, and
+         *  only as far as the last entry that is not opaque.
+         */
+        for (last = palcount - 1; last >= 0; last--)
+            if ((unsigned)palette[last] < 0xFF000000u)
+                break;
+
+        if (last >= 0) {
+            PutBE(Scratch, last + 1);
+            memcpy(Scratch + 4, "tRNS", 4);
+            crc = ChunkCrc(Scratch, 4, 8);
+            EmitBytes(Scratch, 8);
+
+            for (i = 0; i <= last; i++) {
+                /* byte 3 of the entry: the alpha */
+                sample[0] = (unsigned char)((unsigned)palette[i] >> 24);
+                EmitBytes(sample, 1);
+                crc = CrcTable[(unsigned char)(crc ^ sample[0])] ^ (crc >> 8);
+            }
+
+            PutBE(Scratch, ~crc);
+            EmitBytes(Scratch, 4);
+        }
+    } else if ((coltype == 0 || coltype == 2) && MinSample != -1) {
+        /*
+         *  Anything else gets a tRNS holding the darkest sample in the image,
+         *  which is how a greyscale or RGB image ends up with a transparent
+         *  colour: everything darker than this is fully transparent.
+         */
+        PutBE(Scratch, coltype ? 6u : 2u);
+        memcpy(Scratch + 4, "tRNS", 4);
+        crc = ChunkCrc(Scratch, 4, 8);
+        EmitBytes(Scratch, 8);
+
+        n = 8;
+        for (i = 8 * (coltype & 3); i >= 0; i -= 8) {
+            unsigned char hi;
+
+            PutSample(Scratch + n, (int)(((unsigned)MinSample >> i) & 0xFF),
+                      bitdepth);
+            hi = 0;
+            crc = CrcTable[(unsigned char)(crc ^ hi)] ^ (crc >> 8);
+            crc = CrcTable[(unsigned char)(crc ^ Scratch[n + 1])] ^ (crc >> 8);
+            n += 2;
+        }
+
+        EmitBytes(Scratch + 8, n - 8);
+        PutBE(Scratch + n, ~crc);
+        EmitBytes(Scratch + n, 4);
+    }
+
+    /* ---------------- bKGD ---------------- */
+
+    if (Image->bkgd != 0) {
+        PutBE(Scratch, BKGD_LEN(coltype));
+        memcpy(Scratch + 4, "bKGD", 4);
+        crc = ChunkCrc(Scratch, 4, 8);
+        EmitBytes(Scratch, 8);
+
+        if (coltype == 3) {
+            /* the index of the background colour, which is in the palette */
+            for (last = palcount - 1; last > 0; last--)
+                if ((((unsigned)palette[last] ^ (unsigned)Image->bkgd)
+                     & 0xFFFFFFu) == 0)
+                    break;
+            Scratch[0] = (unsigned char)last;
+            crc = CrcTable[(unsigned char)(crc ^ Scratch[0])] ^ (crc >> 8);
+            PutBE(Scratch + 1, ~crc);
+            EmitBytes(Scratch, 5);
+        } else {
+            n = 0;
+            for (i = 8 * (coltype & 3); i >= 0; i -= 8) {
+                PutSample(Scratch + n,
+                          (int)(((unsigned)Image->bkgd >> i) & 0xFF), bitdepth);
+                crc = CrcTable[(unsigned char)(crc ^ Scratch[n])] ^ (crc >> 8);
+                crc = CrcTable[(unsigned char)(crc ^ Scratch[n + 1])] ^ (crc >> 8);
+                n += 2;
+            }
+            PutBE(Scratch + n, ~crc);
+            EmitBytes(Scratch, n + 4);
+        }
+    }
+
+    /* ---------------- the chunks from after PLTE ---------------- */
+
+    for (i = Image->chunkmid; i < Image->chunkend; i++) {
+        unsigned char *c = (unsigned char *)Image->chunks[i];
+        unsigned tag = *(unsigned int *)(c + 4);
+
+        if (tag == TAG_bKGD)
+            continue;
+        if (tag == TAG_hIST && coltype == 3)
+            continue;               /* a palette's histogram is not ours */
+
+        EmitBytes(c, ChunkLen(c) + 12);
+    }
+
+    return 1;
+}
+
+/* ------------------------------------------------------------------ */
+/*  2048 bucket heads over a 256 entry chain, so looking a colour up costs
  *  one hash and a short walk.  The hash is
  *      (((color ^ (color >> 11)) >> 11) & 0xFFFF) - (color & 0xFFFF)
  *  masked to 11 bits.

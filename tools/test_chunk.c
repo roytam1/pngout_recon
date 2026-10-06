@@ -907,6 +907,218 @@ int main(void)
         }
     }
 
+    /* ---- WritePngHeader (sub_405B80) ---- */
+    {
+        static unsigned char out[8192];
+        static IMAGEDESC img;
+        static int palette[300];
+        int i;
+
+        memset(&img, 0, sizeof(img));
+        img.outbuf = out;
+        img.outsize = sizeof(out);
+        Image = &img;
+        MinSample = -1;                      /* no darkest sample yet */
+
+        /*
+         *  The signature and IHDR are fixed apart from the three fields that
+         *  come in, so a 64x32 greyscale image pins the whole 33 bytes:
+         *
+         *      89 50 4E 47 0D 0A 1A 0A   the signature
+         *      00 00 00 0D               IHDR, 13 bytes
+         *      49 48 44 52               "IHDR"
+         *      00 00 00 40 00 00 00 20   64 x 32, both 4 byte big endian
+         *      08 00 00 00 00            8 bits, grey, no compression,
+         *                                 no filter, no interlace
+         *      87 F6 21 58               the CRC over "IHDR" and those 13,
+         *                                 the same value zlib.crc32 gives
+         */
+        check("WritePngHeader returns 1",
+              WritePngHeader(64, 32, 0, 8, NULL, 0), 1);
+        check("IHDR is 33 bytes", OutCount, 33);
+        check("signature byte 0", out[0], 0x89);
+        check("signature byte 1", out[1], 0x50);
+        check("signature byte 7", out[7], 0x0A);
+        check("IHDR length", (out[8] << 24) | (out[9] << 16) |
+                            (out[10] << 8) | out[11], 13);
+        check("IHDR tag", memcmp(out + 12, "IHDR", 4), 0);
+        check("IHDR width", (out[16] << 24) | (out[17] << 16) |
+                            (out[18] << 8) | out[19], 64);
+        check("IHDR height", (out[20] << 24) | (out[21] << 16) |
+                             (out[22] << 8) | out[23], 32);
+        check("IHDR bit depth", out[24], 8);
+        check("IHDR colour type", out[25], 0);
+        check("IHDR compression", out[26], 0);
+        check("IHDR filter", out[27], 0);
+        check("IHDR interlace", out[28], 0);
+        check("IHDR crc 0", out[29], 0x87);
+        check("IHDR crc 1", out[30], 0xF6);
+        check("IHDR crc 2", out[31], 0x21);
+        check("IHDR crc 3", out[32], 0x58);
+
+        /* a palette: PLTE from bytes 2, 1, 0 of each entry */
+        for (i = 0; i < 3; i++)
+            palette[i] = 0xFF000000u | ((unsigned)(0x11 * (i + 1)) << 16) |
+                         ((unsigned)(0x22 * (i + 1)) << 8) | (0x33 * (i + 1));
+        check("palette header returns 1",
+              WritePngHeader(64, 32, 3, 8, palette, 3), 1);
+        /* 33 for IHDR, then 12 + 9 for PLTE */
+        check("PLTE total size", OutCount, 33 + 12 + 9);
+        check("PLTE length", (out[33] << 24) | (out[34] << 16) |
+                             (out[35] << 8) | out[36], 9);
+        check("PLTE tag", memcmp(out + 37, "PLTE", 4), 0);
+        printf("info PLTE entry 0: %02x %02x %02x, entry 2: %02x %02x %02x\n",
+               out[41], out[42], out[43], out[47], out[48], out[49]);
+        check("PLTE entry 0 red", out[41], 0x11);
+        check("PLTE entry 0 green", out[42], 0x22);
+        check("PLTE entry 0 blue", out[43], 0x33);
+        check("PLTE entry 2 red", out[47], 0x33);
+        check("PLTE entry 2 green", out[48], 0x66);
+        check("PLTE entry 2 blue", out[49], 0x99);
+
+        /* all opaque, so no tRNS at all */
+        check("no tRNS for an opaque palette", OutCount, 33 + 12 + 9);
+
+        /* one transparent entry: tRNS holds the alphas, up to the last
+           entry that is not opaque */
+        palette[1] &= 0x00FFFFFF;         /* entry 1 becomes transparent */
+        check("palette with tRNS returns 1",
+              WritePngHeader(64, 32, 3, 8, palette, 3), 1);
+        check("tRNS appears after PLTE", OutCount, 33 + 12 + 9 + 12 + 2);
+        check("tRNS length", (out[54] << 24) | (out[55] << 16) |
+                             (out[56] << 8) | out[57], 2);
+        check("tRNS tag", memcmp(out + 58, "tRNS", 4), 0);
+        check("tRNS alpha of entry 0", out[62], 0xFF);
+        check("tRNS alpha of entry 1", out[63], 0x00);
+
+        /* a background colour has to be in the palette, and is added if it
+           is not - so the palette, and with it PLTE, grows by one entry */
+        for (i = 0; i < 3; i++)
+            palette[i] = 0xFF000000u | (0x0A0B0Cu);
+        img.bkgd = 0x00AABBCCu;            /* not in the palette */
+        check("palette with a new bKGD returns 1",
+              WritePngHeader(64, 32, 3, 8, palette, 3), 1);
+        check("the background colour was added", palette[3],
+              (int)(0xFF000000u | 0x00AABBCCu));
+        /* 33 + PLTE(8 header + 12 data + 4 crc) + bKGD(8 + 1 + 4) */
+        check("bKGD after PLTE", OutCount, 33 + 24 + 13);
+        check("PLTE grew to four entries",
+              (out[33] << 24) | (out[34] << 16) | (out[35] << 8) | out[36], 12);
+        check("bKGD length is one", (out[57] << 24) | (out[58] << 16) |
+                                    (out[59] << 8) | out[60], 1);
+        check("bKGD tag", memcmp(out + 61, "bKGD", 4), 0);
+        check("bKGD palette index", out[65], 3);
+
+        /* and a background colour that will not fit the bit depth is fatal */
+        palette[3] = 0xFF000000u | 0x00FFFFFFu;
+        palette[4] = 0;
+        img.bkgd = 0x00ABCDEFu;            /* in neither of the two entries */
+        check("bKGD that cannot fit fails",
+              WritePngHeader(64, 32, 3, 1, palette, 2), 0);
+
+        /* an RGB image: bKGD is three samples, tRNS the darkest one */
+        memset(&img, 0, sizeof(img));
+        img.outbuf = out;
+        img.outsize = sizeof(out);
+        Image = &img;
+        img.bkgd = 0x00112233u;
+        MinSample = 0x00010203;            /* 0xAARRGGBB, so R G B = 1 2 3 */
+        check("RGB header returns 1", WritePngHeader(64, 32, 2, 8, NULL, 0), 1);
+        /* 33 + tRNS(12 + 6) + bKGD(12 + 6) */
+        check("RGB tRNS and bKGD size", OutCount, 33 + 12 + 6 + 12 + 6);
+        printf("info bytes 33..:");
+        for (i = 33; i < OutCount; i++)
+            printf(" %02x", out[i]);
+        printf("\n");
+        check("tRNS length is six", (out[33] << 24) | (out[34] << 16) |
+                                    (out[35] << 8) | out[36], 6);
+        check("tRNS tag", memcmp(out + 37, "tRNS", 4), 0);
+        printf("info tRNS samples:");
+        for (i = 41; i < 47; i++)
+            printf(" %02x", out[i]);
+        printf("\n");
+        check("tRNS sample 0", (out[41] << 8) | out[42], 0x01);
+        check("tRNS sample 1", (out[43] << 8) | out[44], 0x02);
+        check("tRNS sample 2", (out[45] << 8) | out[46], 0x03);
+        check("bKGD length is six", (out[51] << 24) | (out[52] << 16) |
+                                    (out[53] << 8) | out[54], 6);
+        check("bKGD tag", memcmp(out + 55, "bKGD", 4), 0);
+        check("bKGD sample 0", (out[59] << 8) | out[60], 0x11);
+        check("bKGD sample 1", (out[61] << 8) | out[62], 0x22);
+        check("bKGD sample 2", (out[63] << 8) | out[64], 0x33);
+
+        /* no darkest sample, so no tRNS, and a greyscale bKGD is one sample */
+        MinSample = -1;
+        check("no tRNS without a darkest sample",
+              WritePngHeader(64, 32, 0, 8, NULL, 0), 1);
+        check("grey bKGD only", OutCount, 33 + 12 + 2);
+        check("grey bKGD length", (out[33] << 24) | (out[34] << 16) |
+                                  (out[35] << 8) | out[36], 2);
+        check("grey bKGD sample", (out[41] << 8) | out[42], 0x33);
+
+        /* a four bit sample is rescaled out of the 8 bit value */
+        img.bkgd = 0x000000FF;
+        check("four bit header", WritePngHeader(64, 32, 0, 4, NULL, 0), 1);
+        check("four bit sample is 15", (out[41] << 8) | out[42], 0x0F);
+
+        /* and a background colour of zero means no bKGD chunk at all */
+        MinSample = -1;
+        img.bkgd = 0;
+        check("no bKGD without a background colour",
+              WritePngHeader(64, 32, 6, 8, NULL, 0), 1);
+        check("header only", OutCount, 33);
+    }
+
+    /* ---- the kept chunks ---- */
+    {
+        static unsigned char out[8192];
+        static IMAGEDESC img;
+        static unsigned char rec1[32];
+        static unsigned char rec2[32];
+        static unsigned char rec3[32];
+        unsigned int *chunks[3];
+
+        /* a gAMA record, then an sBIT, then a bKGD that must not be copied */
+        memset(rec1, 0, sizeof(rec1));
+        rec1[3] = 4;
+        memcpy(rec1 + 4, "gAMA", 4);
+        memcpy(rec1 + 8, "\x40\x1A\x73\x40", 4);
+
+        memset(rec2, 0, sizeof(rec2));
+        rec2[3] = 3;
+        memcpy(rec2 + 4, "sBIT", 4);
+        rec2[8] = 8; rec2[9] = 8; rec2[10] = 8;
+
+        memset(rec3, 0, sizeof(rec3));
+        rec3[3] = 1;
+        memcpy(rec3 + 4, "bKGD", 4);
+        rec3[8] = 0;
+
+        chunks[0] = (unsigned int *)rec1;
+        chunks[1] = (unsigned int *)rec2;
+        chunks[2] = (unsigned int *)rec3;
+
+        memset(&img, 0, sizeof(img));
+        img.outbuf = out;
+        img.outsize = sizeof(out);
+        img.chunks = chunks;
+        img.chunkbeg = 0;
+        img.chunkmid = 3;
+        img.chunkend = 3;
+        Image = &img;
+        MinSample = -1;
+
+        check("kept chunks copied", WritePngHeader(8, 8, 2, 8, NULL, 0), 1);
+        /* 33 + gAMA(16) + sBIT rebuilt(8 + 3 + 4 = 15), bKGD dropped */
+        check("gAMA then a rebuilt sBIT", OutCount, 33 + 16 + 15);
+        check("gAMA came first", memcmp(out + 37, "gAMA", 4), 0);
+        check("sBIT follows", memcmp(out + 53, "sBIT", 4), 0);
+        check("sBIT length for RGB", (out[49] << 24) | (out[50] << 16) |
+                                       (out[51] << 8) | out[52], 3);
+        check("sBIT keeps its values", out[57], 8);
+        check("sBIT last value", out[59], 8);
+    }
+
     printf("\n%s  (%d failure%s)\n", failures ? "FAILED" : "PASSED",
            failures, failures == 1 ? "" : "s");
     return failures != 0;

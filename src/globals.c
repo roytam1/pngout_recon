@@ -121,7 +121,9 @@ int      LinBufUsed;           /* 0x411D50 */
 int      BitBufPos;            /* 0x18CBED8 */
 unsigned char *LinBuf;         /* 0x18CBEE0, the LZ work buffer           */
 int      ChunkStart;           /* 0x412160, where the IDAT header starts  */
-int      Scratch;              /* 0x412E78, a 4 byte scratchpad           */
+/* 0x412E78: the chunk staging area - a length, a tag and up to 29 bytes
+   of data, with the CRC written over the top of the tail */
+unsigned char Scratch[64];
 int      RowIndex;             /* 0x42D7CC */
 int      RowCount;             /* 0x6D5570 */
 int      CrcPending;           /* 0x706B84 */
@@ -162,6 +164,7 @@ int      LenSymBits[(MAX_ROWS + 1) * ROW_SLOTS];  /* 0x42F1F4 */
 unsigned char SlotOrder[32];              /* 0x185BA90 */
 int      FreqA, FreqB;                 /* 0x6F6678, 0x6F6AF8 */
 
+int      MinSample;                      /* dword_185BEC0: darkest sample in the image */
 int      unk_185BEC8, unk_180BA84, unk_185BEB8, unk_411D58, unk_41CEC0;
 int      unk_6D4968, unk_6F6B78, unk_412668, unk_42D7C8, unk_18CBEEC;
 unsigned char unk_42E55C;

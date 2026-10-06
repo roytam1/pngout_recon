@@ -90,6 +90,7 @@ listing line counts, which is how the remaining work gets sized.
 | `0x4053D0` `sub_4053D0` | `FlushRow()` | `src/optimize.c` |
 | `0x4058A0` `sub_4058A0` | `InitBlockTables()` | `src/optimize.c` |
 | `0x405A60` `sub_405A60` | `BuildDistanceSlots()` | `src/optimize.c` |
+| `0x405B80` `sub_405B80` | `WritePngHeader()` | `src/optimize.c` |
 | `0x40E584` `UserMathErrorFunction` | `_UserMathErrorFunction()` | `src/stubs.c` |
 | `.data` initialised part | 22 globals + `BitTable[64]` | `src/globals.c` |
 
@@ -152,11 +153,11 @@ recording:
   readers use. Worth re-checking against the real bytes if the original ever
   turns up.
 * **The output really is a PNG, and it stamps itself.** `sub_405150`
-  (`EmitBlock()`) writes the chunk length straight out of a scratch dword,
-  then `PutBits(0x54414449, 32)`, then two bytes of CRC. That first constant
-  is `"IDAT"` read as a little endian DWORD. The two CRC bytes are `0x78 0x5E`
-  - a **placeholder, not a checksum**. Little endian that is **24184**, which
-  is exactly what `main()` tests for:
+  (`EmitBlock()`) writes the chunk length straight out of the staging area
+  (`dword_412E78`, `Scratch[]`), then `PutBits(0x54414449, 32)`, then two bytes
+  of CRC. That first constant is `"IDAT"` read as a little endian DWORD. The two
+  CRC bytes are `0x78 0x5E` - a **placeholder, not a checksum**. Little endian
+  that is **24184**, which is exactly what `main()` tests for:
 
   ```c
   if (NumBlocks > 0 && unk_190A828 == 24184 && !ChunkCount) ...
@@ -314,6 +315,64 @@ Only a suffix of `Bitrev19[]` is sent: the scan walks the table backwards for
 the last symbol that has a length at all, so symbols 16, 17, 18 and 0 always
 go out whether they are used or not.
 
+### sub_405B80, everything in front of the image data
+
+`WritePngHeader()` is not the compressor - it is the other half of `EmitBlock()`
+and writes everything before the IDAT. It returns 0 in exactly one case, a
+background colour that will not fit the bit depth as a palette index, which is
+why `EmitBlock()` calls it first and gives up if it fails:
+
+```
+the signature and a fresh IHDR
+the kept chunks from before PLTE, minus bKGD, with sBIT rebuilt
+for a palette:  PLTE, and a tRNS holding the alpha of each entry
+for anything else: a tRNS holding the darkest sample in the image
+bKGD, if the image has a background colour
+the kept chunks from after PLTE, minus bKGD, and minus hIST for a palette
+```
+
+**Two byte orders meet in here.** The decoded image is one DWORD `0xFFBBGGRR`
+- bytes R, G, B, FF - while the palette and the bKGD colour are `0xAARRGGBB`.
+So PLTE takes bytes 2, 1, 0 of a palette entry, tRNS takes byte 3 (the alpha,
+where `0xFF` means opaque), and bKGD extracts its channels from bytes 2, 1, 0
+as well. That is why the tRNS scan for a palette looks for the last entry that
+is *not* opaque: everything from there on has to be spelled out.
+
+**How a greyscale or RGB image gets a transparent colour.** `tRNS` for those
+types names one sample, and everything equal to or darker than it is fully
+transparent. PNGOUT uses the darkest sample it found while scanning the image
+(`dword_185BEC0`, `MinSample`) and emits that, which makes an image that has
+been through a lossy stage transparent in its shadows. `-1` there means "no
+such sample" and the chunk is left out. The sample is rescaled when the bit
+depth is not 8, and written as two big endian bytes.
+
+**sBIT has to be rebuilt.** It says how many bits each sample really uses, and
+the number of samples in it depends on the colour type, so when the colour type
+changes the chunk has to be re-laid-out. The counts come out of a table:
+
+| colour type | 0 grey | 2 RGB | 3 palette | 4 grey+alpha | 6 RGBA |
+|---|---|---|---|---|---|
+| sBIT samples (`0x04023301`) | 1 | 3 | 3 | 2 | 4 |
+| bKGD bytes (`0x06021602`) | 2 | 6 | 6 | 2 | 6 |
+
+Nibbles of a constant indexed by `4 * colourtype`. The values themselves are
+kept, but a chunk too short for the new colour type has its missing entries
+filled in with the first one - which is right, since every sample of a
+well-formed sBIT has the same depth anyway.
+
+**A palette background is an index, so the colour has to be in the palette.**
+`bKGD` for a palette holds an index, so before PLTE is written PNGOUT looks for
+the background colour among the palette entries and *appends* it if it is not
+there - which is why a palette can grow during this call. If the palette is
+already as long as the bit depth allows, it gives up and says so:
+
+```
+bKGD chunk can't fit palette index. Try higher bitdepth, /c2 or /c6 instead
+```
+
+The search for the index afterwards stops one entry early (`m > 0`, not
+`m >= 0`), which is harmless only because the appended entry is the last one.
+
 ### Still open
 
 * `sub_405A60` (`BuildDistanceSlots()`) fills `dword_6D5578[]` with 30 slots
@@ -327,11 +386,10 @@ go out whether they are used or not.
 
 ### Still to do inside Optimize
 
-`sub_402AD0` itself (5 983 listing lines), the compressor `sub_405B80`, the
-four filter trials `sub_4071D0`/`4077C0`/`407B00`/`407D80`, the min-sum filter
-`sub_4086E0`, the entropy estimate `sub_408000`/`sub_408390`, the timing
-`sub_4063F0`, and the `.bss` globals they all use. Those four are declared in
-`src/stubs.c` so the tree links; each aborts loudly if reached.
+`sub_402AD0` itself (5 983 listing lines), the four filter trials
+`sub_4071D0`/`4077C0`/`407B00`/`407D80`, the min-sum filter `sub_4086E0`, the
+entropy estimate `sub_408000`/`sub_408390`, the timing `sub_4063F0`, and the
+`.bss` globals they all use.
 
 ## DecodeImage (0x409560): how it fits together
 
@@ -434,11 +492,11 @@ Two independent checks, both runnable.
 
 ### tools\selftest.cmd
 
-121 checks over the recovered code: `Swap16`, `GetImageSize` for all
+190 checks over the recovered code: `Swap16`, `GetImageSize` for all
 eight format codes, the `/k` list handling in `ScanChunks`, `FilterPredict()`,
 `CpuFeatures()`, and the optimiser primitives (CRC table, Huffman heap, colour
-hash, `PutBits()`/`EmitBytes()`, `RankValues()`, `FlushRow()`). They caught
-eight real defects, all now fixed:
+hash, `PutBits()`/`EmitBytes()`, `RankValues()`, `FlushRow()` and `WritePngHeader()`).
+They caught eight real defects, all now fixed:
 
 * PNG dimensions are **4 byte** big endian, not 2 byte. `GetImageSize` was
   using `Swap16` where the original calls `_byteswap_ulong` on a DWORD.
@@ -486,6 +544,16 @@ code from the transmitted lengths with `RankValues()`, then walks the payload -
 so every row shape tried has to give its own symbols back exactly, and one of
 them is pinned to the byte: a row of one literal followed by zeroes comes out
 as `00 18 10 00 00 E2 3F 1B`.
+
+`WritePngHeader()` is checked against bytes rather than against itself. A 64x32
+8 bit greyscale image has to produce exactly the 33 signature and IHDR bytes,
+`87 F6 21 58` included - which is the value Python's `zlib.crc32` gives for the
+same 17 bytes, so the chunk CRC is the standard one and not a variant. The rest
+of the tests walk each colour type: PLTE built from bytes 2, 1, 0 of the
+palette, a tRNS whose alphas come from byte 3, a bKGD that appends its own
+colour to the palette when it has to, the "won't fit the bit depth" failure,
+the darkest-sample tRNS for RGB, the 4 bit rescaling, and a kept gAMA chunk
+copied verbatim next to an sBIT that is rebuilt.
 
 ### Import table
 
@@ -549,18 +617,25 @@ original's message and exit 1.
   established from call sites, the string table or the disassembly. Everything
   still unidentified keeps its IDA name (`unk_190A3FC`, `dword_190A420`, ...) so
   nothing is invented silently.
+* **`IMAGEDESC` had the wrong offsets.** The comments claimed `+0x74` for the
+  filter trial, `+0x4C` for the strategy and `+0x34` for the distinct count,
+  but the declared fields did not land there: `ndistinct` came out at `+0x30`,
+  `strategy` at `+0x80` and `trial` at `+0x70`. Reading the original settles it -
+  `sub_4065A0` tests `+0x4C`, `sub_402AD0` drives `+0x74` and `+0x78`, and
+  `sub_405B80` wants `+0x30` and `+0x60 .. +0x70` - so the struct now spells the
+  real layout out field by field, the chunk list included.
 
 ## Layout
 
 ```
 src/defs.h        IDA type compatibility layer (_DWORD, qmemcpy, __noreturn, ...)
-src/pngout.h      SETTINGS, format codes, globals, prototypes
+src/pngout.h      SETTINGS, IMAGEDESC, format codes, globals, prototypes
 src/pngout.c      driver: Msg, CheckEsc, ShowUsage, main
 src/chunk.c       PNG chunk walk, format sniffer, Swap16
 src/clipboard.c   ReadClipboard
 src/globals.c     .data
 src/optimize.c    CRC table, Huffman heap, colour hash, bit/byte output,
-                  deflate tables, per row slots, the row writer
+                  deflate tables, per row slots, the row writer, the PNG header
 src/predict.c     FilterPredict
 src/cpuid.c       CpuFeatures
 src/stubs.c       the two unrecovered entry points, plus the math error handler

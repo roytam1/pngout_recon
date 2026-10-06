@@ -133,34 +133,46 @@ extern int  unk_190A828;            /* dword_190A828 == 24184 marks a PNG we wro
 /* ------------------------------------------------------------------ */
 /*  The image descriptor that the optimiser and the bit writer share   */
 /*                                                                     */
-/*  Reached through dword_42E960.  sub_4052D0 and sub_405320 use only  */
-/*  the output buffer at +0x10 and its size at +0x14; sub_402AD0's      */
-/*  image scan reads +0x00, +0x04, +0x08, +0x0C, +0x30 and +0x74.     */
+/*  Reached through dword_42E960.  The offsets below are the ones the */
+/*  original reads: sub_4052D0 and sub_405320 use +0x10 and +0x14,     */
+/*  sub_405B80 uses +0x30 (the bKGD colour) and +0x60 .. +0x70 (the   */
+/*  kept chunk list), sub_4065A0 tests +0x4C (the strategy) and       */
+/*  sub_402AD0 drives +0x74 (the filter trial) and +0x78 (progress).   */
 /* ------------------------------------------------------------------ */
 
 typedef struct ImageDescStruct {
-    unsigned int *pixels;   /* +00  row data, one plane after another     */
-    int           stride;   /* +04  bytes between planes                  */
-    int           nplanes;  /* +08  entries in the current plane          */
-    int           nrows;    /* +0C  number of planes in the image         */
+    unsigned int *pixels;   /* +00  the decoded 32bpp image              */
+    int           stride;   /* +04  bytes per row                        */
+    int           width;    /* +08                                      */
+    int           height;   /* +0C                                      */
 
     unsigned char *outbuf;  /* +10  the PNG being assembled               */
     int           outsize;  /* +14  its size in bytes                     */
 
-int           pad0[3];  /* +18 .. +20 */
-    unsigned char *unused; /* +24 */
-    int           pad1;     /* +28 */
-    int           ndistinct;/* +34  how many distinct values the image has */
-    int           pad2[15]; /* +38 .. +70 */
+    int           pad0[6];  /* +18 .. +2C */
 
-    int           trial;    /* +74  which filter trial is running        */
-    int           pad3[3];  /* +78 .. +84 */
+    int           bkgd;     /* +30  the bKGD colour, 0xAARRGGBB, or 0    */
+    int           ndistinct;/* +34  how many distinct values the image has */
+
+    int           pad1[5];  /* +38 .. +48 */
 
     int           strategy; /* +4C  0 Xtreme, 1 Intense, 2 Longest Match,
-                               3 Huffman only, 4 uncompressed          */
-    int           pad4[16]; /* +50 .. +70 */
+                               3 Huffman only, 4 uncompressed           */
 
-    int           pad5[17]; /* +84 .. +C4 */
+    int           pad2[4];  /* +50 .. +5C */
+
+    /* the chunks ScanChunks decided to keep, as records of
+       [length][tag][data][crc] - split in two runs around PLTE */
+    int           chunkbeg; /* +60  first chunk after IHDR               */
+    int           chunkmid; /* +64  first chunk after PLTE               */
+    int           chunkend; /* +68  one past the last chunk              */
+    unsigned int **chunks;  /* +70  the records themselves               */
+
+    int           trial;    /* +74  which filter trial is running        */
+    int           percent;  /* +78  progress, 0 .. 100                   */
+
+    int           pad3[4];  /* +7C .. +88 */
+    int           pad4[15]; /* +8C .. +C4 */
 
     int           best;     /* +C8  best compressed size found so far     */
 } IMAGEDESC;
@@ -227,8 +239,10 @@ int  AddColor(int color, int index);
 #define HUFF_SENTINEL   575
 #define HUFF_MAXSYMS    576
 int  BuildCodeLengths(int *counts, int nsyms, int *lengths, int maxlen);
-int  EmitBlock(unsigned Number, unsigned symbols, int bits, int bitspersym,
-              int a5, int a6);
+int  EmitBlock(unsigned width, unsigned height, int coltype, int bitdepth,
+              int *palette, int palcount);
+int  WritePngHeader(int width, int height, int coltype, int bitdepth,
+                    int *palette, int palcount);
 void (*ProgressMsg)(const char *fmt);   /* dword_185BEC4, from s->msg */
 
 /* --- state the optimiser and the bit writer share ----------------- */
@@ -246,7 +260,7 @@ extern int      LinBufUsed;       /* dword_411D50 */
 extern int      BitBufPos;        /* dword_18CBED8 */
 extern unsigned char *LinBuf;     /* dword_18CBEE0, the LZ work buffer */
 extern int      ChunkStart;       /* dword_412160, start of the IDAT header */
-extern int      Scratch;          /* dword_412E78, a 4 byte scratchpad */
+extern unsigned char Scratch[64];  /* dword_412E78: the chunk staging area  */
 extern int      RowIndex;         /* dword_42D7CC */
 extern int      RowCount;         /* dword_6D5570 */
 extern int      CrcPending;       /* dword_706B84 */
@@ -284,6 +298,7 @@ extern int      DistSlot[32768]; /* 0x41CEC8, used as shorts */
 extern int      MatchArea[0x8000];   /* 0x6B4968 */
 extern int      RowSlot[(MAX_ROWS + 1) * ROW_SLOTS];  /* 0x42E958 */
 
+extern int      MinSample;        /* dword_185BEC0, the darkest sample */
 extern int      unk_185BEC8, unk_180BA84, unk_185BEB8, unk_411D58, unk_41CEC0;
 extern int      unk_6D4968, unk_6F6B78, unk_412668, unk_42D7C8, unk_18CBEEC;
 extern unsigned char unk_42E55C;

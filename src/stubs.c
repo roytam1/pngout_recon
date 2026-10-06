@@ -11,15 +11,8 @@
  *                                the whole point of the program.
  *                                ~8.9KB of x86.
  *
- *  The two functions below are the guts of the optimiser that EmitBlock()
- *  in src/optimize.c drives:
- *
- *    sub_405B80  CompressBlock()   - the actual LZ77 + entropy coding
- *    sub_4058A0  InitDistanceTables() - deflate distance base/extra tables
- *
- *  Both abort loudly rather than quietly producing a wrong PNG, so
- *  nothing built from this tree can be mistaken for a working
- *  reconstruction.
+ *  Both abort loudly rather than quietly producing a wrong PNG, so nothing
+ *  built from this tree can be mistaken for a working reconstruction.
  */
 
 #include <stdio.h>
@@ -53,19 +46,6 @@ int Optimize(SETTINGS *s)
     return 0x7FFFFFFF;
 }
 
-int CompressBlock(unsigned Number, unsigned symbols, int bits, int bitspersym,
-                  int a5, int a6)
-{
-    (void)Number; (void)symbols; (void)bits; (void)bitspersym;
-    (void)a5; (void)a6;
-    NotReconstructed("CompressBlock() [sub_405B80]", "0x405B80");
-    return 0;
-}
-
-void InitDistanceTables(void)
-{
-    NotReconstructed("InitDistanceTables() [sub_4058A0]", "0x4058A0");
-}
 
 /* ---------------------------------------------------------------- */
 /*  0x40E584 - the MSVC user math error handler.  VC6's startup
