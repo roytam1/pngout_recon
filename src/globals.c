@@ -155,6 +155,11 @@ int      HashHead[4096];                /* 0x412EC0 */
 int      DistSlot[32768];               /* 0x41CEC8 */
 int      MatchArea[0x8000];             /* 0x6B4968, the LZ work area */
 
+/* the /b block list, 0x42F364: five fields per block record */
+int      BlockRecord[MAX_BLOCKS * BLOCK_STRIDE];
+int      NumBlockList;                /* dword_6D5570 */
+unsigned char *LinBufData;            /* dword_18CBEE4: LinBuf + 4 */
+
 /* per row match slots */
 int      DistSlots[64];                 /* 0x6D5578 */
 unsigned char SlotOrder[32];              /* 0x185BA90 */
@@ -167,6 +172,7 @@ int      EntropyMax;                   /* dword_180A568: the largest count in it
 int     *EntropyLut;                   /* dword_18CBEE8: count * ln(count) * scale */
 int      EntropyLutSize;               /* dword_18CBEE4                        */
 
+int     (*CheckEscHook)(int);            /* dword_6F6670: polled by the trials  */
 int      MinSample;                      /* dword_185BEC0: darkest sample in the image */
 int      unk_185BEC8, unk_180BA84, unk_185BEB8, unk_411D58, unk_41CEC0;
 int      unk_6D4968, unk_6F6B78, unk_412668, unk_42D7C8, unk_18CBEEC;

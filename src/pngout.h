@@ -160,20 +160,25 @@ typedef struct ImageDescStruct {
     int           strategy; /* +4C  0 Xtreme, 1 Intense, 2 Longest Match,
                                3 Huffman only, 4 uncompressed           */
 
-    int           pad2[4];  /* +50 .. +5C */
+    int           pad2[1];  /* +50 */
+
+    int           maxblocks;/* +54  /b#, or 0 to pick the cuts by saving */
+    double        splitthreshold; /* +58: cut a block when the saving beats
+                                     this                                    */
 
     /* the chunks ScanChunks decided to keep, as records of
        [length][tag][data][crc] - split in two runs around PLTE */
     int           chunkbeg; /* +60  first chunk after IHDR               */
     int           chunkmid; /* +64  first chunk after PLTE               */
     int           chunkend; /* +68  one past the last chunk              */
+    int           pad3;     /* +6C */
     unsigned int **chunks;  /* +70  the records themselves               */
 
     int           trial;    /* +74  which filter trial is running        */
     int           percent;  /* +78  progress, 0 .. 100                   */
 
-    int           pad3[4];  /* +7C .. +88 */
-    int           pad4[15]; /* +8C .. +C4 */
+    int           pad4;     /* +7C */
+    int           pad5[18]; /* +80 .. +C4 */
 
     int           best;     /* +C8  best compressed size found so far     */
 } IMAGEDESC;
@@ -321,6 +326,30 @@ extern int     *EntropyLut;           /* dword_18CBEE8                        */
 extern int      EntropyLutSize;       /* dword_18CBEE4                        */
 unsigned int EstimateEntropy(int *hist, int buckets);
 
+extern int     (*CheckEscHook)(int);    /* dword_6F6670, polled by the trials */
+/*
+ *  The /b block list, another 0xA18-strided record array with five fields
+ *  per block - split, start, end, next and a double score.  Only 0x18 bytes
+ *  of each record are touched, so it gets a compact stride here; see
+ *  PlanBlocks() in src/optimize.c for what each field is.
+ */
+#define MAX_BLOCKS     1024            /* the original's cap, `cmp eax, 400h` */
+#define BLOCK_STRIDE   32              /* dwords per block record            */
+extern int BlockRecord[MAX_BLOCKS * BLOCK_STRIDE];
+extern int NumBlockList;               /* dword_6D5570, see the note below   */
+extern unsigned char *LinBufData;      /* dword_18CBEE4, the buffer's data   */
+
+#define BlockSplit(n)   (&BlockRecord[(n) * BLOCK_STRIDE + 0])
+#define BlockStart(n)   (&BlockRecord[(n) * BLOCK_STRIDE + 1])
+#define BlockEnd(n)     (&BlockRecord[(n) * BLOCK_STRIDE + 2])
+#define BlockNext(n)    (&BlockRecord[(n) * BLOCK_STRIDE + 3])
+#define BlockScore(n)   ((double *)&BlockRecord[(n) * BLOCK_STRIDE + 4])
+
+int  PlanBlocks(int start, int end);
+void SortBlockEnds(int count);
+
+/* sub_408390: the best place to cut a run of bytes, and the saving there */
+int  BestSplit(unsigned char *data, int len, double *score);
 extern int      MinSample;        /* dword_185BEC0, the darkest sample */
 extern int      unk_185BEC8, unk_180BA84, unk_185BEB8, unk_411D58, unk_41CEC0;
 extern int      unk_6D4968, unk_6F6B78, unk_412668, unk_42D7C8, unk_18CBEEC;

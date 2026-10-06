@@ -148,6 +148,19 @@ static int tdecode(const unsigned char *out, int *got, int *nlen,
 }
 
 
+/* ------------------------------------------------------------------ */
+/*  BestSplit: where would the /b block splitter cut this?             */
+/* ------------------------------------------------------------------ */
+
+static int esc_calls;
+
+static int esc_hook(int unused)
+{
+    (void)unused;
+    esc_calls++;
+    return 1;                     /* the user pressed ESC */
+}
+
 int main(void)
 {
     unsigned char buf[4096];
@@ -645,7 +658,7 @@ int main(void)
     /* ---- deflate length / distance tables (sub_4058A0) ---- */
     {
         static IMAGEDESC img;
-        int i, ok;
+        int i, n, ok;
 
         memset(&img, 0, sizeof(img));
         img.ndistinct = 256;
@@ -1194,6 +1207,198 @@ int main(void)
         check("a different maximum count rebuilds the table",
               EntropyLutSize, 12);
         check("the table reaches the commonest count", EntropyLut[12] > 0, 1);
+    }
+
+    /* ---- BestSplit (sub_408390) ---- */
+    {
+        static unsigned char buf[512];
+        double s1, s2, s3;
+        int i, cut;
+
+        CheckEscHook = NULL;
+
+        /* one byte or less has no interior cut, and no score either */
+        s1 = 12345.0;
+        check("a single byte has no cut", BestSplit(buf, 1, &s1), 0);
+        check("a single byte leaves the score alone", (int)s1, 12345);
+        check("no bytes at all", BestSplit(buf, 0, &s1), 0);
+
+        /*
+         *  Two flat halves of two different bytes: cutting between them is
+         *  the most compressible thing possible, so that has to be where the
+         *  cost is lowest.
+         */
+        for (i = 0; i < 32; i++) buf[i] = 0x00;
+        for (i = 32; i < 64; i++) buf[i] = 0xFF;
+        cut = BestSplit(buf, 64, &s1);
+        printf("info two flat halves: cut at %d, saving %f\n", cut, s1);
+        check("two flat halves cut between them", cut, 32);
+
+        /* a single flat range has nothing to find: every cut is the same */
+        for (i = 0; i < 64; i++) buf[i] = 0x5A;
+        check("a flat range still finds a cut", BestSplit(buf, 64, &s2) > 0, 1);
+        printf("info flat range: saving %f\n", s2);
+
+        /* four quarters, each a different byte: the best cut is one of the
+           three boundaries */
+        for (i = 0; i < 16; i++) buf[i] = 1;
+        for (i = 16; i < 32; i++) buf[i] = 2;
+        for (i = 32; i < 48; i++) buf[i] = 3;
+        for (i = 48; i < 64; i++) buf[i] = 4;
+        cut = BestSplit(buf, 64, &s3);
+        printf("info four quarters: cut at %d, saving %f\n", cut, s3);
+        check("four quarters cut on a boundary",
+              (cut == 16 || cut == 32 || cut == 48), 1);
+
+        /*
+         *  The score is a saving, so it rises as the range gets easier to
+         *  split: four quarters with two symbols each beat two halves with
+         *  one, and a range that is a single solid byte has nothing to gain.
+         */
+        check("four quarters gain more than two halves", s3 > s1, 1);
+        check("two halves beat a solid range", s1 > s2, 1);
+
+        /* the split is always interior */
+        for (i = 0; i < 200; i++)
+            buf[i] = (unsigned char)(i * 7 + (i / 13));
+        cut = BestSplit(buf, 200, &s3);
+        printf("info a ramp: cut at %d of 200\n", cut);
+        check("the cut is interior", cut > 0 && cut < 200, 1);
+
+        /* ESC is polled every 64K bytes, and it aborts */
+        CheckEscHook = esc_hook;
+        esc_calls = 0;
+        check("ESC aborts the search", BestSplit(buf, 200, &s3), -1);
+        CheckEscHook = NULL;
+    }
+
+    /* ---- PlanBlocks: the /b block splitter (sub_408000) ---- */
+    {
+        static IMAGEDESC img;
+        static unsigned char data[4096];
+        int i, n, ok;
+
+        memset(&img, 0, sizeof(img));
+        Image = &img;
+        CheckEscHook = NULL;
+
+        /* the planner works on LinBuf's data area */
+        LinBufData = data;
+
+        /* a solid block of one byte has nothing worth cutting */
+        for (i = 0; i < 512; i++) data[i] = 0x33;
+        img.maxblocks = 0;
+        img.splitthreshold = 1.0;
+        check("a solid block plans", PlanBlocks(0, 512), 0);
+        printf("info solid block: %d block(s)\n", NumBlockList);
+        check("a solid block stays whole", NumBlockList, 1);
+
+        /*
+         *  Four quarters of 128 bytes each.  How many blocks come out depends
+         *  entirely on the threshold - at zero it will keep cutting into
+         *  single bytes - so what is checked is the shape of the list: the
+         *  ends sorted ascending, and the count going down as the bar goes up.
+         */
+        for (i = 0; i < 512; i++)
+            data[i] = (unsigned char)(i / 128);
+
+        for (n = 0; n < 4; n++) {
+            double thresh = (n == 0) ? 0.0 : (n == 1) ? 40.0
+                             : (n == 2) ? 200.0 : 100000.0;
+
+            img.maxblocks = 0;
+            img.splitthreshold = thresh;
+            check("a quartered block plans", PlanBlocks(0, 512), 0);
+            printf("info threshold %8.0f -> %d block(s) ends:", thresh,
+                   NumBlockList);
+            for (i = 0; i < NumBlockList && i < 8; i++)
+                printf(" %d", *BlockEnd(i));
+            printf("\n");
+
+            /* the ends are the partition, and they are sorted */
+            ok = 1;
+            for (i = 1; i < NumBlockList; i++)
+                if (*BlockEnd(i) < *BlockEnd(i - 1))
+                    ok = 0;
+            check("the ends are sorted ascending", ok, 1);
+            check("the last end is the end of the range",
+                  *BlockEnd(NumBlockList - 1), 512);
+            if (n == 0)
+                check("a zero threshold cuts hard", NumBlockList > 8, 1);
+            if (n == 3)
+                check("an impossible threshold cuts nothing", NumBlockList, 1);
+
+        }
+
+        /* an explicit block count is honoured */
+        img.splitthreshold = 0.0;
+        img.maxblocks = 2;
+        check("two blocks requested", PlanBlocks(0, 512), 0);
+        printf("info /b2: %d block(s), ends %d %d\n", NumBlockList,
+               *BlockEnd(0), *BlockEnd(1));
+        check("/b2 gives two blocks", NumBlockList, 2);
+
+        img.maxblocks = 4;
+        check("four blocks requested", PlanBlocks(0, 512), 0);
+        check("/b4 gives four blocks", NumBlockList, 4);
+        check("/b4 still ends at the end of the range",
+              *BlockEnd(NumBlockList - 1), 512);
+
+        /* one block means no splitting at all */
+        img.maxblocks = 1;
+        check("/b1 gives one block", PlanBlocks(0, 512), 0);
+        check("/b1 leaves one block", NumBlockList, 1);
+
+        /* and the count is clamped to 1024 */
+        img.maxblocks = 5000;
+        check("a huge count still plans", PlanBlocks(0, 512), 0);
+        check("the count was clamped", img.maxblocks, MAX_BLOCKS);
+
+        /* a single byte has no interior cut, so the count is left alone */
+        img.maxblocks = 8;
+        check("one byte cannot be cut", PlanBlocks(0, 1), 0);
+        check("one byte stays whole", NumBlockList, 1);
+
+        /* two bytes do divide, because the guard is "shorter than two" */
+        img.maxblocks = 8;
+        check("two bytes plan", PlanBlocks(0, 2), 0);
+        check("two bytes become two blocks", NumBlockList, 2);
+
+        LinBufData = NULL;
+    }
+
+    /* ---- the shell sort over the block ends ---- */
+    {
+        static int scrambled[40];
+        int i, ok;
+
+        /* a reversed, then interleaved, set of ends */
+        for (i = 0; i < 40; i++)
+            scrambled[i] = 39 - i;
+        for (i = 0; i < 40; i++)
+            *BlockEnd(i) = scrambled[i];
+        SortBlockEnds(40);
+        ok = 1;
+        for (i = 1; i < 40; i++)
+            if (*BlockEnd(i) < *BlockEnd(i - 1))
+                ok = 0;
+        check("the ends sort ascending from reversed", ok, 1);
+
+        for (i = 0; i < 40; i++)
+            *BlockEnd(i) = scrambled[(i * 7) % 40];   /* a stride of 7 */
+        SortBlockEnds(40);
+        ok = 1;
+        for (i = 1; i < 40; i++)
+            if (*BlockEnd(i) < *BlockEnd(i - 1))
+                ok = 0;
+        check("the ends sort ascending from a stride", ok, 1);
+
+        *BlockEnd(0) = 5;
+        *BlockEnd(1) = 3;
+        *BlockEnd(2) = 9;
+        SortBlockEnds(3);
+        check("three ends sort", *BlockEnd(0) * 100 + *BlockEnd(1) * 10 +
+              *BlockEnd(2), 359);
     }
 
     printf("\n%s  (%d failure%s)\n", failures ? "FAILED" : "PASSED",

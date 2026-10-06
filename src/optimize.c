@@ -1304,6 +1304,292 @@ int WritePngHeader(int width, int height, int coltype, int bitdepth,
 }
 
 /* ------------------------------------------------------------------ */
+/*  the /b block splitter                                              */
+/* ------------------------------------------------------------------ */
+
+/*
+ *  sub_408000: cut the filtered image into deflate blocks.
+ *
+ *  The block list is another 0xA18-strided record array, five fields per
+ *  block, and `PlanBlocks()` fills in three of the five the optimiser needs:
+ *
+ *      BlockSplit[b]   where the block was cut, absolute
+ *      BlockStart[b]   first byte
+ *      BlockEnd[b]     one past the last byte
+ *      BlockNext[b]    the next block in the automatic mode's walk
+ *      BlockScore[b]   the saving BestSplit() found there
+ *
+ *  Two modes, chosen by `Image->maxblocks`:
+ *
+ *    - 0 or less, automatic: keep cutting whatever block offers the biggest
+ *      saving, as long as it beats `Image->splitthreshold`, never going over
+ *      1024 blocks.  Each block is looked at twice per round, because cutting
+ *      one block changes its neighbour's score;
+ *    - more than 1: cut the block with the biggest saving until there are
+ *      that many, clamped to 1024.
+ *
+ *  Both end with a shell sort pass over the block *ends* alone - the starts
+ *  are left where they are - so the blocks come out close to equal in size.
+ *  The original's sort is a single pass per gap, halving the gap each round,
+ *  and it walks each window backwards, swapping as long as it can.
+ *
+ *  Returns 0, or -1 if ESC was pressed.
+ */
+/*
+ *  Sort the block ends ascending, one shell sort gap at a time.  Only the
+ *  ends are sorted - the starts are left where the search put them, because
+ *  the finished list is read as start[0], end[0], end[1], end[2] ... in that
+ *  order, so the ends *are* the block boundaries.
+ *
+ *  The walk is backwards from the pair being compared and steps by whole
+ *  records, which is why the pointers move gap * BLOCK_STRIDE dwords at a
+ *  time and not gap.
+ */
+void SortBlockEnds(int count)
+{
+    int gap, j, k, t;
+
+    for (gap = count >> 1; gap != 0; gap >>= 1) {
+        for (j = 0; j < count - gap; j++) {
+            int *outer = BlockEnd(j);
+            int *inner = BlockEnd(j + gap);
+
+            for (k = j; k >= 0; k -= gap,
+                 outer -= gap * BLOCK_STRIDE, inner -= gap * BLOCK_STRIDE) {
+                if (*outer <= *inner)
+                    break;
+                t = *outer;
+                *outer = *inner;
+                *inner = t;
+            }
+        }
+    }
+}
+
+int PlanBlocks(int start, int end)
+{
+    double score, best;
+    int i, n, pass, twice, cut, bestblock;
+
+    /* the byte buffer keeps its base pointer one dword below the data */
+    unsigned char *data = LinBufData;
+
+    *BlockStart(0) = start;
+    *BlockEnd(0) = end;
+    NumBlockList = 1;
+
+    if (Image->maxblocks <= 0) {
+        *BlockNext(0) = -1;
+
+        /*
+         *  Each pass starts at the block whose index is the pass number and
+         *  walks the list twice, because cutting a block changes its
+         *  neighbour's score.  The list grows while it is walked, so a later
+         *  pass reaches the blocks the earlier ones created.
+         */
+        for (pass = 0; pass < NumBlockList; pass++) {
+            i = pass;
+            twice = 2;
+
+            while (twice-- != 0) {
+                if (i < 0)
+                    break;
+
+                cut = BestSplit(data + *BlockStart(i),
+                                *BlockEnd(i) - *BlockStart(i), &score);
+                if (cut < 0)
+                    return -1;
+
+                if (cut > 0 && score > Image->splitthreshold) {
+                    n = NumBlockList;
+                    *BlockStart(n) = *BlockStart(i) + cut;
+                    *BlockEnd(n) = *BlockEnd(i);
+                    *BlockEnd(i) = *BlockStart(n);
+                    *BlockNext(n) = i;
+                    NumBlockList = n + 1;
+                    if (n + 1 >= MAX_BLOCKS)
+                        goto balance;
+                }
+
+                i = *BlockNext(i);
+            }
+        }
+        goto balance;
+    }
+
+    if (Image->maxblocks == 1)
+        return 0;
+
+    if (Image->maxblocks > MAX_BLOCKS)
+        Image->maxblocks = MAX_BLOCKS;
+
+    cut = BestSplit(data + start, end - start, BlockScore(0));
+    if (cut < 0)
+        return -1;
+    *BlockSplit(0) = start + cut;
+
+    while (NumBlockList < Image->maxblocks) {
+        /* the block with the biggest saving, and where it was cut */
+        best = *BlockScore(0);
+        bestblock = 0;
+
+        for (i = NumBlockList - 1; i >= 0; i--) {
+            if (*BlockScore(i) > best) {
+                best = *BlockScore(i);
+                bestblock = i;
+            }
+        }
+
+        if (*BlockEnd(bestblock) - *BlockStart(bestblock) < 2)
+            break;
+
+        n = NumBlockList;
+        *BlockStart(n) = *BlockSplit(bestblock);
+        *BlockEnd(n) = *BlockEnd(bestblock);
+
+        cut = BestSplit(data + *BlockStart(n),
+                        *BlockEnd(n) - *BlockStart(n), BlockScore(n));
+        if (cut < 0)
+            return -1;
+        *BlockSplit(n) = *BlockStart(n) + cut;
+
+        /* and the front half, which the cut just shortened */
+        *BlockEnd(bestblock) = *BlockSplit(bestblock);
+        cut = BestSplit(data + *BlockStart(bestblock),
+                        *BlockEnd(bestblock) - *BlockStart(bestblock),
+                        BlockScore(bestblock));
+        if (cut < 0)
+            return -1;
+        *BlockSplit(bestblock) = *BlockStart(bestblock) + cut;
+
+        NumBlockList = n + 1;
+    }
+
+balance:
+    SortBlockEnds(NumBlockList);
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  where to cut a block                                               */
+/* ------------------------------------------------------------------ */
+
+/*
+ *  sub_408390: given a run of bytes, where is the best place to cut it in
+ *  two?  That is the question `sub_408000` (the /b block splitter) asks over
+ *  and over, so the answer has to be cheap as well as good, and this is a
+ *  single pass with everything it needs kept per symbol.
+ *
+ *  The cost it accumulates is the -log of a symbol's probability with a prior
+ *  folded in, so *lower is better*: the caller keeps the cut with the smallest
+ *  cost.  What it reports is that cost negated and scaled by 1/8, so the score
+ *  is a *saving* and **higher is better** - `sub_408000` splits when the score
+ *  beats the /b threshold.  Two running totals are kept per symbol, for the
+ *  bytes of that symbol seen so far and for the bytes still ahead, and each new
+ *  byte updates both plus the running totals for the whole range.
+ *
+ *  The prior is why there are two magic numbers: the per-byte cost is
+ *
+ *      (n(n+1) + 0.03160502036941208) * (n + 0.5)
+ *      -------------------------------------------------
+ *      (n(n+1) + 0.19823983692604) * n(n+1)
+ *
+ *  for n bytes of one symbol, which is a KT/Laplace style estimator - the
+ *  constant keeps it finite at n = 0, where the term is skipped entirely.
+ *
+ *  Returns the offset of the best cut, 1 .. len - 1, and the saving there.  A
+ *  range of one byte or less has no interior cut: it returns 0 and leaves
+ *  `*score` alone.  -1 means the user pressed ESC.
+ */
+#define PRIOR_NUM  0.03160502036941208
+#define PRIOR_DEN  0.19823983692604
+
+/* the cost of one more byte of a symbol that has been seen n times */
+static double SplitCost(double n)
+{
+    double nn = n * (n + 1.0);
+
+    if (nn == 0.0)
+        return 0.0;
+
+    return ((nn + PRIOR_NUM) * (n + 0.5)) / ((nn + PRIOR_DEN) * nn);
+}
+
+int BestSplit(unsigned char *data, int len, double *score)
+{
+    static int   Total[256];        /* dword_411950: how often, in all   */
+    static int   Seen[256];         /* dword_411550: how often so far     */
+    static double LogCount[256];    /* dbl_6D5E68: ln of the two counts  */
+    static double PartCost[256];    /* dbl_6D5668: the running cost      */
+    static double Running[256];     /* dbl_6D4970: the running total      */
+
+    double best = 1.0e32;
+    double acc = 0.0;
+    double prev = 0.0;              /* the last candidate, left on the
+                                       x87 stack by the original */
+    double tail, total, before, part, rest;
+    int i, sym, cut = 0, left = 0, remaining = len;
+
+    if (len <= 1)
+        return 0;
+
+    memset(Seen, 0, sizeof(Seen));
+    memset(Total, 0, sizeof(Total));
+
+    for (i = 0; i < len; i++)
+        Total[data[i]]++;
+
+    memset(PartCost, 0, sizeof(PartCost));
+
+    for (i = 0; i < 256; i++) {
+        LogCount[i] = Total[i] ? log((double)Total[i]) : 0.0;
+        Running[i] = (double)Total[i] * LogCount[i];
+    }
+
+    /* the original builds both of these with fldln2/fyl2x, which is exactly
+       log(), so log() is what it computes */
+    tail = log((double)(len - 1));
+    total = log((double)len) * (double)len;
+
+    for (i = 0; i + 1 < len; i++) {
+        sym = data[i];
+
+        /* what the cost would be if the range ended here, before this byte
+           has been accounted for */
+        before = prev + Running[sym] - total;
+
+        Seen[sym]++;
+        part = (double)Seen[sym];
+        rest = (double)(Total[sym] - Seen[sym]);
+
+        PartCost[sym] += SplitCost(part);
+        LogCount[sym] -= SplitCost(rest);
+        Running[sym] = part * PartCost[sym] + rest * LogCount[sym];
+
+        remaining--;
+        left++;
+
+        total = (double)remaining * tail + (double)left * acc;
+        acc += SplitCost((double)left);
+        tail -= SplitCost((double)remaining);
+
+        /* and now if the range started after it */
+        prev = before - (Running[sym] - total);
+
+        if (prev < best) {
+            best = prev;
+            cut = i + 1;
+        }
+
+        if ((i & 0xFFFF) == 0 && CheckEscHook != NULL && CheckEscHook(1))
+            return -1;
+    }
+
+    *score = (-0.125 / 1.0) * best;      /* the original: /log2(2.0) */
+    return cut;
+}
+
+/* ------------------------------------------------------------------ */
 /*  the entropy estimate the trials are scored with                    */
 /* ------------------------------------------------------------------ */
 

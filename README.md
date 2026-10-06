@@ -91,6 +91,9 @@ listing line counts, which is how the remaining work gets sized.
 | `0x4058A0` `sub_4058A0` | `InitBlockTables()` | `src/optimize.c` |
 | `0x405A60` `sub_405A60` | `BuildDistanceSlots()` | `src/optimize.c` |
 | `0x405B80` `sub_405B80` | `WritePngHeader()` | `src/optimize.c` |
+| `0x4063F0` `sub_4063F0` | `EstimateEntropy()` | `src/optimize.c` |
+| `0x408000` `sub_408000` | `PlanBlocks()` + `SortBlockEnds()` | `src/optimize.c` |
+| `0x408390` `sub_408390` | `BestSplit()` | `src/optimize.c` |
 | `0x40E584` `UserMathErrorFunction` | `_UserMathErrorFunction()` | `src/stubs.c` |
 | `.data` initialised part | 22 globals + `BitTable[64]` | `src/globals.c` |
 
@@ -402,6 +405,44 @@ once the filter trials are in:
   whose largest count is 1 therefore asks for a table of -1 entries and every
   read lands on the zero at index 0.
 
+### sub_408390, where to cut a block
+
+`BestSplit()` answers the question the `/b` block splitter (`sub_408000`, now
+reconstructed as `PlanBlocks()`) asks over and over: given a run of bytes, where
+is the best place to cut it in two? It has to be cheap as well as good, so it is
+a single pass keeping, per symbol, the bytes seen so far and the bytes still
+ahead.
+
+The cost it accumulates is the −log of a symbol's probability with a prior
+folded in:
+
+```
+(n(n+1) + 0.03160502036941208) * (n + 0.5)
+-----------------------------------------
+(n(n+1) + 0.19823983692604) * n(n+1)
+```
+
+for *n* bytes of one symbol — a KT/Laplace style estimator, with the constant
+keeping it finite at *n* = 0 (where the term is skipped). Internally *lower is
+better*, so the search keeps the smallest; what it reports is that cost negated
+and scaled by 1/8, so the score is a **saving** and higher is better, which is
+what the splitter compares against the `/b#` threshold.
+
+Two details that only show up in the disassembly:
+
+* the previous candidate's cost is left **on the x87 stack** (`fst` rather than
+  `fstp`) and picked up at the top of the next iteration, with a dead
+  `fld dbl_40FC10` — a zero — putting the seed there before the loop. Reading
+  it as anything else makes the search pick the first cut every time;
+* `log()` is computed with `fldln2` + `fyl2x`, which is exactly `log()`, and
+  the returned saving is divided by `log2(2.0)` to turn the `-0.125` factor
+  into `-1/8`.
+
+The tests pin the behaviour that matters: 32 zero bytes followed by 32 `0xFF`
+bytes is cut at 32, four quarters of 16 different bytes are cut on a boundary,
+a solid byte has almost nothing to gain (0.106 against 5.6 and 5.7), and ESC
+is polled every 64K bytes and aborts with −1.
+
 ### Still open
 
 * `sub_405A60` (`BuildDistanceSlots()`) fills `dword_6D5578[]` with 30 slots
@@ -413,12 +454,59 @@ once the filter trials are in:
 * The CRC table's single writer sits 4 bytes above all 18 readers
   (`0x185BABC` vs `0x185BAB8`). Modelled at the readers' address.
 
+### sub_408000, the /b block splitter
+
+`PlanBlocks(start, end)` turns one byte range into the list of deflate blocks
+the compressor will emit, calling `BestSplit()` on each block to decide whether
+cutting it pays. It reads the range out of `dword_18CBEE4` (the filtered image
+buffer, whose base pointer is the freed `dword_18CBEE0` one dword below the
+data) and keeps its list in the second 0xA18-strided record array at
+`0x42F364`: `split`, `start`, `end`, `next`, and a `double` score, five fields
+of the 0x18 bytes the function ever touches. `NumBlockList` is `dword_6D5570`.
+
+Both modes end with the same shell sort:
+
+* **`/b#` given** (`Image->maxblocks`, `+0x54`) — cut the whole range at its
+  best point, then repeatedly split the block with the biggest saving until the
+  count is reached, a block is shorter than two bytes, or 1024 (`cmp eax, 400h`)
+  blocks exist. The scores are *stale* on purpose: a block's score is only
+  refreshed when that block is the one being split, which is why the loop can
+  stop with the count below `/b#` — the chosen block may have no interior cut
+  left. `/b1` returns before any of this, having left the single whole-range
+  block in place.
+* **automatic** (`maxblocks <= 0`) — walk the list from `next`, twice per block
+  because cutting one changes its neighbour's score, cutting whenever
+  `BestSplit()` reports both a cut and a saving above `Image->splitthreshold`
+  (`+0x58`). The walk restarts at the block whose index equals the pass number,
+  which is how the growing list gets visited: it is `mov edi, [pass]` at the
+  bottom of the pass loop, not a remembered cursor. A new block is appended at
+  the end and linked *backwards* (`next[new] = old`), so the list stays in
+  insertion order.
+
+Two things in the sort are easy to get wrong, and both were:
+
+* only the **ends** are sorted. The starts stay where the search left them,
+  because the finished list is read as `start[0], end[0], end[1], end[2] ...` —
+  the ends *are* the boundaries. Sorting the whole records would scramble the
+  pairing.
+* the backwards walk steps by whole records, `gap * 0xA18` bytes in the
+  original, so the pointers must move `gap * BLOCK_STRIDE` **dwords**. Stepping
+  `gap` dwords looks right and leaves the array looking *almost* sorted — which
+  is how it survived review the first time.
+
+The tests check the shape rather than exact cuts, since the count depends
+entirely on the threshold: a solid block stays whole; a quartered block gives
+512 one-byte blocks at threshold 0, two blocks at 40, one at 200 and above, with
+the ends ascending in every case; `/b2`, `/b4` and `/b1` give their block counts;
+`/b5000` is clamped to 1024; and the sort itself is checked on a reversed and a
+stride-7 scrambled set of ends.
+
 ### Still to do inside Optimize
 
 `sub_402AD0` itself (5 983 listing lines), the four filter trials
 `sub_4071D0`/`4077C0`/`407B00`/`407D80`, the min-sum filter `sub_4086E0`, the
-other entropy estimate `sub_408000`/`sub_408390`, the timing `sub_4063F0`, the
-LZ coder `sub_4065A0` and its helpers, and the `.bss` globals they all use.
+timing `sub_4063F0`'s caller, the LZ coder `sub_4065A0` and its helpers, and the
+`.bss` globals they all use.
 
 ## DecodeImage (0x409560): how it fits together
 
@@ -521,11 +609,11 @@ Two independent checks, both runnable.
 
 ### tools\selftest.cmd
 
-200 checks over the recovered code: `Swap16`, `GetImageSize` for all
+242 checks over the recovered code: `Swap16`, `GetImageSize` for all
 eight format codes, the `/k` list handling in `ScanChunks`, `FilterPredict()`,
 `CpuFeatures()`, and the optimiser primitives (CRC table, Huffman heap, colour
-hash, `PutBits()`/`EmitBytes()`, `RankValues()`, `FlushRow()`, `WritePngHeader()` and `EstimateEntropy()`).
-They caught nine real defects, all now fixed:
+hash, `PutBits()`/`EmitBytes()`, `RankValues()`, `FlushRow()`, `WritePngHeader()`, `EstimateEntropy()`, `BestSplit()`, `PlanBlocks()` and its block-end sort).
+They caught ten real defects, all now fixed:
 
 * PNG dimensions are **4 byte** big endian, not 2 byte. `GetImageSize` was
   using `Swap16` where the original calls `_byteswap_ulong` on a DWORD.
@@ -570,6 +658,12 @@ They caught nine real defects, all now fixed:
   it, and the array carries its own 255 bytes of slack in front. This one ran
   at the start of every deflate block, so it would have corrupted the optimiser
   mid-run.
+* **The block-end shell sort stepped by dwords instead of records.** The
+  original's backwards walk is `sub esi, 2584 * gap` bytes, i.e. `gap` whole
+  records; the transcription used the same index arithmetic but moved the
+  pointers by `gap` dwords, so every swap landed in the *start* and *next* fields
+  of neighbouring records and left the ends nearly - but not quite - sorted. The
+  tests now sort a reversed and a stride-7 scrambled set of ends directly.
 
 They also exposed that the original's `strtok` loop in `ScanChunks` steps one
 byte past the terminating NUL after the last token, because it restores the
@@ -679,7 +773,8 @@ src/chunk.c       PNG chunk walk, format sniffer, Swap16
 src/clipboard.c   ReadClipboard
 src/globals.c     .data
 src/optimize.c    CRC table, Huffman heap, colour hash, bit/byte output,
-                  deflate tables, per row slots, the row writer, the PNG header
+                  deflate tables, per row slots, the row writer, the PNG header,
+                  the /b block splitter
 src/predict.c     FilterPredict
 src/cpuid.c       CpuFeatures
 src/stubs.c       the two unrecovered entry points, plus the math error handler
