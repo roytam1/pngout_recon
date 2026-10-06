@@ -47,14 +47,14 @@
 #define PNGOUT_MARK 0x5E78           /* the placeholder CRC, = 24184       */
 
 
-/* dword_42EE68: the filtered image, 320 samples a row with a small header,
-   giving the 646 byte stride sub_402AD0 walks. */
-extern unsigned char ImageBuffer[MAX_WIDTH * 646];
+/* dword_42EE68: the symbol stream for one row, 256 literal slots, 30 length
+   slots at +256 and 30 distance slots at +288. */
+extern int ImageBuffer[MAX_ROWS * ROW_STRIDE];
 
 int CompressBlock(unsigned Number, unsigned symbols, int a3, int bitspersym,
                   int a5, int a6);
 int  BuildDistanceSlots(int row);
-void FlushBlock(unsigned char *rows);
+void FlushRow(int *row);
 
 int EmitBlock(unsigned Number, unsigned symbols, int a3, int bitspersym,
               int a5, int a6)
@@ -105,7 +105,7 @@ int EmitBlock(unsigned Number, unsigned symbols, int a3, int bitspersym,
         PutBits(0, 1);
     PutBits(2, 2);
 
-    FlushBlock(&ImageBuffer[646 * RowIndex]);
+    FlushRow(&ImageBuffer[ROW_STRIDE * RowIndex]);
     return 1;
 }
 
@@ -178,11 +178,19 @@ int RankValues(int *vals, int count, int *out)
             r = hist[v];
             hist[v] = r + 1;
 
+            /*
+             *  Reverse the low v bits of r.  The order matters: the original
+             *  does `shr edx,1` and then `adc eax,eax`, so each bit is taken
+             *  *after* the shift, which is the same as taking it before and
+             *  shifting afterwards.  Reversing after the shift instead reads
+             *  bit 1 upwards, throws the low bit away and pads a zero at the
+             *  top - which makes half the codes come out wrong.
+             */
             acc = 0;
             n = v;
             while (n--) {
-                r >>= 1;
                 acc = acc * 2 + (r & 1);
+                r >>= 1;
             }
             out[i] = acc;
         }
@@ -694,7 +702,7 @@ int InitBlockTables(void)
     unk_42D7C8 = 0;
     unk_18CBEEC = 0;
     RowIndex = 0;
-    RowSlot[646 * RowCount] = 0x7FFFFFFF;          /* dword_42E958[] */
+    RowSlot[ROW_SLOTS * RowCount] = 0x7FFFFFFF;   /* dword_42E958[] */
 
     return BuildDistanceSlots(0);
 }
@@ -704,55 +712,64 @@ int InitBlockTables(void)
 /* ------------------------------------------------------------------ */
 
 /*
- *  sub_405A60: turn one row's LZ distances into the slot table the encoder
- *  searches.  The first 30 slots are length slots, the rest distance slots,
- *  and every slot that has no match is 4096.
+ *  sub_405A60: turn one row's slot values into the table the encoder's match
+ *  search walks.  The first 30 slots come from the length half and the next
+ *  29 from the distance half, and every slot that has no entry at all is
+ *  4096 - larger than any real value, so it simply loses every comparison.
+ *
+ *  Both halves are arrays of *code lengths*, not of lengths or distances:
+ *  sub_4065A0 emits a match with
+ *
+ *      PutBits(dword_6F6A04[code], dword_42F1F4[646*row + code]);  // length
+ *      PutBits(value - LenBase[code], LenExtra[code]);             // extras
+ *      PutBits(dword_6F6AF8[code], dword_42F2E8[646*row + code]);  // distance
+ *      PutBits(value - DistBase[code], DistExtra[code]);
+ *
+ *  so LenSymBits[] (row field +0x89C) and DistSymBits[] (row field +0x990)
+ *  hold how many bits each symbol costs in this row, and what is added here
+ *  is the number of extra bits it takes - which is why the entries stay
+ *  small enough to be coded by the row's own 19 symbol code.
+ *
+ *  Note that the second loop's base pointer is written in the listing as
+ *  `dword_1809390[eax * 8]` with eax = 30, which is exactly where the linker
+ *  put DistPairs - the two tables are adjacent - so `DistPairs[]` is right
+ *  even though the disassembly reads LenPairs.
  *
  *  When the strategy is Xtreme (0) it also builds SlotOrder[], each entry
  *  holding the index of the next strictly smaller slot, so a trial can walk
  *  down the candidates instead of scanning all 30.
  */
-int DistSlots[64];                  /* dword_6D5578, 59 entries used */
-int DistWork[MAX_WIDTH * 646];      /* dword_42E968, per-row scratch */
-int DistIn[MAX_WIDTH * 646];        /* dword_42F2E8, per-row distances */
-unsigned char SlotOrder[32];        /* byte_185BA90 */
-int FreqA;                          /* dword_6F6678 */
-int FreqB;                          /* dword_6F6AF8 */
 
-int RankBytes(unsigned char *vals, int count, int *out);
-int RankInts(int *vals, int count, int *out);
+int RankValues(int *vals, int count, int *out);
 
 int BuildDistanceSlots(int row)
 {
-    int base = 646 * row;
     int n = 0;
-    int *dist = &DistIn[base];
 
-    memset(&DistWork[base], 0, 0x500);
+    memset(&DistWork[ROW_STRIDE * row], 0, 4 * MAX_WIDTH);
 
     do {
-        if (*dist)
-            DistSlots[n] = *dist + LenPairs[2 * n];
+        if (DistSymBits[ROW_SLOTS * row + n])
+            DistSlots[n] = DistSymBits[ROW_SLOTS * row + n] + LenPairs[2 * n];
         else
-            DistSlots[n] = 4096;
+            DistSlots[n] = 4096;                /* 0x1000, "no match" */
         n++;
-        dist++;
     } while (n < 30);
 
     if (n < 59) {
         int *slot = &DistSlots[n];
-        int *pair = &DistPairs[2 * n];
-        int *work = &DistWork[n + base];
+        int *pair = DistPairs;
+        int *in = &LenSymBits[ROW_SLOTS * row + n];
 
         do {
-            if (*work)
-                *slot = *work + *pair;
+            if (*in)
+                *slot = *in + *pair;
             else
                 *slot = 4096;
             pair += 2;
-            work++;
+            in++;
             slot++;
-        } while ((int)pair < 0x1809568);
+        } while (pair < &DistPairs[58]);        /* 0x1809480 .. 0x1809568 */
     }
 
     if (Image->strategy == 0) {
@@ -772,8 +789,228 @@ int BuildDistanceSlots(int row)
         } while (v8 - 1 < 30);
     }
 
-    RankValues((int *)&ImageBuffer[base], 286, &FreqA);
-    return RankValues(dist - 30, 30, &FreqB);
+    RankValues(&ImageBuffer[ROW_STRIDE * row], 286, &FreqA);
+    return RankValues(&DistSymBits[ROW_SLOTS * row], 30, &FreqB);
+}
+
+/* ------------------------------------------------------------------ */
+/*  the row writer                                                     */
+/* ------------------------------------------------------------------ */
+
+/*
+ *  sub_4053D0: write one row's symbol stream out.
+ *
+ *  `row` is field +0x510 of a row record (0x42EE68) and holds
+ *
+ *      row[0 .. 255]   256 literal slots, values 0 .. 15
+ *      row[256 .. 285]  30 length slots, zero = not used
+ *      row[288 .. 317]  30 distance slots, zero = not used
+ *
+ *  which is row field +0x510 laid over the neighbouring fields: row + 288 is
+ *  field +0x990, the distance symbols' bit counts, so the "distance slots"
+ *  below are small codes (1 .. 15) and can go through the row's own code
+ *  along with everything else.  The length slots are the samples the encoder
+ *  matched instead.
+ *
+ *  and what goes on the wire is
+ *
+ *      5 bits   how many length slots are in use, minus 1   (1 .. 30)
+ *      5 bits   how many distance slots are in use, minus 1 (1 .. 30)
+ *      4 bits   how many code lengths follow, minus 4      (4 .. 15)
+ *      3 bits each: that many code lengths, in Bitrev19[] order
+ *      the symbol stream itself
+ *
+ *  The 19 symbols are 16 literals plus three run codes, and each row builds
+ *  its own code for them - the code is transmitted here and never stored -
+ *  with a length limit of 8 bits, so the rows never cost more than they can.
+ *
+ *  The run codes are what makes a row cheap: PNGOUT's own deflate, unlike
+ *  RFC 1951, codes the *symbol stream* with a per row Huffman code, and
+ *
+ *      16   repeat the previous symbol, 2 extra bits, count 3 .. 6
+ *      17   a run of zeroes,           3 extra bits, count 3 .. 10
+ *      18   a run of zeroes,           7 extra bits, count 11 .. 138
+ *
+ *  Codes 17 and 18 are only worth it for zeroes, which is why a run of one
+ *  or two zeroes falls back to plain literals: the 2 bit code 16 could not
+ *  express a count of 1.
+ *
+ *  Note the two passes.  The original walks the row twice with the same run
+ *  analysis, once to count the symbols and once to emit them, and the emit
+ *  pass overwrites the counts with the codes RankValues() hands back.  That
+ *  is reproduced here by ClassifyRun() being called from both loops.
+ */
+
+#define ROW_HIST       19             /* 16 literals + the three run codes */
+
+/*
+ *  Decide what one run of the symbol stream costs.  Returns the code to
+ *  emit - a literal 0 .. 15, or 16, 17 or 18 - and how many symbols of the
+ *  stream it covers in `count`.
+ *
+ *  A run of more than three of a value that is *not* already being repeated
+ *  is charged as a literal plus a code 16 repeat, which is what the original
+ *  does inside one iteration.  Letting the next iteration find that repeat
+ *  instead gives the same answer, because the run it sees is one shorter and
+ *  still equal to the symbol before it, so ClassifyRun() returns code 16
+ *  with exactly the count the original computed inline.
+ */
+static int ClassifyRun(int *row, int total, int pos, int *count)
+{
+    int i, val, run, code;
+
+    for (i = pos + 1; i < total && row[i] == row[pos]; i++)
+        ;
+    run = i - pos;
+    val = row[pos];
+
+    /* a run of zeroes, as long as the 3 or 7 bit count can hold it */
+    if (val == 0 && run >= 3) {
+        if (run > 138)
+            run = 138;
+        if (run > 10)
+            code = 18;
+        else if (pos > 0 && row[pos - 1] == 0 && run <= 6)
+            code = 16;             /* the run is already being repeated */
+        else
+            code = 17;
+        *count = run;
+        return code;
+    }
+
+    /* more of the symbol before this one: 3 .. 6, no longer */
+    if (pos > 0 && val == row[pos - 1] && run >= 3) {
+        if (run % 6 == 2)
+            run = 5;      /* charged as five whatever the real length is */
+        if (run > 6)
+            run = 6;
+        *count = run;
+        return 16;
+    }
+
+    *count = 1;
+    return val;
+}
+
+void FlushRow(int *row)
+{
+    int hist[ROW_HIST];
+    int lens[ROW_HIST];
+    int nlen = ROW_LITERALS + ROW_LENSLOTS;      /* var_A4, starts at 286 */
+    int ndist = ROW_DISTSLOTS;
+    int total, pos, i, nsent;
+
+    /*
+     *  The length slots are packed against index 285 and the distance slots
+     *  against index 317, so the number in use is found by walking down over
+     *  the first zero - and the count is one past the slot that stopped it,
+     *  so a hole anywhere below the top slot is taken as in use.  Both walks
+     *  stop one slot short, which is why a row always reports at least one
+     *  length slot and one distance slot.
+     *
+     *  The distance slots are then moved to sit right after the literals so
+     *  the stream is contiguous, which is where the run analysis expects
+     *  them, and moved back at the end for the next row.
+     */
+    if (row[285] == 0) {
+        int *p = &row[285];
+
+        while (nlen > ROW_LITERALS + 1) {
+            int v = *--p;
+
+            nlen--;
+            if (v)
+                break;
+        }
+    }
+
+    if (row[317] == 0) {
+        int *p = &row[317];
+
+        while (ndist > 1) {
+            int v = *--p;
+
+            ndist--;
+            if (v)
+                break;
+        }
+    }
+
+    PutBits(nlen - ROW_LITERALS - 1, 5);
+    PutBits(ndist - 1, 5);
+
+    if (ndist > 0)
+        for (i = 0; i < ndist; i++)
+            row[nlen + i] = row[288 + i];
+
+    total = nlen + ndist;
+
+    /* pass one: how often does each of the 19 symbols occur? */
+    memset(hist, 0, sizeof(hist));
+
+    for (pos = 0; pos < total; ) {
+        int count;
+
+        hist[ClassifyRun(row, total, pos, &count)]++;
+        pos += count;
+    }
+
+    /* a code for them, transmitted with the row */
+    BuildCodeLengths(hist, ROW_HIST, lens, 8);
+    RankValues(lens, ROW_HIST, hist);   /* hist now holds the codes */
+
+    /*
+     *  Only a suffix of Bitrev19[] is sent.  The scan walks the table
+     *  backwards looking for the last symbol that has a length at all, and
+     *  the count it lands on is the number of entries to send, so symbols
+     *  16, 17, 18 and 0 always go out whether they are used or not.
+     */
+    nsent = 19;
+    for (i = 18; i > 3; i--) {
+        if (lens[Bitrev19[i]] != 0)
+            break;
+        nsent--;
+    }
+
+    PutBits(nsent - 4, 4);
+
+    for (i = 0; i < nsent; i++)
+        PutBits(lens[Bitrev19[i]], 3);
+
+    /* pass two: and now the symbols themselves */
+    for (pos = 0; pos < total; ) {
+        int count;
+        int code = ClassifyRun(row, total, pos, &count);
+
+        switch (code) {
+        case 16:
+            PutBits(hist[16], lens[16]);
+            PutBits(count - 3, 2);
+            break;
+        case 17:
+            PutBits(hist[17], lens[17]);
+            PutBits(count - 3, 3);
+            break;
+        case 18:
+            PutBits(hist[18], lens[18]);
+            PutBits(count - 11, 7);
+            break;
+        default:
+            PutBits(hist[code], lens[code]);
+            break;
+        }
+
+        pos += count;
+    }
+
+    /* put the distance slots back where the next row will look for them */
+    for (pos = 0; pos < ndist; pos++) {
+        int *dst = &row[288 + ndist - 1 - pos];
+        int *src = &row[nlen + ndist - 1 - pos];
+
+        *dst = *src;
+        *src = 0;
+    }
 }
 
 /*

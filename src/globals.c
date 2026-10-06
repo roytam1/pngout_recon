@@ -152,12 +152,13 @@ int      HashPrev[511];                 /* 0x41267C */
 int      HashHead[4096];                /* 0x412EC0 */
 int      DistSlot[32768];               /* 0x41CEC8 */
 int      MatchArea[0x8000];             /* 0x6B4968, the LZ work area */
-int      RowSlot[MAX_WIDTH * 646 + 1];  /* 0x42E958 */
+int      RowSlot[(MAX_ROWS + 1) * ROW_SLOTS];   /* 0x42E958 */
 
 /* per row match slots */
 int      DistSlots[64];                 /* 0x6D5578 */
-int      DistWork[MAX_WIDTH * 646];    /* 0x42E968 */
-int      DistIn[MAX_WIDTH * 646];      /* 0x42F2E8 */
+int      DistWork[MAX_ROWS * ROW_STRIDE];  /* 0x42E968 */
+int      DistSymBits[(MAX_ROWS + 1) * ROW_SLOTS]; /* 0x42F2E8 */
+int      LenSymBits[(MAX_ROWS + 1) * ROW_SLOTS];  /* 0x42F1F4 */
 unsigned char SlotOrder[32];              /* 0x185BA90 */
 int      FreqA, FreqB;                 /* 0x6F6678, 0x6F6AF8 */
 
@@ -169,6 +170,9 @@ unsigned char unk_42E55C;
 /*  .bss symbols that still have to be placed                          */
 /* ------------------------------------------------------------------ */
 
-/* The optimiser's working image: 320 samples a row, 16 bits each, with a
- * small per row header, giving the 646 byte stride seen in sub_402AD0. */
-unsigned char ImageBuffer[MAX_WIDTH * 646];     /* 0x42EE68 */
+/*
+ *  0x42EE68: one record per row, field +0x510 - the symbol stream a row is
+ *  coded from.  256 literal slots, 30 length slots, 30 distance slots; see
+ *  FlushRow() and the ROW_STRIDE notes in pngout.h.
+ */
+int      ImageBuffer[MAX_ROWS * ROW_STRIDE];

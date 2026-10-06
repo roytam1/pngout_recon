@@ -11,14 +11,13 @@
  *                                the whole point of the program.
  *                                ~8.9KB of x86.
  *
- *  The three functions below are the guts of the optimiser that EmitBlock()
+ *  The two functions below are the guts of the optimiser that EmitBlock()
  *  in src/optimize.c drives:
  *
  *    sub_405B80  CompressBlock()   - the actual LZ77 + entropy coding
  *    sub_4058A0  InitDistanceTables() - deflate distance base/extra tables
- *    sub_4053D0  FlushBlock()      - writes the filtered rows out
  *
- *  All of them abort loudly rather than quietly producing a wrong PNG, so
+ *  Both abort loudly rather than quietly producing a wrong PNG, so
  *  nothing built from this tree can be mistaken for a working
  *  reconstruction.
  */
@@ -68,11 +67,6 @@ void InitDistanceTables(void)
     NotReconstructed("InitDistanceTables() [sub_4058A0]", "0x4058A0");
 }
 
-void FlushBlock(unsigned char *rows)
-{
-    (void)rows;
-    NotReconstructed("FlushBlock() [sub_4053D0]", "0x4053D0");
-}
 /* ---------------------------------------------------------------- */
 /*  0x40E584 - the MSVC user math error handler.  VC6's startup
    (_setusermatherr in start+7C) picks this up by name.      */

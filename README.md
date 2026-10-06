@@ -87,8 +87,9 @@ listing line counts, which is how the remaining work gets sized.
 | `0x407FC0` `sub_407FC0` | `FindColor()` | `src/optimize.c` |
 | `0x404DA0` `sub_404DA0` | `BuildCodeLengths()` | `src/optimize.c` |
 | `0x405150` `sub_405150` | `EmitBlock()` | `src/optimize.c` |
+| `0x4053D0` `sub_4053D0` | `FlushRow()` | `src/optimize.c` |
 | `0x4058A0` `sub_4058A0` | `InitBlockTables()` | `src/optimize.c` |
-| `0x405A60` `sub_405A60` | `BuildDistanceSlots()` *(ends in a stub)* | `src/optimize.c` |
+| `0x405A60` `sub_405A60` | `BuildDistanceSlots()` | `src/optimize.c` |
 | `0x40E584` `UserMathErrorFunction` | `_UserMathErrorFunction()` | `src/stubs.c` |
 | `.data` initialised part | 22 globals + `BitTable[64]` | `src/globals.c` |
 
@@ -231,31 +232,106 @@ having its own deflate.
 of `unk_41267C` to `0x7FFFFFFF`, 8 KB at `word_412EC0`, 64 KB at
 `word_41CEC8`, and - only when `Image->strategy < 3` (so Huffman-only and
 uncompressed skip it) - 128 KB at `dword_6B4968` plus five counters. It ends
-with `dword_42E958[646 * RowCount] = 0x7FFFFFFF` and a call to `sub_405A60`.
+with `dword_42E958[0xA18 * RowCount] = 0x7FFFFFFF` and a call to `sub_405A60`.
+
+### The row record: the stride is 0xA18, not 646
+
+Earlier revisions of this file said the working image has a "646 byte stride".
+That is Hex-Rays dividing the immediate by four. Every per row array is indexed
+with `imul eax, 0A18h` - 2584 **dwords**, 10 336 bytes - so the optimiser keeps
+one 2584 dword record per row and the arrays are fields *inside* it, which is
+why they all share the stride and why they overlap:
+
+| field | address | used for |
+|---|---|---|
+| +0x000 | `dword_42E958` | one dword, `0x7FFFFFFF` per block |
+| +0x010 | `dword_42E968` | 320 dwords: the row's samples |
+| +0x44C | `dword_42ECF4` | a counter per length code |
+| +0x480 | `dword_42EDE8` | frequency per distance code |
+| +0x510 | `dword_42EE68` | 318 dwords: the symbol stream `sub_4053D0` eats |
+| +0x89C | `dword_42F1F4` | bits per length symbol, then 29 more entries |
+| +0x910 | `dword_42F268` | how many bits the row's own code needs |
+| +0x990 | `dword_42F2E8` | bits per distance symbol |
+
+`sub_4065A0` settles it: it computes `4 * (0x286 * row + column)` and uses the
+result as a *dword* index, and `0x286 * 4 == 0xA18`. The record is 0xA18 dwords
+but only the first 0x930 of them are touched, so `src/pngout.h` gives the small
+fields a compact stride of their own and keeps 0xA18 for the two big ones
+(the samples and the symbol stream). Nothing in the reconstruction relies on
+the fields overlapping.
+
+### sub_4053D0, the row writer
+
+`FlushRow()` codes one row's symbol stream. The record is
+
+```
+row[0 .. 255]    256 literal slots, values 0 .. 15
+row[256 .. 285]   30 length slots, zero = not in use
+row[288 .. 317]   30 distance slots, zero = not in use
+```
+
+so `row + 288` is field +0x990, the distance symbols' *bit counts* - which is
+why those values are small enough to go through the same code as everything
+else, and why "distance slots" here means "one small code per distance
+symbol". `sub_4065A0` emits the actual distance symbol and its extra bits
+separately, from its own table.
+
+What goes on the wire is
+
+```
+5 bits    length slots in use, minus 1        (1 .. 30)
+5 bits    distance slots in use, minus 1      (1 .. 30)
+4 bits    code lengths that follow, minus 4    (4 .. 15)
+3 bits each, in Bitrev19[] order
+the symbol stream
+```
+
+The 19 symbols are 16 literals plus three run codes, and **each row builds its
+own Huffman code for them and transmits it here** - 8 bits maximum, so a row
+can never cost more than its own entropy:
+
+```
+16    repeat the previous symbol, 2 extra bits, count 3 .. 6
+17    a run of zeroes,           3 extra bits, count 3 .. 10
+18    a run of zeroes,           7 extra bits, count 11 .. 138
+```
+
+17 and 18 only pay off for zeroes, which is why one or two zeroes fall back to
+plain literals: the 2 bit code 16 cannot express a count of 1. A run of more
+than three of a value that is *not* already being repeated is charged as a
+literal plus a code 16 repeat. The original walks the row twice with the same
+analysis - once to count the symbols, once to emit them - and `ClassifyRun()`
+is shared between the two passes here.
+
+How many slots are in use is found by walking down over the first zero from
+the top index, and the count is *one past* the slot that stopped it, so a hole
+anywhere below the top slot is taken as in use. That is why the slots have to
+be packed against index 285 and 317. Both walks stop one slot short, so a row
+always reports at least one length slot and one distance slot. The distance
+slots are copied up so the stream is contiguous, and copied back at the end.
+
+Only a suffix of `Bitrev19[]` is sent: the scan walks the table backwards for
+the last symbol that has a length at all, so symbols 16, 17, 18 and 0 always
+go out whether they are used or not.
 
 ### Still open
 
-* `sub_405800` (`RankValues()`) is transcribed: it assigns each element its
-  rank among equal-or-smaller values, bit-reversed over the width of its own
-  code. The histogram counts DOWN from 0 and the cumulative step doubles,
-  making it a prefix sum in bit-reversed space. `sub_405A60` calls it over 286
-  dwords of row state and over the 30 distances.
-* `sub_405A60` itself (`BuildDistanceSlots()`) is transcribed: it fills
-  `dword_6D5578[]` with 30 length slots then distance slots, 4096 meaning "no
-  match"; builds `byte_185BA90[]` when the strategy is Xtreme; and finishes
-  with the two `sub_405800` calls. Not yet exercisable by a test, because it ends
-  in the stub.
+* `sub_405A60` (`BuildDistanceSlots()`) fills `dword_6D5578[]` with 30 slots
+  from the length half and 29 from the distance half, 4096 meaning "no match";
+  builds `byte_185BA90[]` when the strategy is Xtreme; and finishes with the two
+  `sub_405800` calls. Note that both halves are arrays of *code lengths* - what
+  is added is the number of extra bits - so it is a comparison key for the
+  match search, not a length or a distance.
 * The CRC table's single writer sits 4 bytes above all 18 readers
   (`0x185BABC` vs `0x185BAB8`). Modelled at the readers' address.
 
 ### Still to do inside Optimize
 
-`sub_402AD0` itself (5 983 listing lines), the compressor `sub_405B80`, the row
-writer `sub_4053D0`, `sub_405800`, the four filter trials
-`sub_4071D0`/`4077C0`/`407B00`/`407D80`, the min-sum filter `sub_4086E0`, the
-entropy estimate `sub_408000`/`sub_408390`, the timing `sub_4063F0`, and the
-`.bss` globals they all use. Those four are declared in `src/stubs.c` so the
-tree links; each aborts loudly if reached.
+`sub_402AD0` itself (5 983 listing lines), the compressor `sub_405B80`, the
+four filter trials `sub_4071D0`/`4077C0`/`407B00`/`407D80`, the min-sum filter
+`sub_4086E0`, the entropy estimate `sub_408000`/`sub_408390`, the timing
+`sub_4063F0`, and the `.bss` globals they all use. Those four are declared in
+`src/stubs.c` so the tree links; each aborts loudly if reached.
 
 ## DecodeImage (0x409560): how it fits together
 
@@ -358,10 +434,11 @@ Two independent checks, both runnable.
 
 ### tools\selftest.cmd
 
-71 checks over the recovered code: `Swap16`, `GetImageSize` for all
+121 checks over the recovered code: `Swap16`, `GetImageSize` for all
 eight format codes, the `/k` list handling in `ScanChunks`, `FilterPredict()`,
 `CpuFeatures()`, and the optimiser primitives (CRC table, Huffman heap, colour
-hash, `PutBits()`/`EmitBytes()`). They caught six real defects, all now fixed:
+hash, `PutBits()`/`EmitBytes()`, `RankValues()`, `FlushRow()`). They caught
+eight real defects, all now fixed:
 
 * PNG dimensions are **4 byte** big endian, not 2 byte. `GetImageSize` was
   using `Swap16` where the original calls `_byteswap_ulong` on a DWORD.
@@ -377,12 +454,38 @@ hash, `PutBits()`/`EmitBytes()`). They caught six real defects, all now fixed:
   `dword_42D7D0` and `dword_42D7D4` separately. They are `Heap[0]` and
   `Heap[1]` of one 1-based array, which is why the first version's `HuffPop()`
   only ever returned the sentinel 575.
+* **`RankValues()` reversed its bits in the wrong order.** The original does
+  `shr edx,1` then `adc eax,eax`, so each bit is taken *after* the shift; the
+  transcription shifted first and then took the *new* low bit, which reads bit
+  1 upwards, throws bit 0 away and pads a zero at the top. Every code that was
+  not a power of two came out wrong, and roughly half of all the codes in a
+  code came out identical to another - two symbols with the same code *and* the
+  same length, so the row could not be decoded at all. Nothing noticed until
+  `FlushRow()`'s output was fed back through a decoder written from the format
+  description above; the fix is checked directly now (no two symbols may share
+  a code, and every code must fit its own length).
+* **`BuildDistanceSlots()` never filled its distance half.** The second loop's
+  base pointer is written in the listing as `dword_1809390[eax * 8]` with
+  `eax = 30`, which lands exactly on `DistPairs`, so the loop runs from there to
+  the end of `DistPairs` - 29 entries. The transcription read `DistPairs[2*n]`
+  instead, which starts past the end of the table and so filled nothing: 30
+  slots instead of 59.
+* **`FlushRow()`'s two slot-count walks were off by one.** The original reads
+  the slot, *then* decrements, then tests the value; the transcription tested
+  before decrementing, so a row always claimed one slot too many.
 
 They also exposed that the original's `strtok` loop in `ScanChunks` steps one
 byte past the terminating NUL after the last token, because it restores the
 comma with `tok[strlen(tok)] = ','` and then calls `strtok` again. That is
 harmless against `main()`'s 260 byte buffer; the reconstruction stops at the
 last token instead, which is equivalent for every well-formed list.
+
+The row writer is checked by decoding: `tools/test_chunk.c` carries a small
+decoder for the format described above - it reads the row header, rebuilds the
+code from the transmitted lengths with `RankValues()`, then walks the payload -
+so every row shape tried has to give its own symbols back exactly, and one of
+them is pinned to the byte: a row of one literal followed by zeroes comes out
+as `00 18 10 00 00 E2 3F 1B`.
 
 ### Import table
 
@@ -439,6 +542,9 @@ original's message and exit 1.
   file buffer and the other the tRNS chunk payload. It also folded a jump table
   index into a signed variable in the `/c#` and `/f#` parsers. Both are spelled
   out in `src/pngout.c`.
+* **More Hex-Rays arithmetic.** It prints a dword index scaled by 0xA18 as
+  `646 * n`, having divided the immediate by four - which is right for the
+  product and wrong for the stride. See the row record notes above.
 * **Names.** Descriptive names are used only where the semantics are
   established from call sites, the string table or the disassembly. Everything
   still unidentified keeps its IDA name (`unk_190A3FC`, `dword_190A420`, ...) so
@@ -453,7 +559,8 @@ src/pngout.c      driver: Msg, CheckEsc, ShowUsage, main
 src/chunk.c       PNG chunk walk, format sniffer, Swap16
 src/clipboard.c   ReadClipboard
 src/globals.c     .data
-src/optimize.c    CRC table, Huffman heap, colour hash, bit/byte output
+src/optimize.c    CRC table, Huffman heap, colour hash, bit/byte output,
+                  deflate tables, per row slots, the row writer
 src/predict.c     FilterPredict
 src/cpuid.c       CpuFeatures
 src/stubs.c       the two unrecovered entry points, plus the math error handler

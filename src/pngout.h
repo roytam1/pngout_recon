@@ -29,6 +29,45 @@
 #define MAX_COLORS     256     /* sub_4026E0 clamps the chunk table at 256 */
 #define HASH_BUCKETS   2048    /* dword_1806F88[2048] in sub_407FC0        */
 
+/*
+ *  The optimiser works on one *row record* per row, and every per row array
+ *  is a field of that record, which is why they all share one stride.  The
+ *  stride is the immediate 0xA18 = 2584 dwords, e.g. sub_405150 at 0x4052A3
+ *
+ *      mov eax, dword_42D7CC
+ *      imul eax, 0A18h
+ *      add eax, offset dword_42EE68
+ *      push eax
+ *      call sub_4053D0
+ *
+ *  which is 646 * 4: Hex-Rays printed that as `646 * dword_42D7CC`, which
+ *  reads like a dword count of 646 and is what earlier revisions of this
+ *  reconstruction used.  The records start at dword_42E958 and the fields
+ *  sit at these offsets inside one:
+ *
+ *      +0x000  dword_42E958   one dword, set to 0x7FFFFFFF per block
+ *      +0x010  dword_42E968   320 dwords: the row's samples
+ *      +0x410  dword_42ED68   one dword: a counter the row coder bumps
+ *      +0x44C  dword_42ECF4   30 dwords: a counter per length code
+ *      +0x480  dword_42EDE8   30 dwords: frequency per distance code
+ *      +0x510  dword_42EE68   318 dwords: the symbol stream sub_4053D0 eats
+ *      +0x89C  dword_42F1F4   bits per length symbol, then 29 more entries
+ *      +0x910  dword_42F268   one dword: how many bits the row needs
+ *      +0x990  dword_42F2E8   30 dwords: bits per distance symbol
+ *
+ *  The record is 0xA18 dwords but only the first ~0x930 of them are touched,
+ *  so the small fields are modelled here with a compact stride of their own.
+ *  Nothing in the reconstruction relies on the fields overlapping.
+ */
+#define ROW_STRIDE     2584            /* 0xA18 dwords per row record */
+#define MAX_ROWS       1024            /* the original's .bss allows 1331 */
+#define ROW_SLOTS      32              /* 30 slots + slack                */
+
+/*  the symbol stream at field +0x510, i.e. sub_4053D0's argument layout */
+#define ROW_LITERALS   256             /* literal slots, values 0 .. 15   */
+#define ROW_LENSLOTS   30              /* length slots, at +256          */
+#define ROW_DISTSLOTS  30              /* distance slots, at +288        */
+
 /* ------------------------------------------------------------------ */
 /*  Settings block                                                     */
 /*                                                                     */
@@ -225,8 +264,11 @@ extern int ColorHashNext[MAX_COLORS];
 extern int ColorHashCount;
 extern int *ColorHashPalette;
 
-/* --- the filtered image, 320 samples a row with a small header --- */
-extern unsigned char ImageBuffer[MAX_WIDTH * 646];
+/* --- the symbol stream one row is coded from ------------------------ */
+/*  0x42EE68, field +0x510 of the row record: 256 literal slots, then 30
+ *  length slots at +256, then 30 distance slots at +288.  sub_4053D0 eats
+ *  it; see FlushRow() in src/optimize.c. */
+extern int      ImageBuffer[MAX_ROWS * ROW_STRIDE];
 
 /* --- deflate block state, src/optimize.c -------------------------- */
 extern int      LenPairs[60];   /* 0x1809390: 30 (base, extra) pairs */
@@ -240,7 +282,7 @@ extern int      HashPrev[511];   /* 0x41267C */
 extern int      HashHead[4096];  /* 0x412EC0, used as shorts */
 extern int      DistSlot[32768]; /* 0x41CEC8, used as shorts */
 extern int      MatchArea[0x8000];   /* 0x6B4968 */
-extern int      RowSlot[MAX_WIDTH * 646 + 1];  /* 0x42E958 */
+extern int      RowSlot[(MAX_ROWS + 1) * ROW_SLOTS];  /* 0x42E958 */
 
 extern int      unk_185BEC8, unk_180BA84, unk_185BEB8, unk_411D58, unk_41CEC0;
 extern int      unk_6D4968, unk_6F6B78, unk_412668, unk_42D7C8, unk_18CBEEC;
@@ -250,11 +292,13 @@ int  BuildDeflateTables(void);
 int  InitBlockTables(void);
 int  BuildDistanceSlots(int row);
 extern int      DistSlots[64];        /* dword_6D5578 */
-extern int      DistWork[MAX_WIDTH * 646];   /* dword_42E968 */
-extern int      DistIn[MAX_WIDTH * 646];     /* dword_42F2E8 */
+extern int      DistWork[MAX_ROWS * ROW_STRIDE];  /* dword_42E968 */
+extern int      DistSymBits[(MAX_ROWS + 1) * ROW_SLOTS]; /* dword_42F2E8 */
+extern int      LenSymBits[(MAX_ROWS + 1) * ROW_SLOTS];  /* dword_42F1F4 */
 extern unsigned char SlotOrder[32];      /* byte_185BA90 */
 extern int      FreqA, FreqB;          /* dword_6F6678, dword_6F6AF8 */
 int  RankValues(int *vals, int count, int *out);
+void FlushRow(int *row);
 
 /* fill `dest` with a 32 bit pattern; the CRT memset only does bytes */
 void memset32(void *dest, int value, int count);
@@ -308,9 +352,5 @@ extern unsigned int (*sub_4110F8)(unsigned int, int, int);
 
 extern int  unk_190A3FC;            /* set |= 0xFF000000 when tRNS seen  */
 extern int  unk_190A820, unk_190A1D0;
-
-/* PNGOUT keeps its working image as 320 samples per row, 16 bits each,
- * with a small per-row header: sub_402AD0 walks it with stride 646. */
-extern unsigned char ImageBuffer[320 * 646];   /* 0x42EE68 */
 
 #endif /* PNGOUT_H */

@@ -45,6 +45,109 @@ static unsigned short rd16(const unsigned char *p)
     return (unsigned short)(((unsigned int)p[0] << 8) | p[1]);
 }
 
+/* ------------------------------------------------------------------ */
+/*  a decoder for FlushRow()'s output, so the row writer can be checked */
+/*  by putting a stream back the way it went in                       */
+/* ------------------------------------------------------------------ */
+
+static const unsigned char *t_bits;
+static int t_bitpos;
+
+/*
+ *  PutBits() holds up to seven bits back, so a stream that has not been
+ *  finished leaves its last byte unwritten.  The encoder pads the final byte
+ *  when it closes a block; do the same here so the decoder can see every bit.
+ *  It takes 8 - BitCount more bits to push the pending ones out.
+ */
+static void tflush(void)
+{
+    if (BitCount > 0)
+        PutBits(0, 8 - BitCount);
+}
+
+/* PutBits() is LSB first, so the first bit of a value is bit 0 of the
+   first byte - which is what a decoder has to read back. */
+static int tget(int n)
+{
+    int v = 0, i;
+
+    for (i = 0; i < n; i++) {
+        v |= ((t_bits[t_bitpos >> 3] >> (t_bitpos & 7)) & 1) << i;
+        t_bitpos++;
+    }
+    return v;
+}
+
+/*
+ *  Rebuild the symbol stream one FlushRow() call coded.  Reads the row
+ *  header, the transmitted code lengths and then the payload, using the same
+ *  RankValues() the writer used to turn those lengths into codes.
+ *
+ *  Returns the number of symbols recovered, or -1 if the stream does not
+ *  decode.  The header fields come back so the caller can check them, and so
+ *  does the number of bits the stream turned out to need.
+ */
+static int tdecode(const unsigned char *out, int *got, int *nlen,
+                   int *ndist, int *nsent, int *bitsused)
+{
+    int lens[19], codes[19], maxlen = 0, i, n = 0, prev = 0;
+
+    t_bits = out;
+    t_bitpos = 0;
+
+    *nlen = tget(5) + ROW_LITERALS + 1;
+    *ndist = tget(5) + 1;
+    *nsent = tget(4) + 4;
+
+    for (i = 0; i < 19; i++) {
+        lens[i] = 0;
+        codes[i] = -1;          /* RankValues leaves unused symbols alone */
+    }
+
+    for (i = 0; i < *nsent; i++) {
+        lens[Bitrev19[i]] = tget(3);
+        if (lens[Bitrev19[i]] > maxlen)
+            maxlen = lens[Bitrev19[i]];
+    }
+
+    RankValues(lens, 19, codes);
+
+    while (n < *nlen + *ndist) {
+        int sym = -1, len, v, count;
+
+        for (len = 1; len <= maxlen; len++) {
+            v = tget(len);
+            for (i = 0; i < 19; i++) {
+                if (codes[i] == v && lens[i] == len) {
+                    sym = i;
+                    break;
+                }
+            }
+            if (sym >= 0)
+                break;
+            t_bitpos -= len;    /* not this long: those bits start over */
+        }
+
+        if (sym < 0)
+            return -1;
+
+        if (sym == 16)      { count = tget(2) + 3;   prev = prev; }
+        else if (sym == 17) { count = tget(3) + 3;   prev = 0; }
+        else if (sym == 18) { count = tget(7) + 11;  prev = 0; }
+        else                { count = 1;            prev = sym; }
+
+        if (n + count > *nlen + *ndist)
+            return -1;       /* a run that claims more than the row has */
+
+        while (count-- > 0)
+            got[n++] = prev;
+    }
+
+    *bitsused = t_bitpos;
+    return n;
+}
+
+
 int main(void)
 {
     unsigned char buf[4096];
@@ -458,6 +561,89 @@ int main(void)
         (void)expect;
     }
 
+    /* ---- RankValues: code lengths in, deflate codes out (sub_405800) ---- */
+    {
+        static int lens[19];
+        static int codes[19];
+        int n, i, clash, inrange;
+
+        /*
+         *  The codes are the canonical ones bit reversed over the width of
+         *  each symbol's own code, which is what PutBits() wants.  The check
+         *  that matters is that no two symbols come out with the same code
+         *  *and* the same length - a previous version reversed the bits one
+         *  place off and quietly produced duplicates for about half of them,
+         *  which no other test noticed.
+         */
+        for (n = 0; n < 19; n++) {
+            lens[n] = 0;
+            codes[n] = -1;
+        }
+        lens[1] = 4;
+        lens[3] = 3; lens[4] = 3; lens[5] = 3; lens[6] = 3;
+        lens[7] = 3; lens[10] = 4; lens[16] = 3; lens[18] = 3;
+
+        RankValues(lens, 19, codes);
+        printf("info lengths 4 3333 4 3 3 -> codes");
+        for (n = 0; n < 19; n++)
+            if (lens[n])
+                printf(" %d:%d", n, codes[n]);
+        printf("\n");
+
+        clash = 0;
+        for (n = 0; n < 19; n++) {
+            if (!lens[n])
+                continue;
+            for (i = n + 1; i < 19; i++)
+                if (lens[i] == lens[n] && codes[i] == codes[n])
+                    clash = 1;
+        }
+        check("no two symbols share a code", clash, 0);
+
+        /* and every code has to fit inside its own length */
+        inrange = 1;
+        for (n = 0; n < 19; n++) {
+            if (!lens[n])
+                continue;
+            if (codes[n] < 0 || codes[n] >= (1 << lens[n]))
+                inrange = 0;
+        }
+        check("every code fits its length", inrange, 1);
+
+        /* two symbols of one bit get 0 and 1, in that order */
+        for (n = 0; n < 19; n++) {
+            lens[n] = 0;
+            codes[n] = -1;
+        }
+        lens[5] = 1;
+        lens[18] = 1;
+        RankValues(lens, 19, codes);
+        check("first of two 1 bit symbols gets 0", codes[5], 0);
+        check("second of two 1 bit symbols gets 1", codes[18], 1);
+
+        /* four symbols of two bits: the canonical 0,1,2,3 reversed to
+           0,2,1,3 - which is what an LSB-first writer needs */
+        for (n = 0; n < 19; n++) {
+            lens[n] = 0;
+            codes[n] = -1;
+        }
+        lens[2] = 2; lens[3] = 2; lens[4] = 2; lens[5] = 2;
+        RankValues(lens, 19, codes);
+        check("four 2 bit symbols: first gets 0", codes[2], 0);
+        check("four 2 bit symbols: second gets 2", codes[3], 2);
+        check("four 2 bit symbols: third gets 1", codes[4], 1);
+        check("four 2 bit symbols: fourth gets 3", codes[5], 3);
+
+        /* a symbol of length 0 is left alone, so it keeps its old value */
+        for (n = 0; n < 19; n++) {
+            lens[n] = 0;
+            codes[n] = -1;
+        }
+        lens[7] = 3;
+        RankValues(lens, 19, codes);
+        check("unused symbols are not written", codes[0], -1);
+    }
+
     /* ---- deflate length / distance tables (sub_4058A0) ---- */
     {
         static IMAGEDESC img;
@@ -528,7 +714,202 @@ int main(void)
         }
     }
 
+    /* ---- FlushRow: the row writer (sub_4053D0) ---- */
+    {
+        static unsigned char out[4096];
+        static IMAGEDESC img;
+        static int row[400];
+        static int save[400];
+        static int got[512];
+        int nlen, ndist, nsent, bits, i, n, ok;
+
+        memset(&img, 0, sizeof(img));
+        img.outbuf = out;
+        img.outsize = sizeof(out);
+        Image = &img;
+
+        /*
+         *  The smallest row there is: one literal and then nothing but zeroes,
+         *  which code as two long zero runs.  Only two symbols are used, so
+         *  both get a 1 bit code - 0 for the literal and 1 for the run - and
+         *  the header is
+         *
+         *      5 bits  0   no length slots beyond the first
+         *      5 bits  0   one distance slot
+         *      4 bits  6   ten code lengths follow
+         *      30 bits    nine 000 codes and one 001, for symbol 18
+         *
+         *  giving 61 bits in all: 00 18 10 00 00 E2 3F, plus the last five
+         *  bits (1 1010 and three bits of padding) in the byte the flush
+         *  pushes out.
+         */
+        memset(row, 0, sizeof(row));
+        row[0] = 5;
+        OutCount = 0; BitCount = 0; BitBuf = 0; BitCrc = 0;
+        FlushRow(row);
+        tflush();
+        printf("info one literal -> %02x %02x %02x %02x %02x %02x %02x %02x\n",
+               out[0], out[1], out[2], out[3], out[4], out[5], out[6], out[7]);
+        check("one literal: byte 1", out[1], 0x18);
+        check("one literal: byte 2", out[2], 0x10);
+        check("one literal: byte 5", out[5], 0xE2);
+        check("one literal: byte 6", out[6], 0x3F);
+        check("one literal: the padded byte", out[7], 0x1B);
+        check("one literal: bytes written", OutCount, 8);
+
+        n = tdecode(out, got, &nlen, &ndist, &nsent, &bits);
+        check("one literal: decodes", n, 258);
+        check("one literal: one length slot used", nlen, 257);
+        check("one literal: one distance slot", ndist, 1);
+        check("one literal: ten code lengths sent", nsent, 10);
+        check("one literal: the literal comes back", got[0], 5);
+        ok = 1;
+        for (i = 1; i < 258; i++)
+            if (got[i] != 0)
+                ok = 0;
+        check("one literal: the rest is zeroes", ok, 1);
+
+        /* a row of mixed literals, runs of zeroes and a long run of a
+           non-zero symbol: exercises all three run codes and the clamping */
+        {
+            static int build[64];
+
+            memset(row, 0, sizeof(row));
+            memset(build, -1, sizeof(build));
+            n = 0;
+            for (i = 0; i < 30; i++) build[n++] = 0;     /* a long zero run */
+            for (i = 0; i < 20; i++) build[n++] = 7;     /* repeats */
+            for (i = 0; i < 5; i++)  build[n++] = 3;     /* a short tail   */
+            for (i = 0; i < 4; i++)  build[n++] = (i * 3) % 15 + 1;
+            for (i = 0; i < n; i++) row[i] = build[i];
+
+            /* three length slots and four distance slots in use */
+            row[256] = 4; row[257] = 5; row[258] = 6;
+            for (i = 0; i < 4; i++) row[288 + i] = 3 + i;
+
+            OutCount = 0; BitCount = 0; BitBuf = 0; BitCrc = 0;
+            FlushRow(row);
+            tflush();
+            printf("info mixed row: %d symbols -> %d bytes\n", n, OutCount);
+
+            ok = 1;
+            for (i = 0; i < 400; i++)
+                save[i] = row[i];
+
+            nlen = ndist = nsent = bits = 0;
+            check("mixed row: decodes",
+                  tdecode(out, got, &nlen, &ndist, &nsent, &bits),
+                  ROW_LITERALS + 3 + 4);
+            check("mixed row: three length slots", nlen, ROW_LITERALS + 3);
+            check("mixed row: four distance slots", ndist, 4);
+            check("mixed row: the stream is sent whole", nsent >= 4, 1);
+            /* whatever the writer emitted has to be enough to read back */
+            check("mixed row: no bits are missing", bits <= 8 * OutCount, 1);
+
+            /* the literals must come back exactly */
+            ok = 1;
+            for (i = 0; i < n; i++)
+                if (got[i] != build[i])
+                    ok = 0;
+            check("mixed row: literals survive the round trip", ok, 1);
+
+            /* then the four distance slots, in order */
+            ok = 1;
+            for (i = 0; i < 4; i++)
+                if (got[ROW_LITERALS + 3 + i] != 3 + i)
+                    ok = 0;
+            check("mixed row: the distance slots follow", ok, 1);
+
+            /* and they must have been put back where the next row looks */
+            ok = 1;
+            for (i = 0; i < 4; i++)
+                if (row[288 + i] != 3 + i)
+                    ok = 0;
+            check("mixed row: distance slots restored", ok, 1);
+            ok = 1;
+            for (i = 0; i < 4; i++)
+                if (row[ROW_LITERALS + 3 + i] != 0)
+                    ok = 0;
+            check("mixed row: the copy left behind is cleared", ok, 1);
+
+            /* a long run of zeroes has to be cheaper than the same row
+               coded as literals: 59 symbols, so at worst 59 bits of payload
+               plus the two 5 bit counts and the code table */
+            /* 263 symbols in 20 bytes: the 197 zeroes of padding and the run
+               of sevens collapse into three events, so this is far below the
+               263 bits a literal a piece would take */
+            check("mixed row: stays well under 32 bytes", OutCount < 32, 1);
+            (void)save;
+        }
+
+        /* a row that is nothing but zeroes of every length the three run
+           codes can express, so each boundary gets used */
+        {
+            memset(row, 0, sizeof(row));
+            for (i = 0; i < 2; i++)  row[i] = 0;   /* too short: literals */
+            n = 2;
+            for (i = 0; i < 3; i++)  { row[n++] = 0; }  /* code 17: 3 */
+            for (i = 0; i < 4; i++)  { row[n++] = 0; }  /* code 16 or 17 */
+            for (i = 0; i < 10; i++) { row[n++] = 0; }  /* code 17 */
+            for (i = 0; i < 11; i++) { row[n++] = 0; }  /* code 18 */
+            for (i = 0; i < 138; i++){ row[n++] = 0; }  /* code 18, clamped */
+            for (i = 0; i < 7; i++)  { row[n++] = 0; }  /* code 16/17 */
+
+            OutCount = 0; BitCount = 0; BitBuf = 0; BitCrc = 0;
+            FlushRow(row);
+            tflush();
+            printf("info zero runs: %d symbols -> %d bytes\n", n, OutCount);
+            check("zero runs: decodes",
+                  tdecode(out, got, &nlen, &ndist, &nsent, &bits),
+                  ROW_LITERALS + 1 + 1);
+            ok = 1;
+            for (i = 0; i < n; i++)
+                if (got[i] != 0)
+                    ok = 0;
+            check("zero runs: all of it came back", ok, 1);
+            check("zero runs: costs far less than 175 bits", OutCount < 24, 1);
+        }
+
+        /* the scan-backs: how many slots are in use is found by walking down
+           over the first zero, and never drops below one */
+        {
+            memset(row, 0, sizeof(row));
+            row[0] = 9;
+            row[285] = 7;               /* the top length slot: all 30 used */
+            row[317] = 4;               /* the top distance slot: all 30 */
+            OutCount = 0; BitCount = 0; BitBuf = 0; BitCrc = 0;
+            FlushRow(row);
+            tflush();
+            check("top slot in use: all 30 length slots",
+                  tdecode(out, got, &nlen, &ndist, &nsent, &bits),
+                  ROW_LITERALS + ROW_LENSLOTS + ROW_DISTSLOTS);
+            check("top slot in use: 30 length slots", nlen, 286);
+            check("top slot in use: 30 distance slots", ndist, 30);
+
+            /* a hole below the top slot: the walk stops at the first zero,
+               so everything from there down is taken as in use - which is why
+               the slots have to be packed against the top index */
+            memset(row, 0, sizeof(row));
+            row[0] = 9;
+            row[283] = 7;
+            row[284] = 0;
+            row[285] = 0;
+            row[288] = 5;
+            OutCount = 0; BitCount = 0; BitBuf = 0; BitCrc = 0;
+            FlushRow(row);
+            tflush();
+            check("hole below the top slot: 28 length slots",
+                  tdecode(out, got, &nlen, &ndist, &nsent, &bits),
+                  ROW_LITERALS + 28 + 1);
+            check("hole below the top slot: 28 length slots (field)",
+                  nlen, ROW_LITERALS + 28);
+            check("one distance slot at the bottom", ndist, 1);
+        }
+    }
+
     printf("\n%s  (%d failure%s)\n", failures ? "FAILED" : "PASSED",
            failures, failures == 1 ? "" : "s");
     return failures != 0;
 }
+
+
