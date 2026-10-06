@@ -1,0 +1,11 @@
+# build output
+build/
+*.obj
+*.exe
+*.idb
+*.pdb
+*.map
+*.log
+
+# derived from pngout.exe.lst / pngout.exe.c - run tools\regen.cmd
+reference/
