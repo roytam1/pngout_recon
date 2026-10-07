@@ -211,7 +211,11 @@ static unsigned char *lzbits;
 static int lzbitpos;
 static int lzfail;
 
-#define LZFAIL(n)  do { lzfail = pos * 100 + (n); return -1; } while (0)
+#define LZFAIL(n)  do { lzfail = pos * 100 + (n);                          \
+                         printf("   lzfail pos=%d bit=%d code=%d lslot=%d "\
+                                "mlen=%d nmatch=%d\n", pos, lzbitpos, (n),\
+                                lslot_dbg, mlen_dbg, *nmatch);           \
+                         return -1; } while (0)
 
 static int lzget(int n)
 {
@@ -247,7 +251,7 @@ static int lzdecode(int nbits, unsigned char *to, int want,
         }
         {
             int lslot;
-            int lslot_dbg;
+            int lslot_dbg, mlen_dbg;
             int dslot, mlen, mdist;
 
             lslot_dbg = lzget(5);
@@ -256,6 +260,7 @@ static int lzdecode(int nbits, unsigned char *to, int want,
             if (lslot - 30 >= LEN_CODES)
                 LZFAIL(1);
             mlen = lzget(LenCodeExtra(lslot - 30)) + LenCodeBase(lslot - 30);
+            mlen_dbg = mlen;
 
             if (lzget(1) == 0)
                 LZFAIL(2);
@@ -295,6 +300,35 @@ static void lzsetup(int strategy, int limit)
 {
     int i;
 
+    /*
+     *  sub_4058A0 wipes all of the coder's state before the first byte of a
+     *  block; lzsetup has to do the same or the previous test's MatchLimit and
+     *  MatchCost[] decide what this one is allowed to emit.
+     */
+    memset(LzWindow, 0, sizeof(LzWindow));
+    memset(RunLen, 0, sizeof(RunLen));
+    memset(MatchStart, 0, sizeof(MatchStart));
+    memset32(MatchCost, 0x7FFFFFFF, 512);
+    memset32(HashHead, 0, sizeof(HashHead) / sizeof(HashHead[0]));
+    memset32(DistSlot, 0, sizeof(DistSlot) / sizeof(DistSlot[0]));
+    memset32(BestCost, 0, sizeof(BestCost) / sizeof(BestCost[0]));
+    memset(ROWOF(0, ROW_SAMPLES), 0, ROW_SAMPLE_MAX * sizeof(int));
+    memset(ROWOF(0, ROW_LENCNT), 0, ROW_SAMPLE_MAX * sizeof(int));
+    memset(ROWOF(0, ROW_DISTFREQ), 0, ROW_DISTSLOTS * sizeof(int));
+
+    LzWrite = 0;
+    LzScan = 0;
+    LzHead = 0;
+    unk_42D7C8 = 0;
+    MatchLimit = 0;
+    MatchCost[0] = 0x80000000;       /* loc_407059: the very first position */
+    MatchCount = 0;
+    RunEnd = 0;
+    RunCount = 0;
+    PrevReach = 0;
+    PrevMark = 0;
+    unk_42E55C = 0;
+
     memset(&lzimg, 0, sizeof(lzimg));
     memset(lzout, 0, sizeof(lzout));
     Image = &lzimg;
@@ -314,16 +348,25 @@ static void lzsetup(int strategy, int limit)
     RowCost = 0;
     lzbits = lzout;
 
+    /*
+     *  The row's code: 9 bits for every literal, 6 for every length symbol
+     *  and 6 for every distance code.
+     *
+     *  These three are all *inside* the one symbol array at field +0x510, and
+     *  the overlap is the point - field +0x89C is the 30th entry of that array
+     *  onwards and field +0x990 is its 288th, which is why ROW_SYMBOLS[] has to
+     *  be filled first and the two other fields written over the top of it.
+     *  Setting ROW_LENBITS[] naively would take the last 29 *literals* down to
+     *  6 bits as well, which is a trap worth stating.
+     */
     for (i = 0; i < ROW_SAMPLE_MAX; i++) {
         ROWOF(0, ROW_SAMPLES)[i] = 0;
         ROWOF(0, ROW_SYMBOLS)[i] = LZ_LITBITS;
     }
-    for (i = 0; i < ROW_SAMPLE_SYMS; i++)
-        ROWOF(0, ROW_SYMBOLS)[i] = LZ_LITBITS;
-    for (i = 0; i < 59; i++)
-        ROWOF(0, ROW_LENBITS)[i] = LZ_CODEBITS;
-    for (i = 0; i < ROW_DISTSLOTS; i++)
-        ROWOF(0, ROW_DISTBITS)[i] = LZ_CODEBITS;
+    for (i = 257; i < ROW_SAMPLE_SYMS; i++)       /* the length symbols   */
+        ROWOF(0, ROW_SYMBOLS)[i] = LZ_CODEBITS;
+    for (i = 0; i < ROW_DISTSLOTS; i++)           /* the distance symbols */
+        ROWOF(0, ROW_SYMBOLS)[ROW_DISTFREQ - ROW_SAMPLES + i] = LZ_CODEBITS;
     *ROWOF(0, ROW_ROWBITS) = 0;
     *ROWOF(0, ROW_LIMIT) = limit;
 
@@ -353,6 +396,8 @@ static void lzfeed(const unsigned char *p, int n)
 
     for (i = 0; i < n; i++)
         LzCode(p + i, 1);
+
+    LzCode((const unsigned char *)0, 0);   /* flush the LZ_SKIPBACK tail */
 }
 
 int main(void)
@@ -2164,23 +2209,24 @@ int main(void)
 
             
 
-            {
-                extern int LzDbgCand, LzDbgRec, LzDbgLit, LzDbgEmit;
-                extern int LzDbgI, LzDbgF, LzDbgN;
-                printf("   dbg s%d cand=%d rec=%d lit=%d emit=%d out=%d"
-                       " skip=%d@%d/%d\n",
-                       strat[s], LzDbgCand, LzDbgRec, LzDbgLit, LzDbgEmit,
-                       OutCount, LzDbgN, LzDbgI, LzDbgF);
-            }
             check("the window took the bytes", LzWrite, n);
             check("the window still holds them",
                   memcmp(LzWindow, lzinput, n), 0);
 
             decoded = lzdecode(OutCount * 8, lzgot, n, &nm, &longest, &trail);
-            sprintf(name, "s%d: random data decodes (fail %d)", strat[s], lzfail);
+            sprintf(name, "s%d: random data decodes (fail %d)", strat[s],
+                    lzfail);
             check(name, decoded, n);
-            sprintf(name, "s%d: and is the input", strat[s]);
-            check(name, decoded == n ? memcmp(lzgot, lzinput, n) : 1, 0);
+            if (decoded == n) {
+                int k, diff = 0;
+
+                for (k = 0; k < n; k++)
+                    if (lzgot[k] != lzinput[k])
+                        diff = k + 1;
+                sprintf(name, "s%d: random data is the input (first at %d)",
+                        strat[s], diff);
+                check(name, diff, 0);
+            }
             sprintf(name, "s%d: with almost no matches", strat[s]);
             check(name, nm < n / 16, 1);
 
@@ -2193,16 +2239,36 @@ int main(void)
             lzsetup(strat[s], 0x7FFFFFFF);
             lzfeed(lzinput, n);
             LzCode((const unsigned char *)0, 0);
+            
 
             decoded = lzdecode(OutCount * 8, lzgot, n, &nm, &longest, &trail);
-            sprintf(name, "s%d: repetitive data decodes", strat[s]);
+            sprintf(name, "s%d: repetitive data decodes (fail %d)", strat[s],
+                    lzfail);
             check(name, decoded, n);
-            sprintf(name, "s%d: and is the input", strat[s]);
-            check(name, decoded == n ? memcmp(lzgot, lzinput, n) : 1, 0);
-            sprintf(name, "s%d: with matches", strat[s]);
-            check(name, nm > 0, 1);
-            sprintf(name, "s%d: and a long one", strat[s]);
-            check(name, longest >= 40, 1);
+            if (decoded == n) {
+                int k, diff = 0;
+
+                for (k = 0; k < n; k++)
+                    if (lzgot[k] != lzinput[k])
+                        diff = k + 1;
+                sprintf(name, "s%d: and is the input (first at %d)", strat[s],
+                        diff);
+                check(name, diff, 0);
+            }
+            /*
+             *  Strategies 3 and 4 never match at all - `cmp ecx, 3; jge
+             *  loc_406CED` jumps straight to the literal - so only 0..2 can be
+             *  asked to produce matches.
+             */
+            if (strat[s] < 3) {
+                sprintf(name, "s%d: with matches", strat[s]);
+                check(name, nm > 0, 1);
+                sprintf(name, "s%d: and a long one", strat[s]);
+                check(name, longest >= 40, 1);
+            } else {
+                sprintf(name, "s%d: with no matches at all", strat[s]);
+                check(name, nm, 0);
+            }
 
 /*
              *  A single byte repeated.  Almost everything is a match at
@@ -2248,8 +2314,31 @@ int main(void)
                     locked++;
             check("every literal locked its sample", locked > 0, 1);
             check("and the step table was written", MatchCount > 0, 1);
-            check("the hash chains were built", HashHead[0] != 0 ||
-                  HashHead[1] != 0 || HashHead[2] != 0, 1);
+            {
+int bucket, links = 0, deepest = 0;
+
+                /*
+                 *  The buckets hold positions, so a non-zero bucket only says a
+                 *  position landed there.  What matters is that walking the
+                 *  DistSlot[] chains reaches back through the whole scanned
+                 *  range, so count the links.
+                 */
+                for (bucket = 0; bucket < 4096; bucket++) {
+                    int p = (int)(unsigned short)HashHead[bucket];
+                    int len = 0;
+
+                    while (p != 0 && len <= n) {
+                        len++;
+                        p = (int)(unsigned short)DistSlot[p & 32767];
+                    }
+                    links += len;
+                    if (len > deepest)
+                        deepest = len;
+                }
+                check("the hash chains link the scanned range",
+                      links > n / 2, 1);
+                check("and some chain goes back a long way", deepest > 20, 1);
+            }
         }
 
         /*
@@ -2262,9 +2351,9 @@ int main(void)
             for (i = 0; i < n; i++)
                 lzinput[i] = (unsigned char)(i & 7);
 
-            RowCount = 2;
             lzsetup(1, n / 2);              /* the first block is half of it */
-            *ROWOF(1, ROW_LIMIT) = n;      /* and the second row the rest   */
+            RowCount = 2;              /* lzsetup resets this to 1 */
+            *ROWOF(1, ROW_LIMIT) = 0x7FFFFFFF;   /* the second row is open ended */
             lzfeed(lzinput, n);
             LzCode((const unsigned char *)0, 0);
 

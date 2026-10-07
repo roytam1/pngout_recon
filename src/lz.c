@@ -43,8 +43,6 @@
 #define LZ_SKIPBACK 260              /* `lea ecx, [esi-104h]`              */
 #define LZ_STARTHACK  30              /* `cmp byte_185BA90[dl], 1Eh`        */
 
-int LzDbgCand, LzDbgRec, LzDbgLit, LzDbgEmit;
-int LzDbgI, LzDbgF, LzDbgN;
 #define LZ_STEPHOPS  1026            /* word_806D86 - word_806B82, in shorts */
 
 /*
@@ -84,7 +82,6 @@ static void LzSimple(int pos, int savedCost, int cap, int maxlen, int dist)
         cost = savedCost + DistSlots[dslot] + DistSlots[lslot];
 
         if (cost < MatchCost[end & LZ_COSTMASK] && end <= cap) {
-            LzDbgRec++;
             if (end > MatchLimit)
                 MatchLimit = end;
             SetMatch(end, len, dist);
@@ -171,7 +168,6 @@ static void LzXtreme(int pos, int savedCost, int cap, int maxlen, int dist)
         end = pos + len;
         cost = savedCost + DistSlots[LenCodeOf(len)] + target;
         if (cost < MatchCost[end & LZ_COSTMASK] && end <= cap) {
-            LzDbgRec++;
             if (end > MatchLimit)
                 MatchLimit = end;
             SetMatch(end, len, dist);
@@ -377,20 +373,11 @@ int LzCode(const unsigned char *data, int len)
             /* loc_40677C: a real candidate */
             int maxlen = RunEnd - pos;
 
-            LzDbgCand++;
             if (Image->strategy == 0) {
                 LzXtreme(pos, savedCost, cap, maxlen, dist);
             } else {
                 LzSimple(pos, savedCost, cap, maxlen, dist);
             }
-
-            /*
-             *  Both searches can push MatchLimit out as they find better
-             *  matches at `end`, and the emit below has to see that: the local
-             *  copy is what `pos == furthest` is tested against, and it is
-             *  read at the top of the iteration, before the searches ran.
-             */
-            furthest = MatchLimit;
         }
 
         /* ---- 0x406C02: close this position's slot ---- */
@@ -449,6 +436,9 @@ int LzCode(const unsigned char *data, int len)
                     furthest = pos;
                     MatchLimit = pos;
                 }
+                /* the last settle of this row is where matches get emitted; the
+               decoder failed at 2745 with a 258 byte match, which is exactly
+               LZ_MAXMATCH, so check the entry that produced it */
                 SetMatch(pos, 1, b);
                 MatchCost[pos & LZ_COSTMASK] = savedCost + lens[b];
             }
@@ -534,16 +524,19 @@ int LzCode(const unsigned char *data, int len)
             distbits = ROWOF(RowIndex, ROW_DISTBITS);
 
             /* loc_406ED4: emit them */
-            LzDbgI = i;
-            LzDbgF = furthest;
-            LzDbgN++;
             for (; i <= furthest; i++) {
                 int mlen = MatchLenAt(i);
 
+                /*
+                 *  Each entry stands for the run of bytes that *ends* at its own
+                 *  index, so the walk does not advance by the length: a match of
+                 *  length L at index i is one symbol and the next entry is i+1,
+                 *  which is why the shift loop above exists - it slides the tails
+                 *  down so the entries line up one index per symbol.
+                 */
                 if (mlen == 1) {
                     int b = MatchValAt(i);
 
-                    LzDbgLit++;
                     samples[b]++;
                     PutBits((unsigned int)LitCodes[b],
                             (unsigned int)lens[b]);
