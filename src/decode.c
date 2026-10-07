@@ -757,11 +757,19 @@ static int DecodePng(const unsigned char *data, int size, unsigned char *pixels,
             OutBitDepth = (unsigned char)depth;
             OutColType = (unsigned char)coltype;
 
+            /*
+             *  The channel ring.  The unfilter keeps the left-hand neighbour of
+             *  each byte in RowA[ch] and walks it with CurChannel, so the ring
+             *  has to enumerate exactly one full cycle of the samples per
+             *  pixel: 0->1->2->0 for RGB and 0->1->0->1 for grey+alpha.  A ring
+             *  that skips a channel reconstructs Sub, Average and Paeth against
+             *  stale state, which shows up as rows that are flat or halved.
+             */
             switch (coltype) {          /* the channel ring */
             case 0: case 3: Ring[0] = Ring[1] = Ring[2] = Ring[3] = 0; break;
-            case 2:         Ring[0] = 1; Ring[1] = 0; Ring[2] = 2; Ring[3] = 0;
+            case 2:         Ring[0] = 1; Ring[1] = 2; Ring[2] = 0; Ring[3] = 0;
                             break;
-            case 4:         Ring[0] = 1; Ring[1] = 0; Ring[2] = 0; Ring[3] = 0;
+            case 4:         Ring[0] = 1; Ring[1] = 0; Ring[2] = 1; Ring[3] = 0;
                             break;
             case 6:         Ring[0] = 1; Ring[1] = 2; Ring[2] = 3; Ring[3] = 0;
                             break;

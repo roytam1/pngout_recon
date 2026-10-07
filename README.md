@@ -1424,14 +1424,30 @@ byte sources need checking against it. The unfilter itself is exercised and
 produces rows of the right length, so the defect is in the expansion, not
 upstream.
 
-**The decoder now produces pixels, and here is exactly where it stands.**
+**Where it stands, precisely.** A 6x6 RGB image with filter bytes 0,1,2,3,4,0 on
+successive rows round-trips with **row 0 (filter 0) exact and every non-zero
+filter row wrong**. So the inflate, the expansion and the encoder are all sound;
+the defect is confined to the unfilter's filter 1-4 branches. Symptoms: a Sub
+row gives the same pixel repeated from x=1 onward, so the left-neighbour
+reference is not advancing, and an Up row comes out at exactly half the expected
+value. The prime suspect is the `Ring[]` / `CurChannel` sample-offset rotation
+and the `RowA` / `RowC` history arrays behind it: `RowA[ch]` is refreshed in the
+Average and Paeth branches but not in Sub or Up, which is precisely the pattern
+that would leave Sub and Up reconstructing against stale state. A greyscale
+8x4 image with all filter bytes zero comes back pixel-exact with no non-opaque
+alpha, which is consistent.
 
-An 8x4 depth-8 greyscale image with every filter byte zero comes back
-pixel-exact with no non-opaque alpha. A 4x4 RGB image with every filter byte zero
-comes back with **row 0 exact and rows 1-3 wrong**, so the remaining defect is
-per-row state rather than the expansion - every row goes through identical
-indexing. Across the 15 RGB corpus images, 3 round-trip exactly and 12 differ.
-Greyscale and palette inputs have not been compared pixel-for-pixel yet.
+Two hypotheses have been tested and **ruled out**, so do not re-try them: it is
+not the destination pointer (a running `dword_18CBF00` versus `base + pitch *
+row`, both now consistent with the listing), and it is not the `Ring[]` /
+`CurChannel` rotation - correcting the ring so it enumerates a full cycle per
+pixel changed nothing observable. What is left is the Sub branch itself: it
+reads `RowA[ch]`, writes `Up[RowLeft--]`, and advances `CurChannel` and `i` by
+hand, and the symptom - every byte from the second onwards decoding to the same
+value - looks like `i` or `RowA[ch]` failing to advance. Note also that the
+Sub-style branches mix a pre-decrement of `RowLeft` into the same expression as
+a read of `Up[RowLeft + 1]`, which is unsequenced in C and worth rewriting as
+two statements once the branch is otherwise correct.
 
 **Five defects found by testing pixels, all fixed:**
 
