@@ -103,6 +103,7 @@ listing line counts, which is how the remaining work gets sized.
 | `0x408390` `sub_408390` | `BestSplit()` | `src/optimize.c` |
 | `0x406530` `sub_406530` | `CompressByte()` | `src/lz.c` |
 | `0x4065A0` `sub_4065A0` | `LzCode()` | `src/lz.c` |
+| `0x4086E0` `sub_4086E0` | `WriteStored()` | `src/optimize.c` |
 | `0x40E584` `UserMathErrorFunction` | `_UserMathErrorFunction()` | `src/stubs.c` |
 | `.data` initialised part | 22 globals + `BitTable[64]` | `src/globals.c` |
 
@@ -709,11 +710,81 @@ Adler-32. The tests that call `FinishBlock()` directly hand it an empty window
 (`LzWrite = LzScan = 0`), which is what a block that never filtered anything
 looks like.
 
+### sub_4086E0, the /s4 writer
+
+`WriteStored()` is what `/s4` calls: the image out with **no compression at
+all**, and therefore the only path that does not touch the deflate machinery.
+That makes it the easiest way to check the PNG framing against something other
+than itself, and it is checked against Python's `zlib`.
+
+`dword_411D54` (`LinBufBytes`) is how many bytes one row packs into, per colour
+type:
+
+| colour type | `LinBufBytes` |
+|---|---|
+| 0, 3 (grey below 8 bits, palette) | `(bitdepth * width + 7) / 8 + 1` |
+| 2 (RGB) | `3 * width + 1` |
+| 4 (grey + alpha) | `2 * width + 1` |
+| 6 (RGBA) | `4 * width + 1` |
+
+The trailing **+1 is the row's filter type**, which is the thing that took the
+longest here. /s4 does not filter, so it is always 0 — but it is still written,
+and it still goes through the Adler-32, and it is *inside* `LinBufBytes`. That
+last point is what makes the row length come out right: the original computes
+the count as `(LinBufBytes * 0x10001) ^ 0xFFFF0000`, which is LEN and ~LEN as
+two little endian 16 bit fields — the header of a zlib **stored** deflate block.
+So each row is
+
+```
+1 byte   BFINAL, set on the last row
+4 bytes  LEN, ~LEN   =  LinBufBytes and its complement
+1 byte   the filter type, always 0
+N bytes  the samples
+```
+
+which is exactly a stored deflate block per row, and `zlib.decompress()` takes
+the whole IDAT. Five things had to be right for that, and four of them were
+wrong at first:
+
+* **the two placeholder bytes.** The 24184 mark is `0x78 0x5E`, written as two
+  *single* byte stores, not as one 16 bit store of `0x5E78` — the original does
+  `mov byte ptr [esi+ecx], 78h` and then `mov byte ptr [esi+edx], 1` further
+  on, with a whole row loop in between. Writing it as a dword put two zero bytes
+  after the mark and shifted everything;
+* **the filter byte.** It has to be written and added to the sum, which is what
+  the `+1` in every `LinBufBytes` formula is for;
+* **header and samples are one loop, not two passes.** The original's row loop
+  writes the flag, the count and the pixels before moving on;
+* **the length field is *reserved*, not written.** `mov ebx,
+  dword_185BECC; add ebx, 4; mov dword_185BECC, ebx` skips over it so the tag
+  lands after it, and the CRC therefore starts at `start + 4` — it covers the
+  tag and the payload but not the length. That is what PNG wants, and what the
+  deflate path does too (there `BitCrc` is seeded before `PutBits(TAG_IDAT_,
+  32)`);
+* **the Adler-32 is reseeded** (`mov [esp+2Ch+Number], 1` at 0x4087D5). Without
+  it the sum starts from whatever the last deflate trial left in the global, and
+  every structural check still passes — only `zlib` complains, with "incorrect
+  data check".
+
+The two byte orders meet here too, the same way they do in `WritePngHeader()`:
+a pixel is one DWORD `0xFFBBGGRR`, so the samples go out **B, G, R, A** — bytes
+2, 1, 0 and then 3, which is PLTE's order and the reverse of the internal one.
+
+The palette path is the one that is *looked up* rather than copied: each pixel
+goes through `sub_407FC0` (`FindColor()`), and below 8 bits the index is packed
+two or four to a byte, counting down from the top of the byte. The partial byte
+at the end of a row is flushed on the last pixel as well as at each group
+boundary, which is what stops a width that is not a multiple of the group size
+from losing it:
+
+```
+if ((n & mask) != mask && n != width - 1) goto next sample
+```
+
 ### Still to do inside Optimize
 
-`sub_402AD0` itself (5 983 listing lines), the min-sum filter
-`sub_4086E0`, the timing `sub_4063F0`'s caller, and the `.bss` globals they
-all use.
+`sub_402AD0` itself (5 983 listing lines), the timing `sub_4063F0`'s caller, and
+the `.bss` globals they both use.
 
 ## DecodeImage (0x409560): how it fits together
 
@@ -816,11 +887,11 @@ Two independent checks, both runnable.
 
 ### tools\selftest.cmd
 
-428 checks over the recovered code: `Swap16`, `GetImageSize` for all
+488 checks over the recovered code: `Swap16`, `GetImageSize` for all
 eight format codes, the `/k` list handling in `ScanChunks`, `FilterPredict()`,
 `CpuFeatures()`, and the optimiser primitives (CRC table, Huffman heap, colour
-hash, `PutBits()`/`EmitBytes()`, `RankValues()`, `FlushRow()`, `WritePngHeader()`, `EstimateEntropy()`, `BestSplit()`, `PlanBlocks()` with its block-end sort, `FilterByte()` with `Adler32Update()`, `AdvanceRow()`, and `LzCode()`).
-They caught thirteen real defects, all now fixed:
+hash, `PutBits()`/`EmitBytes()`, `RankValues()`, `FlushRow()`, `WritePngHeader()`, `EstimateEntropy()`, `BestSplit()`, `PlanBlocks()` with its block-end sort, `FilterByte()` with `Adler32Update()`, `AdvanceRow()`, `LzCode()`, and `WriteStored()`).
+They caught fourteen real defects, all now fixed:
 
 * PNG dimensions are **4 byte** big endian, not 2 byte. `GetImageSize` was
   using `Swap16` where the original calls `_byteswap_ulong` on a DWORD.
@@ -884,6 +955,12 @@ They caught thirteen real defects, all now fixed:
 * **`FinishBlock()`'s LZ flush was a hook.** With the coder reconstructed it is
   a real call, `FlushLzCoder()`, because step 1 has to run before step 4 — the
   flush is what leaves the Adler-32 sum in `AdlerSum`.
+* **`WriteStored()` did not reseed the Adler-32.** The original does
+  `mov [esp+2Ch+Number], 1` at 0x4087D5; leaving the global alone means
+  starting from whatever the last deflate trial finished with, and the sum is
+  checked by every decoder so the PNG is unreadable. Found by handing the
+  output to Python's `zlib`, which rejected it with "incorrect data check"
+  while every structural check passed.
 
 They also exposed that the original's `strtok` loop in `ScanChunks` steps one
 byte past the terminating NUL after the last token, because it restores the
@@ -994,7 +1071,8 @@ src/clipboard.c   ReadClipboard
 src/globals.c     .data
 src/optimize.c    CRC table, Huffman heap, colour hash, bit/byte output,
                   deflate tables, per row slots, the row writer, the PNG header,
-                  the /b block splitter
+                  the /b block splitter, the /s4 stored writer
+src/lz.c          the LZ coder (sub_4065A0) and its byte sink (sub_406530)
 src/predict.c     FilterPredict
 src/cpuid.c       CpuFeatures
 src/stubs.c       the two unrecovered entry points, plus the math error handler

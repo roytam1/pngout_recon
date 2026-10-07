@@ -184,6 +184,53 @@ static int esc_hook(int unused)
 }
 
 /* ------------------------------------------------------------------ */
+/*  sub_4086E0: /s4, the stored writer                                  */
+/* ------------------------------------------------------------------ */
+
+/*
+ *  A helper for the /s4 tests: find the IDAT by walking the chunks, so they do
+ *  not have to know how long PLTE and tRNS made the header.  Returns the
+ *  offset of the IDAT's length field, or -1.
+ */
+static int find_idat(const unsigned char *p, int len)
+{
+    int o = 8;
+
+    while (o + 8 <= len) {
+        unsigned int clen = ((unsigned)p[o] << 24) | ((unsigned)p[o + 1] << 16) |
+                            ((unsigned)p[o + 2] << 8) | p[o + 3];
+
+        if (memcmp(p + o + 4, "IDAT", 4) == 0)
+            return o;
+        if (memcmp(p + o + 4, "IEND", 4) == 0)
+            return -1;
+        o += 12 + (int)clen;
+    }
+    return -1;
+}
+
+/*
+ *  dword_185BEC4 is s->msg, the printf-style progress line main() installs.
+ *  sub_4086E0 ends with a bare "\r" and "Out:%8d bytes (stored)", so the test
+ *  needs somewhere to put them.  Only the first few are kept, so a long run
+ *  cannot overflow the buffer.
+ */
+static char messages[512];
+static int nmsgs;
+
+static void sink_msg(const char *fmt, ...)
+{
+    va_list ap;
+
+    nmsgs++;
+    if (strlen(messages) > 200)
+        return;
+    va_start(ap, fmt);
+    vsprintf(messages + strlen(messages), fmt, ap);
+    va_end(ap);
+}
+
+/* ------------------------------------------------------------------ */
 /*  the LZ coder: give the rows a code the test can read back, run the */
 /*  coder over some bytes, and put the symbols back together to see    */
 /*  whether the stream carries the data it was given                   */
@@ -2450,6 +2497,289 @@ int bucket, links = 0, deepest = 0;
 
         (void)base;
 #undef FIELD_OFFSET
+    }
+
+    /* ---- sub_4086E0: /s4, the stored (uncompressed) writer ------------- */
+    {
+        static IMAGEDESC simg;
+        static unsigned char sout[1 << 16];
+        static unsigned char spix[4 * 5 * 3];
+        static unsigned char want[256];
+        int w = 4, h = 3, i, r, c, o, ct, adler, nwant;
+        unsigned int wcrc;
+        unsigned int *pal[1];
+
+        /* sub_4086E0 reports its size through dword_185BEC4, which is s->msg;
+           main() always sets it, so the test has to as well */
+        ProgressMsg = sink_msg;
+        nmsgs = 0;
+        messages[0] = 0;
+
+        memset(&simg, 0, sizeof(simg));
+        memset(sout, 0, sizeof(sout));
+        memset(spix, 0, sizeof(spix));
+        Image = &simg;
+        simg.outbuf = sout;
+        simg.outsize = sizeof(sout);
+        simg.pixels = (unsigned int *)spix;
+        simg.stride = w * 4;
+        simg.width = w;
+        simg.height = h;
+        MinSample = -1;              /* no tRNS chunk, as the tests above do */
+
+        /*
+         *  A pixel is 0xFFBBGGRR, so bytes 2, 1, 0 are B, G, R and byte 3 the
+         *  alpha - the same order PLTE and bKGD use.  Fill every byte from a
+         *  counter so all four channels are distinct and a byte order
+         *  mistake cannot pass, then pin the first two pixels to values that
+         *  are easy to read off.
+         */
+        for (i = 0; i < w * h * 4; i++)
+            spix[i] = (unsigned char)(i * 7 + 3);
+        spix[0] = 0x10; spix[1] = 0x20; spix[2] = 0x30; spix[3] = 0x40;
+        spix[4] = 0x50; spix[5] = 0x60; spix[6] = 0x70; spix[7] = 0x80;
+
+        /* ---- RGB, 8 bit ---- */
+        ct = 2;
+        unk_185BED0 = ct;
+        unk_180A570 = 8;
+        unk_180B978 = 0;
+        OutCount = 0;
+        RowIndex = 0;
+        RowCount = 1;
+        InitCrcTable();              /* what Optimize() does first */
+        AdlerSum = 0x11223344;       /* poison: WriteStored() reseeds it */
+        check("/s4: it wrote a PNG", WriteStored(), 1);
+        check("/s4: the signature is there",
+              memcmp(sout, "\x89PNG\x0D\x0A\x1A\x0A", 8), 0);
+
+        /* the IHDR for 4x3 RGB, checked against zlib.crc32 over the same 17
+           bytes - 3B 96 39 91 */
+        check("/s4: the IHDR is the standard 13 bytes",
+              memcmp(sout + 8, "\0\0\0\015IHDR\0\0\0\4\0\0\0\3\10\2\0\0\0"
+                               "\x3B\x96\x39\x91", 25), 0);
+        /*
+         *  The IDAT.  Its length is staged and written big endian, the tag is
+         *  "IDAT" and the next two bytes are the 24184 placeholder.
+         */
+        o = 33;
+        check("/s4: the IDAT tag", memcmp(sout + o + 4, "IDAT", 4), 0);
+        check("/s4: and the placeholder CRC",
+              sout[o + 8] + sout[o + 9] * 256, 24184);
+
+        /* LinBufBytes for RGB is 3 * width + 1 */
+        check("/s4: the stored row length", LinBufBytes, 3 * w + 1);
+        /* the length field counts everything between itself and the CRC */
+        check("/s4: and the IDAT length covers what is written",
+              ((unsigned)sout[o] << 24) | ((unsigned)sout[o + 1] << 16) |
+              ((unsigned)sout[o + 2] << 8) | sout[o + 3],
+              (unsigned)(h * (5 + 3 * w + 1) + 2 + 4));
+
+        /*
+         *  The payload is a zlib *stored* deflate block per row: a header byte
+         *  carrying BFINAL, then LEN and ~LEN as two little endian 16 bit
+         *  fields.  The 4 bytes come out of
+         *  `(LinBufBytes * 0x10001) ^ 0xFFFF0000`, which is exactly that.
+         */
+        /*
+         *  Per row: the flag byte, LEN and ~LEN as two little endian 16 bit
+         *  fields, the filter type byte, then the samples.  So a row is
+         *  5 + LinBufBytes and the walk has to step by all of it.
+         */
+        o += 10;               /* past the length, the tag and the 2 marks */
+        nwant = 0;
+        adler = 1;
+        for (r = 0; r < h; r++) {
+            int len, nlen, lenbytes;
+
+            check("/s4: the row is a stored block, last row flagged",
+                  sout[o] == (r == h - 1), 1);
+            o++;
+            len = sout[o] | (sout[o + 1] << 8);
+            nlen = sout[o + 2] | (sout[o + 3] << 8);
+            check("/s4: LEN is LinBufBytes", len, 3 * w + 1);
+            check("/s4: and NLEN is its complement", len ^ nlen, 0xFFFF);
+            o += 4;
+            check("/s4: the row starts with the filter type", sout[o], 0);
+            adler = (int)Adler32Update((unsigned)adler, 0);
+            o++;
+
+            /* the samples: B, G, R per pixel, so the same byte order the
+               internal 0xFFBBGGRR pixel has to be reversed into */
+            lenbytes = 3 * w;
+            for (c = 0; c < lenbytes; c++) {
+                int px = r * w + c / 3;         /* into the whole image */
+                static const int srcoff[3] = { 2, 1, 0 };
+
+                want[c] = spix[px * 4 + srcoff[c % 3]];
+                adler = (int)Adler32Update((unsigned)adler, want[c]);
+            }
+            check("/s4: the row's bytes are B, G, R",
+                  memcmp(sout + o, want, lenbytes), 0);
+            o += lenbytes;
+        }
+
+        /* the Adler-32 of the unfiltered data, big endian, and then the
+           block CRC.  The CRC covers the tag and the payload but *not* the
+           length field - the length is reserved by bumping OutCount past it
+           before the tag goes out, so it is written into the buffer at the
+           end and the running CRC never sees it.  That is also what PNG
+           wants, and what the deflate path does: there BitCrc is seeded
+           before PutBits(TAG_IDAT_, 32). */
+        check("/s4: the Adler-32 went out big endian",
+              ((unsigned)sout[o] << 24) | ((unsigned)sout[o + 1] << 16) |
+              ((unsigned)sout[o + 2] << 8) | sout[o + 3], (unsigned)adler);
+        o += 4;
+
+        wcrc = 0xFFFFFFFFu;
+        for (i = 37; i < o; i++)
+            wcrc = CrcTable[(wcrc ^ sout[i]) & 0xFF] ^ (wcrc >> 8);
+        wcrc = ~wcrc;
+        check("/s4: the IDAT's CRC is over its tag and payload",
+              ((unsigned)sout[o] << 24) | ((unsigned)sout[o + 1] << 16) |
+              ((unsigned)sout[o + 2] << 8) | sout[o + 3], wcrc);
+        o += 4;
+
+        /* the IEND chunk: a zero length, the tag, and a CRC that is fixed because
+           the chunk has no data */
+        check("/s4: IEND's length is zero",
+              sout[o] | (sout[o + 1] << 8) | (sout[o + 2] << 16) |
+              (sout[o + 3] << 24), 0);
+        check("/s4: then the tag", memcmp(sout + o + 4, "IEND", 4), 0);
+        check("/s4: and the fixed CRC",
+              ((unsigned)sout[o + 8] << 24) | ((unsigned)sout[o + 9] << 16) |
+              ((unsigned)sout[o + 10] << 8) | sout[o + 11], 0xAE426082u);
+        check("/s4: and that is the end of it", OutCount, o + 12);
+
+        /* ---- greyscale + alpha: two bytes, grey then alpha ---- */
+        ct = 4;
+        unk_185BED0 = ct;
+        OutCount = 0;
+        WriteStored();
+        o = find_idat(sout, OutCount); check("/s4: found the IDAT", o > 0, 1); o += 10;
+        check("/s4: gray+alpha row length", LinBufBytes, 2 * w + 1);
+        for (r = 0; r < h; r++) {
+            int len;
+
+            o++;
+            len = sout[o] | (sout[o + 1] << 8);
+            check("/s4: gray+alpha LEN", len, 2 * w + 1);
+            check("/s4: and NLEN", (sout[o + 2] | (sout[o + 3] << 8)) ^ len,
+                  0xFFFF);
+            o += 4;
+            o++;                         /* the filter type, always zero */
+            for (c = 0; c < 2 * w; c++) {
+                int px = r * w + c / 2;
+
+                if (c & 1)
+                    want[c] = spix[px * 4 + 3];   /* alpha */
+                else
+                    want[c] = spix[px * 4 + 0];   /* grey = the R byte */
+            }
+            check("/s4: grey then alpha", memcmp(sout + o, want, 2 * w), 0);
+            o += 2 * w;
+        }
+
+        /* ---- RGBA: four bytes, B, G, R then alpha ---- */
+        ct = 6;
+        unk_185BED0 = ct;
+        OutCount = 0;
+        WriteStored();
+        o = find_idat(sout, OutCount); check("/s4: found the IDAT", o > 0, 1); o += 10;
+        check("/s4: RGBA row length", LinBufBytes, 4 * w + 1);
+        for (r = 0; r < h; r++) {
+            int len;
+
+            o++;
+            len = sout[o] | (sout[o + 1] << 8);
+            check("/s4: RGBA LEN", len, 4 * w + 1);
+            o += 4;
+            o++;                         /* the filter type */
+            for (c = 0; c < 4 * w; c++) {
+                int px = r * w + c / 4;
+                static const int off4[4] = { 2, 1, 0, 3 };
+
+                want[c] = spix[px * 4 + off4[c & 3]];
+            }
+            check("/s4: B, G, R, A", memcmp(sout + o, want, 4 * w), 0);
+            o += 4 * w;
+        }
+
+        /* ---- a palette, 8 bit: one byte per pixel, looked up ---- */
+        ct = 3;
+        unk_185BED0 = ct;
+        unk_180B578[0] = 0xFF000000;
+        unk_180B578[1] = 0xFF0000FF;
+        unk_180B978 = 2;
+        /*
+         *  Fill the image with the two palette entries, alternating, so the
+         *  bytes that come out are 0,1,0,1,... - which pins the lookup and
+         *  cannot be confused with a copy of the pixel.
+         */
+        for (i = 0; i < w * h; i++)
+            *(unsigned int *)(spix + i * 4) = unk_180B578[i & 1];
+        OutCount = 0;
+        WriteStored();
+        check("/s4: an 8 bit palette row is one byte per pixel",
+              LinBufBytes, w + 1);
+        o = find_idat(sout, OutCount); check("/s4: found the IDAT", o > 0, 1); o += 10;
+        o++;                         /* the row's flag byte */
+        check("/s4: and its LEN is width + 1", sout[o] | (sout[o + 1] << 8),
+              w + 1);
+        o += 4;
+        o++;                         /* the filter type, always zero */
+        for (c = 0; c < w; c++)
+            want[c] = (unsigned char)(c & 1);   /* alternating two entries */
+        check("/s4: the indices are the palette positions",
+              memcmp(sout + o, want, w), 0);
+
+        /* ---- a palette below 8 bits: packed, two to a byte ---- */
+        unk_180A570 = 4;
+        OutCount = 0;
+        WriteStored();
+        check("/s4: a 4 bit palette row packs two to a byte",
+              LinBufBytes, ((4 * w + 7) >> 3) + 1);
+        o = find_idat(sout, OutCount); check("/s4: found the IDAT", o > 0, 1); o += 10;
+        o++;
+        check("/s4: and its LEN", sout[o] | (sout[o + 1] << 8),
+              ((4 * w + 7) >> 3) + 1);
+        o += 4;
+        o++;                         /* the filter type, always zero */
+        /*
+         *  Counting down from the top of the byte: pixel 0 in the high nibble,
+         *  pixel 1 in the low one.  With the alternating palette above both are
+         *  0 or 1, so each byte is 0x01 - pixel 0 in the high nibble.
+         */
+        for (c = 0; c < w / 2; c++)
+            want[c] = 0x01;
+        check("/s4: the high nibble first", memcmp(sout + o, want, w / 2), 0);
+
+        /* the size line, and the carriage return that comes before it when
+           /v was not given */
+        /* one more run of its own, so the messages can be counted cleanly */
+        messages[0] = 0;
+        nmsgs = 0;
+        OutCount = 0;
+        WriteStored();
+        check("/s4: two progress messages", nmsgs, 2);
+        check("/s4: a bare CR without /v", messages[0], '\r');
+        check("/s4: then the size",
+              strncmp(messages + 1, "Out:", 4), 0);
+
+        /* and with /v it is a newline after the size instead */
+        simg.verbose = 1;
+        messages[0] = 0;
+        nmsgs = 0;
+        OutCount = 0;
+        WriteStored();
+        check("/s4: /v prints the newline after", messages[strlen(messages) - 1],
+              '\n');
+        check("/s4: and no leading CR", messages[0] != '\r', 1);
+        simg.verbose = 0;
+        ProgressMsg = NULL;
+
+        Image = NULL;
+        (void)pal;
     }
 
     printf("\n%s  (%d failure%s)\n", failures ? "FAILED" : "PASSED",

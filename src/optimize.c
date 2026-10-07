@@ -1972,3 +1972,266 @@ void FinishBlock(void)
         EmitBytes(c, Swap32(*(unsigned int *)c) + 12);
     }
 }
+
+/* ------------------------------------------------------------------ */
+/*  sub_4086E0: the /s4 writer - the image out with no compression     */
+/* ------------------------------------------------------------------ */
+
+/*
+ *  `/s4` means "store", and this is the whole of it: an IDAT holding the
+ *  samples verbatim.  It is worth having as a separate entry point because it
+ *  is the only path that does *not* go through the deflate machinery at all,
+ *  which makes it the easiest way to check the PNG framing - signature, IHDR,
+ *  the kept chunks, IDAT, IEND - against something other than itself.
+ *
+ *  `dword_411D54` (LinBufBytes) is how many bytes one row of samples packs
+ *  into, and it is per colour type:
+ *
+ *      0 / 3   palette or grey below 8 bits:  (width * bitdepth + 7) / 8 + 1
+ *      2       RGB:                          3 * width + 1
+ *      4       grey + alpha:                 2 * width + 1
+ *      6       RGBA:                         4 * width + 1
+ *
+ *  The trailing +1 is the room for the "+1" of the `(x * maxval) / maxval`
+ *  rescaling a PNG reader applies, and the cases 0 and 3 also build the colour
+ *  hash first - a palette image has to be looked up, not copied.
+ *
+ *  Note what is *not* here: no filter byte.  The stored path writes the samples
+ *  exactly as they are, which is why `LinBufBytes` above has to include the
+ *  row's own byte rather than leave room for a filter type.
+ */
+
+/*
+ *  Both of these are the *little endian DWORD* forms, because the original
+ *  stores them with `mov dword_185BECC... , 444E4549h` and
+ *  `..., 826042AEh` and PutStoredWord() writes little endian:
+ *
+ *      0x444E4549 -> 49 45 4E 44  ->  "IEND"
+ *      0x826042AE -> AE 42 60 82  ->  the CRC of "IEND", big endian on the wire
+ *
+ *  which is why they read backwards as hex.
+ */
+#define TAG_IEND_   0x444E4549u      /* "IEND", little endian */
+#define IEND_CRC    0x826042AEu      /* its CRC, little endian  */
+
+/* one byte of a row, into the IDAT staging area, with the bound check the
+   original does at every single store (`cmp esi, [edi+14h]; jge skip`) */
+static void PutStored(unsigned char c)
+{
+    if (OutCount < Image->outsize)
+        Image->outbuf[OutCount] = c;
+    OutCount++;
+}
+
+static void PutStoredWord(unsigned int w)
+{
+    PutStored((unsigned char)(w & 0xFF));
+    PutStored((unsigned char)((w >> 8) & 0xFF));
+    PutStored((unsigned char)((w >> 16) & 0xFF));
+    PutStored((unsigned char)((w >> 24) & 0xFF));
+}
+
+/* one byte of sample data, which also goes through the Adler-32 */
+static void PutStoredSample(unsigned char c)
+{
+    PutStored(c);
+    AdlerSum = (int)Adler32Update((unsigned int)AdlerSum, c);
+}
+
+/*
+ *  One row of samples, for colour type 0 or 3.  A palette index is *looked up*
+ *  per pixel (`sub_407FC0`, FindColor) and packed at the bit depth, two or four
+ *  to a byte.  The packing counts down from the top of the byte - `shl v,
+ *  (~n & 7)` for 1 bit, `(~n & 3) * 2` for 2 and `(~n & 1) * 4` for 4, with
+ *  `n` the running sample index - and the partial byte at the end of a row
+ *  goes out on its own, because the original stores the packed byte when the
+ *  group completes *or* when the row runs out:
+ *
+ *      if ((n & mask) != mask && n != width - 1) goto next sample
+ *
+ *  which is what stops a row whose width is not a multiple of the group size
+ *  from losing its last partial byte.
+ */
+static void StoreSubByteRow(int row, int width, int bitdepth)
+{
+    int perbyte = 8 / bitdepth;
+    unsigned char *base = (unsigned char *)Image->pixels + row * Image->stride;
+    int col, shift, sample, packed;
+
+    packed = 0;
+    for (col = 0; col < width; col++) {
+        unsigned char *p = base + col * 4;
+
+        sample = FindColor(*(int *)p);
+        if (bitdepth == 8) {
+            PutStoredSample((unsigned char)sample);
+            continue;
+        }
+        shift = perbyte - 1 - (col % perbyte);
+        packed |= sample << (shift * bitdepth);
+        if ((col % perbyte) == perbyte - 1 || col == width - 1) {
+            PutStoredSample((unsigned char)packed);
+            packed = 0;
+        }
+    }
+}
+
+/*
+ *  One row of samples for the rest, whole bytes per pixel in the order PNG
+ *  wants them - which for a 32 bit internal pixel `0xFFBBGGRR` is B, G, R, A.
+ *  That is the same byte order PLTE and bKGD use, and the reverse of the
+ *  internal one.
+ */
+static void StoreByteRow(int row, int width, int coltype)
+{
+    unsigned char *base = (unsigned char *)Image->pixels + row * Image->stride;
+    static const int off_bgr[3] = { 2, 1, 0 };
+    static const int off_rgba[4] = { 2, 1, 0, 3 };
+    int col;
+
+    for (col = 0; col < width; col++) {
+        unsigned char *p = base + col * 4;
+
+        switch (coltype) {
+        case 2:                         /* B, G, R */
+            PutStoredSample(p[off_bgr[0]]);
+            PutStoredSample(p[off_bgr[1]]);
+            PutStoredSample(p[off_bgr[2]]);
+            break;
+        case 4:                         /* grey, alpha */
+            PutStoredSample(p[0]);
+            PutStoredSample(p[3]);
+            break;
+        case 6:                         /* B, G, R, A */
+            PutStoredSample(p[off_rgba[0]]);
+            PutStoredSample(p[off_rgba[1]]);
+            PutStoredSample(p[off_rgba[2]]);
+            PutStoredSample(p[off_rgba[3]]);
+            break;
+        }
+    }
+}
+
+int WriteStored(void)                  /* sub_4086E0 */
+{
+    int start, i, len, width, height, coltype, bitdepth;
+
+    coltype = unk_185BED0;
+    width = Image->width;
+    height = Image->height;
+
+    switch (coltype) {
+    case 0:
+    case 3:
+        bitdepth = unk_180A570;
+        LinBufBytes = ((bitdepth * width + 7) >> 3) + 1;
+        InitColorHash(unk_180B578);
+        for (i = unk_180B978 - 1; i >= 0; --i)
+            AddColor(unk_180B578[i], i);
+        break;
+    case 2:
+        LinBufBytes = 3 * width + 1;
+        break;
+    case 4:
+        LinBufBytes = 2 * width + 1;
+        break;
+    case 6:
+        LinBufBytes = 4 * width + 1;
+        break;
+    default:
+        LinBufBytes = 0;
+        break;
+    }
+
+    if (!WritePngHeader(width, height, coltype, unk_180A570,
+                        unk_180B578, unk_180B978))
+        return 0;
+
+    /*
+     *  The Adler-32 seed.  This is `mov [esp+2Ch+Number], 1` at 0x4087D5, and
+     *  it has to be set here rather than left to whatever the last trial left
+     *  in the global: the sum has to start at 1, and an off-by-one in the low
+     *  half is invisible until a decoder checks it.
+     */
+    AdlerSum = 1;
+
+    /* ---- the IDAT, opened by hand: no deflate block header at all ---- */
+    /*
+     *  The length field is *reserved* by bumping OutCount past it (the
+     *  original's `mov ebx, dword_185BECC; add ebx, 4; mov dword_185BECC,
+     *  ebx`) and the tag is written after it.  The CRC below therefore starts
+     *  at start + 4 and does not cover the length, which is what PNG wants
+     *  and what the deflate path does too: there BitCrc is seeded before
+     *  PutBits(TAG_IDAT_, 32).
+     */
+    start = OutCount;
+    OutCount += 4;
+    PutStoredWord(TAG_IDAT_);
+    /* the same placeholder CRC as the deflate path, and two single bytes:
+     * `mov byte ptr [esi+ecx], 78h` then `mov byte ptr ..., 1` a row further
+     * on, NOT one 16 bit store - 0x5E78 read little endian is 0x78, 0x5E but
+     * writing it as a dword would put two zero bytes after them */
+    PutStored(0x78);
+    PutStored(0x5E);
+
+/*
+     *  Per row: one byte saying whether it is the last row, then the row's
+     *  byte count in the same `LinBufBytes * 0x10001 ^ 0xFFFF0000` form the
+     *  row writer uses - which is LEN and ~LEN as two little endian 16 bit
+     *  fields, i.e. the header of a zlib *stored* deflate block.  Then a
+     *  single zero byte, and that is where LinBufBytes' trailing +1 goes:
+     *  it is the row's **filter type**, the same byte FilterSample() emits
+     *  first in the compressed path, here always 0 (None) because /s4 does
+     *  not filter.  It goes through the Adler-32 like any other data byte.
+     *
+     *  So LinBufBytes really is the full row: 1 + n * width.  The header and
+     *  the samples are one loop, not two passes - the original's row loop
+     *  writes the flag and the count and then walks the pixels before moving
+     *  on to the next row.
+     */
+    for (i = 0; i < height; i++) {
+        PutStored((unsigned char)(i == height - 1));
+        PutStoredWord(((unsigned int)LinBufBytes * 0x10001u) ^ 0xFFFF0000u);
+        PutStoredSample(0);           /* the filter type, always None */
+
+        if (coltype == 0 || coltype == 3)
+            StoreSubByteRow(i, width, unk_180A570);
+        else
+            StoreByteRow(i, width, coltype);
+    }
+
+    PutStoredWord(Swap32((unsigned int)AdlerSum));
+
+    /* ---- the CRC, over the tag and the payload but not the length ---- */
+    {
+        unsigned int crc = 0xFFFFFFFFu;
+
+        for (i = start + 4; i < OutCount; i++)
+            crc = CrcTable[(crc ^ Image->outbuf[i]) & 0xFF] ^ (crc >> 8);
+        PutStoredWord(Swap32(~crc));
+    }
+
+    /* ---- the IDAT's length, which does not count itself ---- */
+    len = Swap32((unsigned int)(OutCount - start - 12));
+    memcpy(Image->outbuf + start, &len, 4);
+
+    /* ---- whatever chunks follow the image data, whole ---- */
+    for (i = Image->chunktail; i < Image->chunkend; i++) {
+        unsigned char *c = (unsigned char *)Image->chunks[i];
+
+        EmitBytes(c, Swap32(*(unsigned int *)c) + 12);
+    }
+
+    /* ---- IEND: a zero length, the tag, and its fixed CRC ---- */
+    PutStoredWord(0);
+    PutStoredWord(TAG_IEND_);
+    PutStoredWord(IEND_CRC);
+
+    if (Image->verbose == 0)
+        ProgressMsg("\r");
+    ProgressMsg("Out:%8d bytes (stored)", OutCount);
+    if (Image->verbose)
+        ProgressMsg("\n");
+
+    return 1;
+}

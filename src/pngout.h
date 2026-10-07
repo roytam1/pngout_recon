@@ -202,7 +202,14 @@ typedef struct ImageDescStruct {
     int           percent;  /* +78  progress, 0 .. 100                   */
 
     int           pad4;     /* +7C */
-    int           pad5[18]; /* +80 .. +C4 */
+    int           pad5a;    /* +80 */
+    /*
+     *  +84 is s->verbose, the /v flag.  sub_4086E0 reads it twice: when it is
+     *  clear it prints a bare "\r" *before* the size line instead of a newline
+     *  after it, which is what overwrites the progress bar on one line.
+     */
+    int           verbose;  /* +84  /v */
+    int           pad5[16]; /* +88 .. +C4 */
 
     int           best;     /* +C8  best compressed size found so far     */
 } IMAGEDESC;
@@ -273,7 +280,7 @@ int  EmitBlock(unsigned width, unsigned height, int coltype, int bitdepth,
               int *palette, int palcount);
 int  WritePngHeader(int width, int height, int coltype, int bitdepth,
                     int *palette, int palcount);
-void (*ProgressMsg)(const char *fmt);   /* dword_185BEC4, from s->msg */
+void (*ProgressMsg)(const char *fmt, ...);   /* dword_185BEC4, from s->msg */
 
 /* --- state the optimiser and the bit writer share ----------------- */
 extern int         OutCount;      /* dword_185BECC */
@@ -281,7 +288,7 @@ extern int         BitCount;      /* dword_412670, a BIT count */
 extern unsigned int BitBuf;       /* dword_412674 */
 extern unsigned int BitCrc;       /* dword_412EB8 */
 extern IMAGEDESC  *Image;         /* dword_42E960 */
-extern void      (*ProgressMsg)(const char *fmt);   /* dword_185BEC4 */
+extern void      (*ProgressMsg)(const char *fmt, ...);   /* dword_185BEC4 */
 
 /* --- block state, set up by EmitBlock() -------------------------- */
 extern int      BlockSymbols;     /* dword_41266C */
@@ -446,6 +453,10 @@ void SortBlockEnds(int count);
 /* sub_408390: the best place to cut a run of bytes, and the saving there */
 int  BestSplit(unsigned char *data, int len, double *score);
 extern int      MinSample;        /* dword_185BEC0, the darkest sample */
+extern int      unk_180A570;      /* dword_180A570: the bit depth to write */
+extern int      unk_185BED0;      /* dword_185BED0: the colour type to write */
+extern int      unk_180B978;      /* dword_180B978: /ks, and the palette length */
+extern int      unk_180B578[MAX_COLORS];   /* dword_180B578, the palette */
 extern int      unk_185BEC8, unk_180BA84, unk_185BEB8, unk_411D58, unk_41CEC0;
 extern int      unk_42D7C8;
 extern unsigned char unk_42E55C;
@@ -561,6 +572,8 @@ int  AdvanceRow(void);
 
 /* loc_4075B0: flush the LZ coder, close the block, write its trailer */
 void FinishBlock(void);
+/* sub_4086E0: /s4, write the image out with no compression at all */
+int  WriteStored(void);
 unsigned int Swap32(unsigned int x);
 
 /* fill `dest` with a 32 bit pattern; the CRT memset only does bytes */

@@ -112,7 +112,7 @@ unsigned int BitBuf;           /* 0x412674: the bit accumulator            */
 unsigned int BitCrc;           /* 0x412EB8: running CRC of the output     */
 
 /* s->msg, published so the optimiser can report progress */
-void (*ProgressMsg)(const char *fmt);          /* 0x185BEC4 */
+void (*ProgressMsg)(const char *fmt, ...);   /* 0x185BEC4 */
 
 /* block state, set up by EmitBlock() */
 int      BlockSymbols;         /* 0x41266C */
@@ -205,6 +205,17 @@ int      MinSample;                      /* dword_185BEC0: darkest sample in the
 int      unk_185BEC8, unk_180BA84, unk_185BEB8, unk_411D58, unk_41CEC0;
 int      unk_42D7C8;
 unsigned char unk_42E55C;
+
+/*
+ *  What Optimize() decides once, before the trials: the colour type and bit
+ *  depth it will write, and the palette it built from the image.  dword_180B978
+ *  is s->palflag, the `/ks` flag, so it is the palette's *length* as well -
+ *  which is why sub_4086E0 passes it to WritePngHeader() as the entry count.
+ */
+int      unk_180A570;                    /* dword_180A570: /d#, the bit depth to write */
+int      unk_185BED0;                    /* dword_185BED0: /c#, the colour type to write */
+int      unk_180B978;                    /* dword_180B978: /ks, and the palette length */
+int      unk_180B578[MAX_COLORS];        /* dword_180B578: the palette, 0xAARRGGBB    */
 
 /* ------------------------------------------------------------------ */
 /*  the row records, 0x42E958                                            */
