@@ -101,6 +101,8 @@ listing line counts, which is how the remaining work gets sized.
 | `loc_4075B0` | `FinishBlock()` | `src/optimize.c` |
 | `0x408000` `sub_408000` | `PlanBlocks()` + `SortBlockEnds()` | `src/optimize.c` |
 | `0x408390` `sub_408390` | `BestSplit()` | `src/optimize.c` |
+| `0x406530` `sub_406530` | `CompressByte()` | `src/lz.c` |
+| `0x4065A0` `sub_4065A0` | `LzCode()` | `src/lz.c` |
 | `0x40E584` `UserMathErrorFunction` | `_UserMathErrorFunction()` | `src/stubs.c` |
 | `.data` initialised part | 22 globals + `BitTable[64]` | `src/globals.c` |
 
@@ -565,9 +567,10 @@ byte — and the 24 bit version simply never looks at the argument's top byte.
 `FilterSample(pixel, nbytes)` is the shared body. Only the byte count differs
 between the four; the row-start, store and row-end code is identical.
 
-`sub_406530` is stubbed in `src/stubs.c`: `FilterByte()` compares the sink
-pointer against it, so it has to exist, but it needs the LZ coder
-(`sub_4065A0`, 1721 listing lines), which is described below and not yet done.
+`sub_406530` (`CompressByte()`) is now reconstructed in `src/lz.c`: it is the
+Adler-32 update followed by `LzCode(&byte, 1)` — one byte at a time, and the
+coder is handed a pointer to the *argument slot* rather than the value, which is
+what `lea ecx, [esp+0Ch+arg_0]; push 1; push ecx; call sub_4065A0` does.
 
 ### sub_407090, closing a row
 
@@ -606,13 +609,9 @@ also moved from `optimize.c` into `pngout.h` so the tests can build records.
 
 ### sub_4065A0, the LZ coder
 
-Not yet reconstructed — it is the largest single piece left and a wrong version
-would silently produce bad PNGs, so it stays a loud stub until it can be done
-properly. What the listing does say, recorded here so the work is not repeated:
-
-`sub_4065A0(data, len)` appends `len` bytes to a **32K sliding window** and then
-lifts matches out of it. `len == 0` means "flush", which is how `loc_4075B0`
-closes a block.
+Reconstructed in `src/lz.c` as `LzCode(data, len)`, the last big piece of the
+optimiser. `len == 0` means "flush", which is how `loc_4075B0` closes a block.
+Its state:
 
 | what | where | role |
 |---|---|---|
@@ -623,34 +622,57 @@ closes a block.
 | hash heads | `word_412EC0[4096]` | the newest position with that hash |
 | hash chain | `word_41CEC8[32768]` | the previous one, per position |
 | run lengths | `word_185BED8[32768]`, `dword_411D58` | `byte_42E55C` is the last byte seen; the counter saturates at `0x7FFF` |
-| match lengths | `dword_6D6670[32768]`, `dword_6B4968[32768]` | the length found at a position, and how far it is still valid |
+| step table | `word_806B82[]`, `word_806D86[]` | per position and length, the distance to step to next |
+| match start | `dword_6D6670[32768]`, `dword_6B4968[32768]` | where a position's step list begins, and how far it is still valid |
 | best cost | `dword_412678[512]`, `dword_412668` | indexed by `position & 0x1FF`; `dword_412668` is the furthest position with a cost |
 | match list | `dword_706B88[0x40000]`, `dword_180BA84` | length in the low half, distance in the high half |
-| length slots | `byte_414EC0[4096]`, `byte_180B980[256]`, `byte_185BA90[32]` | which length code a match length costs; the last is `SlotOrder[]`, already reconstructed |
-| distance slots | `dword_6D5578[64]` | `DistSlots[]`, already reconstructed |
-| extra bits | `word_806B82[]`, `word_806D86[]` | per length and per distance |
 
-How it fits the pieces already reconstructed together:
+The shape: it walks the window from `LzScan` to `writepos - 260`, and at every
+position *tries* a match, keeping the cheapest encoding of each prefix in
+`MatchCost[position & 0x1FF]` and the symbol that achieves it in
+`MatchList[position & 0x3FFFF]`. A position nothing beats falls back to a
+literal, which also **locks** the row record's sample for that byte value
+(`|= 0x80000000`) — the bit `AdvanceRow()` clears. So the coder both fills the
+row record and decides what the row's next code must keep.
 
-* a literal is recorded as `rowrec.samples[byte] |= 0x80000000` — the sample is
-  counted **and locked**, which is exactly the bit `AdvanceRow()` clears. So the
-  coder both fills the row record's sample array and decides what the next code
-  must keep;
-* the current row's cost comes from `rowrec+0x510` (the length array
-  `AdvanceRow()` writes) added to the running total `dword_96`, and matches are
-  only worth recording while the position is at or before `dword_412668`;
-* whether to keep scanning at all is `strategy == 2`, or
-  `position + 258 <= furthest`, or `(position - rowStart + 260) >= 0x40000`;
-* `dword_1809394[2 * slot]` and `byte_414EBF[]` map a length slot to its base
-  length, so the "extra bits" tables are indexed by slot.
+Two strategies, kept apart: `/s0` (Xtreme) walks the *distance* in the inner
+loop with the `SlotOrder[]` chain and the `BestCost[]` early-out;
+`/s1` and `/s2` (`LzSimple()`) walk the *length*. Strategies 3 and 4 skip
+matching entirely — `cmp ecx, 3; jge loc_406CED`.
 
-The matching itself is lazy with a cost heuristic: it tries length 3 upwards,
-compares the cost of the match against `literal cost + DistSlots[...]`, keeps
-walking the hash chain while the length is growing (`word_185BED8[]` lets it
-step over a run in one go), and only then decides whether to take the match or
-the literal. There are four or five interleaved heuristics in there — the
-`v35 - 3 >= dword_6B4968[...]` and `byte_185BA90[...]` loops — which is why it
-needs all 1721 lines rather than a tidy 200.
+**The one that took longest to get right is a register lifetime.** `ebx` holds
+two different things and the reconstruction had them the wrong way round:
+
+* the *trigger* for the emit block is `cmp ebx, edi; jnz loc_40706E`, against
+  the copy of `dword_412668` taken at `0x406630`;
+* but `0x406C02`, which closes the position's step-table slot, ends with
+  `mov ebx, dword_412668` at `0x406CC4` — a **fresh read of the global**, which
+  the search has just been raising to the furthest position its matches reach.
+  That is the value the literal path's clamp
+  (`cmp edi, ebx; jle` / `mov dword_412668, ebx`) is measured against.
+
+Taking the copy from the top of the iteration instead makes that clamp fire
+against a stale number and pull `MatchLimit` back down to `pos + 1`, throwing
+away every match the position found. The symptom was subtle: the stream decoded
+to the right *length* but one byte wrong at the end, and only the strategies
+that actually match were affected. With the clamp fixed the emit block's own
+reads of the global (0x406E69, and 0x406FEE for the loop bound) agree with the
+trigger and the batches tile exactly.
+
+The other thing that only shows up in a working coder is the **slide-down
+loop** at `loc_406E97`. The last entry in the match list can reach back before
+the row began, so its tail is copied down until it does not — and that is what
+makes the emit walk one index per symbol rather than one per *byte*. A match of
+length L at index i is one symbol and the next entry is i+1.
+
+### The chain the emit walks
+
+`MatchLimit` is the furthest position with a cost, and the emit runs only once
+`pos == MatchLimit`: everything up to there is settled. The loop at 0x406ED4
+walks `i` from the slid-down start to `dword_412668`, one index per symbol,
+emitting a literal (length 1, the byte in the high half) or a length + distance
++ extra bits. The tests decode that back with a tagged code shape and check both
+the byte count and the content.
 
 ### loc_4075B0, closing a block
 
@@ -681,14 +703,17 @@ padding, which would have made step 7 emit the chunks that belong *before* the
 image data. `WritePngHeader()`'s second run is now `[chunkmid, chunktail)` — the
 chunks that go between PLTE and IDAT — and the rest follow the image.
 
-Step 1 is the LZ coder, still a stub, so it is a hook (`FlushLz`) and with none
-installed the rest still runs, which is what the tests exercise.
+Step 1 is `FlushLzCoder()` — `LzCode(0, 0)` — which is a real call now rather
+than a hook, so the coder's last match is on the wire before the padding and the
+Adler-32. The tests that call `FinishBlock()` directly hand it an empty window
+(`LzWrite = LzScan = 0`), which is what a block that never filtered anything
+looks like.
 
 ### Still to do inside Optimize
 
 `sub_402AD0` itself (5 983 listing lines), the min-sum filter
-`sub_4086E0`, the timing `sub_4063F0`'s caller, the LZ coder `sub_4065A0`
-described above and its helpers, and the `.bss` globals they all use.
+`sub_4086E0`, the timing `sub_4063F0`'s caller, and the `.bss` globals they
+all use.
 
 ## DecodeImage (0x409560): how it fits together
 
@@ -791,11 +816,11 @@ Two independent checks, both runnable.
 
 ### tools\selftest.cmd
 
-351 checks over the recovered code: `Swap16`, `GetImageSize` for all
+428 checks over the recovered code: `Swap16`, `GetImageSize` for all
 eight format codes, the `/k` list handling in `ScanChunks`, `FilterPredict()`,
 `CpuFeatures()`, and the optimiser primitives (CRC table, Huffman heap, colour
-hash, `PutBits()`/`EmitBytes()`, `RankValues()`, `FlushRow()`, `WritePngHeader()`, `EstimateEntropy()`, `BestSplit()`, `PlanBlocks()` with its block-end sort, `FilterByte()` with `Adler32Update()`, and `AdvanceRow()`).
-They caught ten real defects, all now fixed:
+hash, `PutBits()`/`EmitBytes()`, `RankValues()`, `FlushRow()`, `WritePngHeader()`, `EstimateEntropy()`, `BestSplit()`, `PlanBlocks()` with its block-end sort, `FilterByte()` with `Adler32Update()`, `AdvanceRow()`, and `LzCode()`).
+They caught thirteen real defects, all now fixed:
 
 * PNG dimensions are **4 byte** big endian, not 2 byte. `GetImageSize` was
   using `Swap16` where the original calls `_byteswap_ulong` on a DWORD.
@@ -846,6 +871,19 @@ They caught ten real defects, all now fixed:
   pointers by `gap` dwords, so every swap landed in the *start* and *next* fields
   of neighbouring records and left the ends nearly - but not quite - sorted. The
   tests now sort a reversed and a stride-7 scrambled set of ends directly.
+* **The LZ coder read `MatchLimit` from the wrong place.** It took it from the
+  top of the loop iteration instead of from `0x406CC4`, where the original
+  re-reads the global after the search has been raising it. The literal path's
+  clamp then measured against a stale number and pulled `MatchLimit` back down
+  to `pos + 1`, discarding every match that position had just found. The stream
+  still decoded to the right length and was one byte wrong at the end, and only
+  the three strategies that actually match were affected.
+* **The step table's long-range hop was 1026 entries instead of 258.** IDA's
+  `word_806D86` minus `word_806B82` is 0x204 bytes, which is 258 shorts, not
+  the 1026 the note claimed. Xtreme (`/s0`) is the only strategy that uses it.
+* **`FinishBlock()`'s LZ flush was a hook.** With the coder reconstructed it is
+  a real call, `FlushLzCoder()`, because step 1 has to run before step 4 — the
+  flush is what leaves the Adler-32 sum in `AdlerSum`.
 
 They also exposed that the original's `strtok` loop in `ScanChunks` steps one
 byte past the terminating NUL after the last token, because it restores the

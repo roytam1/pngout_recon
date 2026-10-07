@@ -289,8 +289,8 @@ static int lzdecode(int nbits, unsigned char *to, int want,
 
 static IMAGEDESC lzimg;
 static unsigned char lzout[1 << 17];
-static unsigned char lzinput[8192];
-static unsigned char lzgot[8192];
+static unsigned char lzinput[40000];
+static unsigned char lzgot[40000];
 
 /*
  *  Everything EmitBlock and sub_4058A0 set up, with the row's code pinned to
@@ -2108,7 +2108,14 @@ int main(void)
         ChunkStart = 12;              /* pretend an IDAT header went out   */
         RowIndex = 0;
         RowCount = 1;                 /* so AdvanceRow() stops after it     */
-        FlushLz = NULL;
+        /*
+         *  FinishBlock() flushes the LZ coder first, which is what leaves the
+         *  Adler-32 sum in AdlerSum - so this test has to hand it an empty
+         *  window and a scan position already at the write position, or the
+         *  flush would emit a row's worth of symbols into the block trailer.
+         */
+        LzWrite = 0;
+        LzScan = 0;
         RowHeaderCode = 0;
         *ROWOF(0, ROW_ROWBITS) = 0;
         *ROWOF(1, ROW_ROWBITS) = 0;
@@ -2171,7 +2178,6 @@ int main(void)
                   memcmp(out + n + 12, tail, 13), 0);
         }
 
-        FlushLz = NULL;
         Image = NULL;
     }
 
@@ -2213,6 +2219,7 @@ int main(void)
             check("the window still holds them",
                   memcmp(LzWindow, lzinput, n), 0);
 
+            tflush();     /* the last byte of bits is still in the buffer */
             decoded = lzdecode(OutCount * 8, lzgot, n, &nm, &longest, &trail);
             sprintf(name, "s%d: random data decodes (fail %d)", strat[s],
                     lzfail);
@@ -2241,6 +2248,7 @@ int main(void)
             LzCode((const unsigned char *)0, 0);
             
 
+            tflush();     /* the last byte of bits is still in the buffer */
             decoded = lzdecode(OutCount * 8, lzgot, n, &nm, &longest, &trail);
             sprintf(name, "s%d: repetitive data decodes (fail %d)", strat[s],
                     lzfail);
@@ -2273,14 +2281,23 @@ int main(void)
 /*
              *  A single byte repeated.  Almost everything is a match at
              *  distance 1, so the run counters and the run-length skip in both
-             *  searches get exercised hard, and `RunLen` has to saturate at
-             *  0x7FFF rather than counting past it.
+             *  searches get exercised hard.
+             *
+             *  `RunLen[pos]` is the number of *identical bytes before* `pos`,
+             *  capped at 0x7FFF (`inc dword_411D58` at 0x40669F, then the
+             *  `cmp eax, 7FFFh` at 0x4066A0).  So a run of `n` bytes ends at
+             *  n - 1 and the cap is only reached past 32767 bytes - the run
+             *  below is nowhere near it, and the saturating one is the next
+             *  test.  Strategies 3 and 4 never run the counters at all:
+             *  `cmp ecx, 3; jge loc_406CED` skips the whole lot, and the
+             *  skip-ahead loop guards its copy with `cmp [ecx+4Ch], 3`.
              */
             n = 4000;
             memset(lzinput, 0x5A, n);
             lzsetup(strat[s], 0x7FFFFFFF);
             lzfeed(lzinput, n);
             LzCode((const unsigned char *)0, 0);
+            tflush();     /* the last byte of bits is still in the buffer */
             decoded = lzdecode(OutCount * 8, lzgot, n, &nm, &longest, &trail);
             sprintf(name, "s%d: a solid run decodes", strat[s]);
             check(name, decoded, n);
@@ -2290,8 +2307,30 @@ int main(void)
                 if (lzgot[i] != 0x5A)
                     bad++;
             check(name, bad, 0);
-            sprintf(name, "s%d: and the run saturates", strat[s]);
-            check(name, RunLen[n - 1] == 0x7FFF, 1);
+            sprintf(name, "s%d: and the run counts the bytes before it",
+                    strat[s]);
+            check(name, strat[s] >= 3 ? 1 : (RunLen[n - 1] == n - 1), 1);
+        }
+
+        /*
+         *  A run long enough to reach the 0x7FFF cap.  The window is 64KB, so
+         *  this still fits without wrapping, and the coder stops 260 bytes
+         *  short of the end until the flush.
+         */
+        for (s = 0; s < 3; s++) {
+            char name[64];
+
+            n = 33000;
+            memset(lzinput, 0x5A, n);
+            lzsetup(strat[s], 0x7FFFFFFF);
+            lzfeed(lzinput, n);
+            LzCode((const unsigned char *)0, 0);
+            tflush();
+            decoded = lzdecode(OutCount * 8, lzgot, n, &nm, &longest, &trail);
+            sprintf(name, "s%d: a long run decodes", strat[s]);
+            check(name, decoded, n);
+            sprintf(name, "s%d: and the run saturates at 0x7FFF", strat[s]);
+            check(name, RunLen[n - 1], 0x7FFF);
         }
 
         /*

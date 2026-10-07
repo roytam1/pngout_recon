@@ -138,7 +138,6 @@ int      FilterLeft;           /* 0x6D496C, the previous raw byte */
 int      FilterHistogram[256]; /* 0x42E560: unk_42E55C is four bytes below */
 int      FilterByteCount;      /* 0x180A568 */
 void   (*BlockFullHook)(void); /* where FilterByte()'s jump to loc_4075B0 goes */
-void   (*FlushLz)(void);      /* the LZ coder's own flush, sub_4065A0(0, 0) */
 
 /* the Huffman work area, src/optimize.c */
 int      Freq[HUFF_MAXSYMS];           /* 0x42CEC8 */

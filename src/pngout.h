@@ -520,8 +520,8 @@ extern int      BestCost[256];        /* dword_6D5170 */
  *  word_806D86 are - they are one array, not three.
  */
 #define LzStepWrite(k)  (StepTable[(k) + 3])
-#define LzStepPairAt(k) ((unsigned)StepTable[(k) + 2] | \
-                         ((unsigned)StepTable[(k) + 3] << 16))
+#define LzStepPairAt(k) ((unsigned)StepTable[(k) + 3] | \
+                         ((unsigned)StepTable[(k) + 4] << 16))
 
 /*
  *  Which code a length or a distance costs.  byte_180B980 and byte_414EC0 are
@@ -546,6 +546,8 @@ extern int      BestCost[256];        /* dword_6D5170 */
 #define MatchValAt(p)       ((int)MatchList[2 * ((p) & 0x3FFFF) + 1])
 
 int  LzCode(const unsigned char *data, int len);
+/* LzCode(0, 0): flush the coder, which is what loc_4075B0's step 1 is */
+void FlushLzCoder(void);
 
 
 /* sub_407D80: filter one image byte and hand it to the trial''s sink */
@@ -559,7 +561,6 @@ int  AdvanceRow(void);
 
 /* loc_4075B0: flush the LZ coder, close the block, write its trailer */
 void FinishBlock(void);
-extern void   (*FlushLz)(void);   /* where step 1 above goes: sub_4065A0(0,0) */
 unsigned int Swap32(unsigned int x);
 
 /* fill `dest` with a 32 bit pattern; the CRT memset only does bytes */

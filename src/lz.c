@@ -27,6 +27,22 @@
  *  `/s0` (Xtreme) does the lazy length/distance search with the slot order
  *  walk, everything else does the one in loc_4067D0.  Strategies 3 and 4 skip
  *  matching altogether - `cmp ecx, 3; jge loc_406CED`.
+ *
+ *  Two register-lifetime details are load-bearing and are easy to get wrong:
+ *
+ *    - **`furthest` is read after the search, not before.**  0x406C02 closes
+ *      the position's step-table slot and its last act is
+ *      `mov ebx, dword_412668` at 0x406CC4 - a *fresh* read of MatchLimit,
+ *      which the search has just been raising to the furthest position its
+ *      matches reach.  Taking the value from the top of the iteration instead
+ *      makes the literal path's clamp (`cmp edi, ebx; jle`, then
+ *      `mov dword_412668, ebx`) fire against a stale number and pull MatchLimit
+ *      back down, which loses every match that position found.  The emit block
+ *      reads the global again (0x406E69, and 0x406FEE for the loop bound),
+ *      which is what finally matters: the trigger is the copy, the amount to
+ *      emit is the global.
+ *    - **The step table's long-range hop is 258 entries, not 1026.**
+ *      `word_806D86 - word_806B82` is 0x204 bytes = 258 shorts.
  */
 
 #include <stdio.h>
@@ -43,7 +59,7 @@
 #define LZ_SKIPBACK 260              /* `lea ecx, [esi-104h]`              */
 #define LZ_STARTHACK  30              /* `cmp byte_185BA90[dl], 1Eh`        */
 
-#define LZ_STEPHOPS  1026            /* word_806D86 - word_806B82, in shorts */
+#define LZ_STEPHOPS  258             /* word_806D86 - word_806B82 = 0x204 bytes */
 
 /*
  *  sub_406530: the sink FilterByte() points at when a trial really compresses.
@@ -277,6 +293,20 @@ static void LzXtreme(int pos, int savedCost, int cap, int maxlen, int dist)
 /*  sub_4065A0                                                         */
 /* ------------------------------------------------------------------ */
 
+void (*LzTraceHook)(int, int, int, int, int, int);
+
+/*
+ *  The two hooks `FinishBlock()` and `FilterByte()` go through.  In the
+ *  original these are jumps, not calls: `FilterByte()` jumps into loc_4075B0
+ *  (the row loop's block-full handler) and loc_4075B0's first step is
+ *  `sub_4065A0(0, 0)`.  Both are direct now that the coder exists, so the
+ *  hooks are installed once rather than left to the caller.
+ */
+void FlushLzCoder(void)
+{
+    LzCode((const unsigned char *)0, 0);
+}
+
 int LzCode(const unsigned char *data, int len)
 {
     int writePos, limit, rowend, cap;
@@ -309,7 +339,6 @@ int LzCode(const unsigned char *data, int len)
     while (LzScan < limit) {
         pos = LzScan;
         runEnd = RunEnd;
-        furthest = MatchLimit;
 
         savedCost = MatchCost[pos & LZ_COSTMASK];
         MatchCost[pos & LZ_COSTMASK] = 0x7FFFFFFF;
@@ -421,6 +450,20 @@ int LzCode(const unsigned char *data, int len)
         HashHead[hash] = start;
 
     literal:
+        /*
+         *  0x406C02: the position's slot is closed - PrevMark and PrevReach
+         *  are updated and the hash chains are linked - and the last thing
+         *  it does is `mov ebx, dword_412668` at 0x406CC4.  That is where
+         *  the local `furthest` comes from, and it is a *fresh* read of the
+         *  global: the search routines above have been raising MatchLimit to
+         *  the furthest position their matches reach, so by now it can be far
+         *  ahead of what it was when this iteration started.  Taking the
+         *  value from the top of the iteration instead makes the literal's
+         *  clamp below fire against a stale number and pull MatchLimit back
+         *  down, which loses every match the position found.
+         */
+        furthest = MatchLimit;
+
         /* ---- 0x406CED: no match here, so a literal ---- */
         {
             int b = LzByte(pos);
@@ -436,9 +479,6 @@ int LzCode(const unsigned char *data, int len)
                     furthest = pos;
                     MatchLimit = pos;
                 }
-                /* the last settle of this row is where matches get emitted; the
-               decoder failed at 2745 with a 258 byte match, which is exactly
-               LZ_MAXMATCH, so check the entry that produced it */
                 SetMatch(pos, 1, b);
                 MatchCost[pos & LZ_COSTMASK] = savedCost + lens[b];
             }
@@ -492,9 +532,22 @@ int LzCode(const unsigned char *data, int len)
             continue;
 
         /* ---- 0x406E69: everything up to `furthest` is settled ---- */
+        /*
+         *  `furthest` above is the copy of MatchLimit this iteration started
+         *  with - 0x4065B4's `mov ebx, dword_412668` - and it is only the
+         *  *trigger* for this block (`cmp ebx, edi; jnz loc_40706E`), which
+         *  the literal path below updates.  The emit itself re-reads the
+         *  global: 0x406E69's `mov esi, dword_412668`, and again at 0x406FEE
+         *  for the loop bound.  The search routines raise MatchLimit to the
+         *  furthest position a match reaches, so by the time the scan catches
+         *  up the global is ahead of the copy the trigger used, and it is the
+         *  global that says how much there is to emit.  Using the copy here
+         *  emits the matches one batch too late, and the chain then reaches
+         *  back past the row start.
+         */
         {
-            int i = furthest;
-            int from = furthest - MatchLenAt(furthest);
+            int i = MatchLimit;
+            int from = MatchLimit - MatchLenAt(MatchLimit);
 
             /*
              *  loc_406E97: the last entry can reach back before the row began,
@@ -508,6 +561,9 @@ int LzCode(const unsigned char *data, int len)
                     i--;
                     MatchList[2 * (i & LZ_LISTMASK)] = (int)(w & 0xFFFF);
                     MatchList[2 * (i & LZ_LISTMASK) + 1] = (int)(w >> 16);
+                    if (LzTraceHook)
+                        LzTraceHook(-1, i, (int)(w & 0xFFFF), from,
+                                    (int)(w >> 16), unk_42D7C8);
                     from -= MatchLenAt(from);
                     if (from <= unk_42D7C8)
                         break;
@@ -524,8 +580,12 @@ int LzCode(const unsigned char *data, int len)
             distbits = ROWOF(RowIndex, ROW_DISTBITS);
 
             /* loc_406ED4: emit them */
-            for (; i <= furthest; i++) {
+            for (; i <= MatchLimit; i++) {
                 int mlen = MatchLenAt(i);
+
+                if (LzTraceHook)
+                    LzTraceHook(i, mlen, MatchValAt(i), furthest, MatchLimit,
+                                unk_42D7C8);
 
                 /*
                  *  Each entry stands for the run of bytes that *ends* at its own

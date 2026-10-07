@@ -1942,16 +1942,15 @@ int AdvanceRow(void)
  *      6. the IDAT's length, now that its contents are all written;
  *      7. whatever chunks belong after the image data.
  *
- *  Step 1 is the LZ coder, which is not reconstructed yet, so it is a hook;
- *  with none installed the rest still runs, which is what the tests want.
+ *  Step 1 is the LZ coder, which has to run before step 3 because flushing it
+ *  is what leaves the Adler-32 sum in AdlerSum.
  */
 void FinishBlock(void)
 {
     unsigned int len;
     int i;
 
-    if (FlushLz != NULL)
-        FlushLz();
+    FlushLzCoder();
 
     AdvanceRow();
 
