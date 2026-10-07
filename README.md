@@ -33,6 +33,14 @@ machine. `cl.exe` there imports `mspdb60.dll`, which lives in
 `cmd.exe` cannot `chdir` into one; `pushd` maps it to a drive letter. It
 propagates the command's exit code so it can be used from scripts.
 
+That mapping is a **real one that outlives the process**: a script that exits
+without reaching its `popd`s leaks a drive letter permanently, and there are only
+twenty six of them. Once they run out, `pushd` silently starts returning 1, and
+every `pushd` in these scripts becomes a no-op - so the build lands in the
+repository root instead of `build\`, `if exist pngcheck.exe` finds the *old* one
+and nothing is rebuilt. If a build here seems to do nothing, check `net use`
+first; `net use X: /delete /y` gives the letters back.
+
 ## Reference corpus
 
 `tools\extract_lst.py` splits the 924 MB listing into `reference/` (10 KB to
@@ -104,49 +112,134 @@ listing line counts, which is how the remaining work gets sized.
 | `0x406530` `sub_406530` | `CompressByte()` | `src/lz.c` |
 | `0x4065A0` `sub_4065A0` | `LzCode()` | `src/lz.c` |
 | `0x4086E0` `sub_4086E0` | `WriteStored()` | `src/optimize.c` |
+| `0x404D60` `sub_404D60` | `NothingChanged()` | `src/optimize.c` |
+| `0x408690` `sub_408690` | `PutByte()` | `src/optimize.c` |
+| `0x4086B0` `sub_4086B0` | `InitProgressScale()` | `src/optimize.c` |
+| `0x402AD0` `sub_402AD0` | `Optimize()` | `src/trials.c` |
 | `0x40E584` `UserMathErrorFunction` | `_UserMathErrorFunction()` | `src/stubs.c` |
+| `0x40AF40` `sub_40AF40` | `FilterPredict()` | `src/predict.c` |
 | `.data` initialised part | 22 globals + `BitTable[64]` | `src/globals.c` |
+
+`Optimize()` and everything it calls is now round-trip verified: `Optimize()`
+produces a PNG that `tools\pngcheck.py` inflates with `zlib`, unfilters and
+compares sample by sample against the source, over 30 cases covering all five
+strategies, colour types 0, 2, 3 and 6, all five filters and both block
+splitting modes. See **Verification so far**.
 
 ### Not yet reconstructed
 
-`src/stubs.c` aborts loudly for these two, so a build can never silently
-produce a wrong PNG.
+`src/stubs.c` aborts loudly for the one that is left, so a build can never
+silently produce a wrong PNG.
 
 | original | name | size | what it does |
 |---|---|---|---|
 | `0x409560` | `DecodeImage()` | 4 353 B | dispatches to the PNG/JPEG/GIF/BMP/PCX/DDS/TGA decoders and publishes `OutColType`, `OutBitDepth`, `NumBlocks`, `dword_190A420[]`, `unk_190A820` |
-| `0x402AD0` | `Optimize()` | 8 954 B | the trial and error search over filters, block splits and Huffman tables; returns the size of the smallest PNG it found |
+
+The PNG half is worked through and written up above: format dispatch, the
+signature, the IHDR/PLTE/bKGD/tRNS handlers, the sub-8-bit table expansion, the
+sample count and row byte count, the bit reader and input pump, the whole
+inflate body, the unfilter, the pixel expansion, and the Adam7 constants. The
+Huffman helpers are the last thing on the critical path for a PNG that decodes.
+No C has been written for any of it, so a build reports the entry point as
+unimplemented rather than guessing at the inflate path.
 
 ## Optimize (0x402AD0): how it fits together
 
-Worked through so far. `Optimize()` takes the `SETTINGS *` that `main()`
-built and writes the resulting PNG into `s->outbuf`, returning its size, or
-`0x7FFFFFFF` when it found nothing better than the original.
+`src/trials.c`. `Optimize()` takes the `SETTINGS *` that `main()` built and writes
+the resulting PNG into `s->outbuf`, returning its size, or `0x7FFFFFFF` when it
+found nothing better than the original.
 
 On entry it copies the settings into globals, which is how the whole optimiser
 gets at them:
 
 | setting | global | meaning |
 |---|---|---|
-| `s->palflag` `[7]` | `dword_180B978` | `/ks` keep settings |
-| `s->filter` `[8]` | `dword_6D5664` | `/f#`, -1 = automatic |
+| `s->palflag` `[7]` | `dword_180B978` | `/ks` keep settings, and afterwards the palette length |
+| `s->filter` `[8]` | `dword_6D5664` | `/f#`, -1 = automatic (becomes 5, or 0 for a palette) |
 | `s->coltype` `[9]` | `dword_185BED0` | `/c#`, -1 = automatic |
 | `s->bitdepth` `[10]` | `dword_180A570` | `/d#` |
+| `s->strategy` `[19]` | `Image->strategy` `+4C` | `/s#`, 4 = `/s4` stored |
+| `s->maxblocks` `[21]` | `Image->maxblocks` `+54` | `/n#`, an exact block count |
+| `s->blocksplit` `[22]` | `Image->splitthreshold` `+58` | `/b#`, the saving a cut has to beat |
 | `s->msg` `[31]` | `dword_185BEC4` | progress messages, e.g. `"\nEarly ESC! "` |
 | `s->checkesc` `[32]` | `dword_6F6670` | polled in every trial loop |
-| `s->outsize` `[30]` | zeroed | filled in at the end |
+| `s->verbose` `[33]` | `Image->verbose` `+84` | `/v`, also the `QueryPerformanceCounter` timing |
 
-Then it walks the image (`dword_42E960`) to classify it: the minimum pixel
-value into `dword_185BEC0`, whether every channel repeats (grey) into a flag
-bit, and how many distinct colours there are into the palette at
-`dword_180B578` (kept at `unk_1808F90` so a trial can be undone).
+It then walks the image (`dword_42E960`) once to classify it, producing the three
+flag bits that decide the colour type:
+
+| bit | meaning | set when |
+|---|---|---|
+| 1 | needs alpha | a non-opaque pixel whose RGB triple also appears opaque |
+| 2 | not grayscale | some pixel has `R != G != B` |
+| 4 | too many colours | a 257th distinct colour turned up |
+
+and the palette in `dword_180B578`, the number of distinct colours, and
+`MinSample` (`dword_185BEC0`), the darkest pixel - which is what decides whether
+a tRNS chunk is written. The classification decides the type (`loc_402D8C`):
+
+| flags | type | because |
+|---|---|---|
+| 0 | 0 if >= 128 colours, else 3 | a handful of greys is cheaper as a PLTE |
+| 1, 2, 3 | 3 | a palette is the only encoding under 256 colours |
+| 5 | 4 | grey + alpha, palette would need too many entries |
+| 6 | 2 | RGB, more than 256 colours and nothing transparent |
+| 7 | 6 | RGBA |
+
+If the user *forced* a `/c#` the image cannot use, it says why in the original's
+exact wording and gives up with `0x7FFFFFFF`.
+
+It then estimates the output size in closed form (`loc_4034C8`), which sizes the
+work buffer and doubles as the size `/s4` would produce, and either takes the
+`/s4` shortcut or runs the trials.
+
+### The trial loop
+
+The loop re-runs the same image with the same options; what changes between
+iterations is the *row records*, the per block Huffman machinery in
+`src/optimize.c`. Trial 0 seeds them, each later trial leaves them primed by the
+previous one, so the code lengths improve and the output shrinks until it stops.
+`/f5` ("mixed") filters each row once per candidate filter with the histogram
+sink, scores it with `EstimateEntropy()`, and re-filters the row with the winner
+and the real sink; `/f6` instead reuses a caller-supplied per row table. The loop
+knows it has stopped by fingerprinting each trial's filter choices and size into
+`dword_1809568`/`dword_180A578` - once a trial reproduces an earlier pair, no
+further progress is possible and the best result is restored and returned.
 
 ### Pieces recovered
 
-See the table above; `src/optimize.c` plus `src/predict.c` and `src/cpuid.c`
-are what the rest of the optimiser will be built on. Three findings worth
-recording:
+See the table above; `src/optimize.c` plus `src/predict.c` and `src/cpuid.c` are
+what `Optimize()` is built on. Findings worth recording:
 
+* **The greyscale test is two shifted halves, not a mask.** `loc_402C0A` builds
+  `(v & 0xFFFF) << 8` and `v & 0xFFFF00` and xors them, which is zero exactly
+  when `R == G == B`. The tempting single mask,
+  `(v & 0xFFFF00FF) == ((v & 0xFF00) << 8)`, is *not* the same test: it also
+  requires `B == 0`, so it calls every grey pixel with a non-zero blue a colour
+  and sends ordinary greyscale to a palette.
+* **The minimum pixel is compared unsigned.** `MinSample` starts at `0xFFFFFFFF`
+  and the loop's `jnb` is an unsigned compare, so a transparent black
+  (`0x00000000`) wins it. Compared signed, 0 is greater than -1 and the
+  transparent background would never be noticed - which is exactly the pixel
+  whose presence decides whether the image needs an alpha channel.
+* **With /kp off, the colour type 3 pass does not re-seed the hash.**
+  `loc_40327E` only calls `FindColor()` and counts; the palette *and* the hash
+  were already built by the first pass over the image. Calling
+  `InitColorHash()` there would make every pixel look like a new colour and
+  append a second copy of the palette.
+* **`unk_411F5C` is zeroed `.bss`, not a table.** Section 3 (`.data`) is 512 bytes
+  of file image with a `0x14F9838` virtual size, so `dword_411D5C` and everything
+  past it reads as zero; the greyscale scan's `or edx, [ecx]` therefore
+  contributes nothing and it is really a scan of `dword_411D60` alone. The one
+  other thing it does is skip grey level 85, which changes nothing because
+  `0x55`'s nibbles match anyway.
+* **`dword_180A568` is one variable under two names.** `loc_406510` counts a
+  row's bytes into it and `EstimateEntropy()` then decrements it to get the
+  largest count to tabulate. Declared as two counters, `EstimateEntropy()`
+  keeps decrementing one nothing increments and sizes its table from `-1`.
+* **`dword_411D60` and `dword_180B578` are swapped together.** The palette and
+  the per-entry counts are the two halves of one exchange, and getting that
+  wrong leaves the counts describing a different palette than the one written.
 * **`dword_42D7D0` and `dword_42D7D4` are one array, not two.** IDA names them
   separately because they are `Heap[0]` and `Heap[1]`; the heap is 1-based with
   the sentinel 575 in slot 0, pre-written one slot ahead on each push so the
@@ -189,6 +282,41 @@ recording:
 * **`dword_412E78` is a scratch buffer, not a field.** It is seeded with the
   PNG signature at `0x405B8F` and then used as a general byte scratchpad by
   `sub_405B80`, so its value at any point depends on what ran before.
+* **`dword_6F6A78` is `LitCodes[256]`, not a variable of its own.** It is
+  `dword_6F6678 + 256`, so `RankValues()` fills it along with the rest of the
+  table, and `sub_407090` writes it with the row's own length for symbol 256 to
+  **close every deflate block**. Nothing in the optimiser names an end-of-block:
+  the one bit and the two bits written before each `sub_4053D0` are BFINAL and
+  BTYPE, so a row *is* a block, and the code that ends it goes out from
+  `AdvanceRow()`.
+* **`dword_42F370` is the block list's `end` field, not a row field.**
+  `0x405FE8`:
+  ```
+  mov  edx, dword_42D7CC
+  imul edx, 0A18h
+  mov  eax, dword_42F370[edx]
+  ```
+  `0x42F370` is exactly 0xA18 dwords past the row record's base (`0x42E958`), so
+  it is the *next* record's field 0 - which is where the `/b` block list lives
+  (`BlockRecord` is at `0x42F364` and `end` is its fourth dword). Row index and
+  block index are the same counter (`dword_6D5570` is both `RowCount` and
+  `NumBlockList`), so the position where a row's data stops is the position where
+  its block ends. `sub_4058A0`'s last store, `dword_42E958[0xA18 * RowCount] =
+  0x7FFFFFFF`, is therefore the same array one record later: it opens the *last*
+  block to the whole window, which is what lets the final row end when the writer
+  runs out of bytes instead of at a boundary.
+* **`sub_40AF40`'s first distance is measured from `c`, not from `b`.** The
+  three are `|a + b - 2c|`, `|b - c|` and `|a - c|`, and the answer is `a` when
+  `d2` is no larger than either, `b` when `d3 <= d1`, `c` otherwise. `a`, `b`,
+  `c` are the left, above and above-left samples. Reading the first as
+  `|a + c - 2b|` is the natural mistake and disagrees on most triples.
+* **The four filter routines do not agree on which byte comes first.** They emit
+  `2, 1, 0` for 24 bit (`mov cl, byte ptr [arg_0+2]` / `mov dl, bh` /
+  `and eax, 0FFh` in `sub_4077C0`) and `2, 1, 0, 3` for 32 bit, because an
+  internal pixel is one DWORD with **B, G, R, A** from the bottom up; only the
+  1 and 2 byte cases walk upwards. So an RGB image comes out R, G, B per scanline
+  and a grey+alpha one grey then alpha, which is PNG's order - getting it wrong
+  costs nothing but the colours, and a round trip cannot see it.
 
 ### The code-length solver
 
@@ -275,6 +403,21 @@ rather than one array per field. That is not cosmetic: modelled separately the
 reconstruction needed two full records - 21MB of `.bss` - and the fields *do*
 overlap on purpose (`sub_407090` reads the previous row's samples as
 `samples[i] - 320`, which is inside the record in front of it).
+
+Two of those fields are the same field under two names, and both matter:
+
+* `+0x89C` is `+0x510` + 227, so `ROW_LENBITS[k]` is `ROW_SYMBOLS[227 + k]`; the
+  LZ coder indexes it with the *pair* index 30 to 58 and so reads
+  `ROW_SYMBOLS[257 .. 285]`, which is where the length code lengths are.
+* `+0x990` is `+0x510` + 288, so the distance symbols' bit counts are
+  `ROW_SYMBOLS[288 .. 317]` - the same 30 entries `FlushRow()` calls the
+  distance slots.
+* `+0x910` is `ROW_SYMBOLS[256]`: how many bits the row's end-of-block code
+  needs. `sub_407090` reads it *after* rebuilding the code lengths, so it is the
+  length the row's own code gives symbol 256, not a separate counter.
+
+And one field is not in the record at all: `dword_42F370[646 * row]`, the row's
+limit, is the `/b` block list's `end` field - see the `Pieces recovered` notes.
 
 ### sub_4053D0, the row writer
 
@@ -455,14 +598,16 @@ is polled every 64K bytes and aborts with −1.
 
 ### Still open
 
-* `sub_405A60` (`BuildDistanceSlots()`) fills `dword_6D5578[]` with 30 slots
-  from the length half and 29 from the distance half, 4096 meaning "no match";
-  builds `byte_185BA90[]` when the strategy is Xtreme; and finishes with the two
-  `sub_405800` calls. Note that both halves are arrays of *code lengths* - what
-  is added is the number of extra bits - so it is a comparison key for the
-  match search, not a length or a distance.
 * The CRC table's single writer sits 4 bytes above all 18 readers
   (`0x185BABC` vs `0x185BAB8`). Modelled at the readers' address.
+
+`sub_405A60` (`BuildDistanceSlots()`) is described above and is done: it fills
+`dword_6D5578[]` with 30 slots from the length half and 29 from the distance
+half, 4096 meaning "no match"; builds `byte_185BA90[]` when the strategy is
+Xtreme; and finishes by turning the row's code lengths into `LitCodes[]` and
+`DistCodes[]`. Note that both halves are arrays of *code lengths* - what is added
+is the number of extra bits - so it is a comparison key for the match search, not
+a length or a distance.
 
 ### sub_408000, the /b block splitter
 
@@ -733,6 +878,16 @@ and it still goes through the Adler-32, and it is *inside* `LinBufBytes`. That
 last point is what makes the row length come out right: the original computes
 the count as `(LinBufBytes * 0x10001) ^ 0xFFFF0000`, which is LEN and ~LEN as
 two little endian 16 bit fields — the header of a zlib **stored** deflate block.
+
+The compressed path uses the same global with **no** `+1`, because
+`sub_405150` computes it as `(bitdepth * width + 7) >> 3` and `FilterSample()`
+counts sample bytes, emitting the filter type separately on the call where
+`BitBufPos` is still 0. So `LinBufBytes` means two different things in the two
+paths - the *whole* stored row in one, the *number of calls* per row in the
+other - which is the same in the compressed path for a different reason: there the
+buffer holds **one dword per call**, not per byte, and a call is a pixel however
+many bytes the colour type gives it. That is why the RGB and RGBA paths get
+`width` here and not `3 * width` / `4 * width`.
 So each row is
 
 ```
@@ -781,10 +936,18 @@ from losing it:
 if ((n & mask) != mask && n != width - 1) goto next sample
 ```
 
-### Still to do inside Optimize
+### Nothing left inside Optimize
 
-`sub_402AD0` itself (5 983 listing lines), the timing `sub_4063F0`'s caller, and
-the `.bss` globals they both use.
+`sub_402AD0` is reconstructed: the colour type and bit depth decision, the closed
+form size estimate, the `/s4` shortcut, the trial loop, the block splitting and
+the timing. `tools\pngcheck.cmd` round trips all of it.
+
+The one thing that is still worth a second opinion is the length table's aliasing
+(above): the reconstruction builds `LenPairs[]` last and reads it by slot, which
+is what the original's *intent* is, but the original's actual reads for codes 30
+to 58 land in the distance table that overlaps it in memory. The two agree
+everywhere except the last length code, so the only visible difference is in the
+extra bits of a 258 byte match.
 
 ## DecodeImage (0x409560): how it fits together
 
@@ -854,10 +1017,366 @@ of `1 << bitdepth` entries is generated into `dword_190A420` with step
 
 * width and height are `_byteswap_ulong` of a DWORD and must be greater than 0
 * bit depth must satisfy `(1 << depth) & 0x116`, so 1, 2, 4 or 8
-* colour type must satisfy `(1 << type) & 0x5D`, so 0, 2, 3, 4 or 6
+* colour type must satisfy `(1 << type) & 0x5D`, so 0, 2, 4 or 6
 * compression and filter methods must both be 0, interlace must be below 2
 * `dword_18DB268 = interlace * 7`
 * PLTE: entry count is `len / 3`, read backwards three bytes at a time
+
+### The PNG chunk walk, `0x409680` ... `0x409A3B`
+
+The signature is checked as two DWORDs, `0x474E5089` and `0x0A1A0A0D`, and
+`dword_18D4350` (the transparent RGB triple) is cleared first. Then one loop
+walks the chunks. Each iteration caches the cursor twice, once pointing at the
+`len,tag` header and once at the data, and `next = data + len + 4` skips the
+CRC. Only four tags are recognised; **everything else, CRC and all, is skipped
+without a CRC check**, so PNGOUT accepts corrupt ancillary chunks.
+
+Tags are matched as the little-endian DWORD at `data - 4`: IHDR `0x52444849`,
+PLTE `0x504C5445`, bKGD `0x624B4744`, tRNS `0x534E5274`, IDAT `0x54414449`.
+
+`dword_190A420` is a single 256 entry table at `0x190A420..0x190A81F` that
+serves as *both* the greyscale ramp and the palette, with `dword_190A820` right
+after it holding the entry count. Three things fill it:
+
+* **IHDR**, for colour types 0 and 4 only, builds the ramp
+  `dword_190A420[i] = 0xFF000000 + i * 0x010101 * (255 / maxval)`, and sets
+  `dword_190A820 = 1 << depth`.
+* **PLTE** sets `dword_190A820 = len / 3` and writes
+  `dword_190A420[i] = (bswap32(data + 3*i) >> 8) | 0xFF000000`, backwards.
+* **IDAT** setup, for bit depths below 8, expands whichever of the two is
+  present out to a full 256 entries, so the per-pixel reader can index by a raw
+  byte: depth 1 does `pal[j] = pal[j & 1]` from 2, depth 2 does `pal[k] =
+  pal[k & 3]` from 4, depth 4 does `pal[m] = pal[m & 15]` from 16.
+
+**tRNS** never allocates a second table. For colour type 0 with depth ≤ 8 it
+sets `HIBYTE(dword_190A420[data[1]]) = 0`, and for colour type 3 it walks
+`i` from `min(len, palcount) - 1` down to 0 doing
+
+```c
+dword_190A420[i] = (dword_190A420[i] & 0x00FFFFFF) | (data[i] << 24);
+```
+
+IDA names the store `dword_190A424[--i]`, which looks like a second array, but
+`0x190A424 + 4 * (i - 1) == 0x190A420 + 4 * i`, so the `dec` and the +4 base
+offset cancel and the update is in place on `dword_190A420[i]`. The same four
+bytes are reused as a scalar by `sub_40D560` (the BMP decoder), which is why IDA
+hinted two conflicting types. Colour type 2 with depth 8 instead stores the
+single triple `dword_18D4350`, which `sub_40A8D0` compares against per pixel.
+
+**bKGD** is stored separately, in `dword_190A3FC`, and split out to the three
+channels `dword_411070`, `dword_411074`, `dword_411078`. Colour types 0 and 4
+scale the 16 bit value through the same ramp formula; 2 and 6 use the byte
+formula at depth 8 and `(sample / 257)` at depth 16; type 3 just looks the index
+up in the table. Colour types other than 0, 2, 3, 4, 6 leave it alone.
+
+### IDAT setup at `0x409A3B`
+
+Everything up to here is pure chunk parsing. Reaching IDAT is the only way out
+of the loop, so the first IDAT wins and later ones are handled by the pump. The
+setup is:
+
+```c
+dword_18DB740 = data + len - 4;   /* the tail; the offset counts back to data */
+dword_18DEE44 = 32 - 8 * len;     /* so the first read lands exactly on data */
+dword_18D8F58 = 0;                /* not reading from a FILE * */
+dword_18DB478 = 0;                /* no chunk staged yet */
+```
+
+then the seven remaining arguments are copied out, and a colour type switch fills
+the per-sample channel ring the unfilter and pixel readers use:
+
+| colour type | effect |
+|---|---|
+| 0, 3 | `dword_18DB85C[0] = 0`, a one slot ring |
+| 2 | `dword_18DB860 = 2`, so the ring is 1, 2, 0 |
+| 4 | `dword_18DB860 = 0`, so the ring is 1, 0 |
+| 6 | `dword_18DB860 = 2` and additionally `dword_18DB864 = 3`, `dword_18DB868 = 0`, so the ring is 1, 2, 3, 0 |
+
+`dword_18DB85C[0] = 1` for every type that has an alpha slot. The ring is
+explained under **The unfilter** below.
+
+The argument plumbing, for whoever writes the C: `arg_8` is the destination
+base, `arg_C` the pitch, `arg_10` and `arg_14` reach the row-edge clamps,
+`arg_18` an x origin and `arg_1C` a row or plane index.
+
+### Samples per pixel, and the row byte count
+
+The constant `0x04021301`, shifted by `4 * colourtype` and masked with `0xF`, is
+the sample count per pixel: **{0:1, 2:3, 3:1, 4:2, 6:4}**. Palettised PNG is one
+"sample" per pixel, namely the index. So `dword_18DB26C = width * samples`, then
+converted to bytes by bit depth, `(x + 7) >> 3`, `(x + 3) >> 2`, `(x + 1) >> 1`
+and identity for 1, 2, 4 and 8.
+
+`sub_40A630` recomputes the same figure per Adam7 pass, which is where the
+sub-8-bit expansion above matters.
+
+### The bit reader and the input pump
+
+`dword_18DEE44` is a signed bit offset and `dword_18DB740` a byte pointer. A read
+of *n* bits is always
+
+```c
+eax = dword_18DEE44;                       /* the offset */
+v   = *(unsigned *)(dword_18DB740 + (eax >> 3));
+v >>= (eax & 7);                           /* arithmetic: the offset can be negative */
+v &= mask[n];
+dword_18DEE44 = eax + n;
+if (dword_18DEE44 >= 0) { sub_40A340(); eax = dword_18DEE44; }
+```
+
+so the offset counts **up towards zero** from a large negative value, and the
+pointer is anchored at the *end* of the region rather than the start. The
+negative shift `eax >> 3` walks the bytes backwards, which is why the anchor is
+the tail.
+
+IDAT setup exploits that:
+
+```c
+dword_18DB740 = data + len - 4;    /* the last 4 bytes of the data */
+dword_18DEE44 = 32 - 8 * len;      /* so (data + len - 4) + ((32-8len) >> 3) == data */
+```
+
+The pump fires as soon as an offset after a read would be non-negative, and has
+three cases:
+
+* **`dword_18D8F58` set**, reading from a `FILE *`: refill the window at
+  `unk_18FA1C4` with `fread`, at most `0xFFFC` bytes, and subtract `0x7FFE0`
+  (that is `8 * 65532`) from the offset.
+* **`dword_18DB478` set**, a chunk already staged: just move the anchor to the
+  next chunk header and add `32 - 8 * dword_18DEDE8`.
+* otherwise, stage the *next* chunk: read its length from `[anchor + 8]`, set
+  `dword_18DB478 = anchor + 8 + len + 12` (header plus data plus CRC plus
+  header), copy `[anchor + 0]` into `dword_18D8F5C` and, when the next tag at
+  `[anchor + 0xC]` really is IDAT, `[anchor + 0x10]` into `dword_18D8F60`; point
+  `dword_18DB740` at `dword_18D8F60` and subtract 32.
+
+The staging trick is neat and worth spelling out: `dword_18D8F5C` holds a copy
+of the 4 bytes the old anchor pointed at and `dword_18D8F60` the next chunk's
+first 4 data bytes, and those two live adjacently in `.bss`. Swapping the anchor
+onto them and rebasing the offset keeps reads running across the boundary without
+a copy.
+
+**Two quirks here are in the original and must be kept.** The staged length
+`dword_18DEDE8` is read once and never refreshed, so every IDAT after the first
+is walked using the *first* one's length; and the tag is only checked when
+staging, so continuation chunks are taken on trust. Well-formed files with
+uniform IDAT sizes are unaffected.
+
+### The inflate body, `0x409B40` ... `0x40A31E`
+
+It is a `puff.c` descendant, and the structure is completely explicit:
+
+```
+bfinal = read 1;  btype = read 2;
+```
+
+* **btype 0, stored.** Discard bits to the byte boundary, read `len` and
+  `nlen`, and bail out unless `len == ~nlen`. A zero length ends the image. The
+  bytes go into a **16 KB circular window** at `byte_18E1098`, handed to
+  `sub_40A8D0` in 16 KB chunks.
+* **btype 1, fixed.** The code lengths are written out with five `rep stosd`
+  runs, 144 entries of 8, 112 of 9, 24 of 7 and 8 of 8 at `dword_18DEE78`, then
+  32 distances of 5 at `unk_18DF2F8`, with `arg_C = 32`. The four literal runs
+  are contiguous, which is a free consistency check on the layout:
+  `0x18DEE78 + 144*4 == 0x18DF0B8`, `+112*4 == 0x18DF278`, `+24*4 == 0x18DF2D8`.
+* **btype 2, dynamic.** `HLIT = read 5 + 257`, `HDIST = read 5 + 1`,
+  `HCLEN = read 4 + 4`, then `HCLEN` code lengths of 3 bits each indexed through
+  the permutation table `dword_411080[]`, the remainder of that 19 entry table
+  zeroed, and the lengths read with `puff`'s 16/17/18 repeat codes. A
+  `dword_190A400` counter ticks once per dynamic block.
+* **btype 3** is rejected, as it should be.
+
+`dword_18DEE78` is a single flat array: the `HLIT` literal/length lengths at
+`[0 .. HLIT-1]` and the `HDIST` distance lengths at `[HLIT .. HLIT+HDIST-1]`.
+
+Each of the two tables is then compiled twice, once slowly and once fast:
+
+```c
+sub_40A580(offs,            count, bitcounts, work);
+sub_40A4A0(bitcounts, work, symbols,   codes, maxbits);
+```
+
+`sub_40A580` is puff's `construct()`, and `sub_40A4A0` builds a direct lookup
+table. The hot loop peeks 9 bits (6 for distances) into `codes[]`; a non-zero
+entry means "this many extra bits to skip and the symbol is in `symbols[]`",
+while a zero means the code is longer than the peek, so it falls back to
+`sub_40A440`, puff's `decode()` bit at a time.
+
+Lengths and distances come from the tables `sub_40AF90` built, one 8 byte
+`{extra, base}` pair per entry and indexed by the raw symbol:
+
+* length: `dword_18DBA98[sym].extra` / `dword_18DBA9C[sym].base`, symbol 257 up
+* distance: `dword_18DC1B0[dsym].extra` / `dword_18DC1B4[dsym].base`
+
+The extra bits are masked with `dword_4100D8[extra]`, the shared bit table.
+
+The copy is byte at a time through the circular window, `src = write - dist`,
+which is what makes overlapping matches expand correctly:
+
+```c
+src = write - dist;  end = write + len;
+do { w[write & 0x7FFF] = w[src++ & 0x7FFF]; } while (++write < end);
+```
+
+At the end of the stream the tail is flushed, and if the last partial block
+crossed the 16 KB boundary it is flushed in two pieces. The wrap test is
+`((start ^ write) & 0xFF00) & 0x8000`, i.e. bit 8 of the XOR: `start` is always
+a multiple of `0x4000` so it contributes nothing to bit 8, leaving "has the
+write index passed 0x10000".
+
+**Returning 0 clears `dword_190A820` when the colour type is 4**, the only sign
+that grey+alpha has no palette.
+
+### The unfilter, `sub_40A8D0`
+
+It is handed 16 KB at a time and keeps three byte rows alive across calls:
+
+| global | role |
+|---|---|
+| `dword_18FA1C0 + i` | the `b` neighbour, the row above, walked **downwards** from `dword_18DB26C` so offset 0 goes unused |
+| `dword_18CBF68 + ch` | the `a` neighbour, left |
+| `dword_18CBF54 + ch` | the `c` neighbour, up-left |
+
+`dword_18DB85C[]` is a little ring of channel indices and `dword_18DC38C` is the
+slot currently in use. IDAT setup fills the ring, and the first slot is
+`dword_18DB85C[0]`:
+
+| colour type | ring |
+|---|---|
+| 0, 3 | `0` |
+| 2 | 1, 2, 0 |
+| 4 | 1, 0 |
+| 6 | 1, 2, 3, 0 |
+
+So slots 1, 2 and 3 are R, G and B, and slot 0 is the alpha slot, which the
+types without alpha simply leave unused. The five filters are the PNG five, but
+two details are PNGOUT's own:
+
+* `if (filter == dword_4110CC) filter = 5`, so a filter byte equal to
+  `dword_4110CC` is redirected to case 5. That global lives in `.data` and
+  `sub_40AF90` also writes 4 to it, so in practice **filter 4, the Paeth byte,
+  is decoded as PNGOUT's own predictor.**
+* case 4 calls `sub_40AF40`; case 5 has the same thing inlined against an
+  absolute-value table at `0x18D6A40`, reached by folding the row offset into
+  the address, so the three lookups land at `T[c-b]`, `T[2c-a-b]` and `T[c-a]`.
+
+Those two copies of the predictor are not the same code. `sub_40AF40` returns
+`a` on `d2 <= d3 && d2 <= d1`; the inline returns `b` when `d2 == d3 && d1 >=
+d2`, having first swapped `c` for `a`. They disagree on 511 of the 261 121
+`(a-c, b-c)` pairs — but in every one of those `a == b`, so **the value returned
+is identical over the whole byte domain**, which brute force confirms. The
+branches differ, the answers do not. `src/predict.c` matches `sub_40AF40`
+instruction for instruction and needs no change.
+
+A row ends when `dword_18D9FA4`, the bytes left in it, reaches zero, which then
+advances `dword_18DA23C` by `dword_18DA234`, clears the left and up-left slots,
+resets the counter to `dword_18DB26C`, and when the pass is done drops
+`dword_18DB268` and calls `sub_40A630` again. Only once a row is complete does
+the tail of the function expand it into pixels.
+
+### The pixel expansion, and what colour type 4 really is
+
+The expansion walks `v26` down from `dword_18DB270` to `dword_18DB274` writing
+`0xFFBBGGRR` at `dword_18CBF00` and striding by `dword_18D9F90`. Type 2 folds
+`dword_18D4350` in on the way, clearing the alpha byte of any pixel matching the
+tRNS triple. Type 6 writes four bytes. Types 0 and 3 index `dword_190A420` with
+the packed sample, once per pixel or per bit, with the shift out of `v26 & 7`,
+`& 6` or `& 4` for depths 1, 2 and 4.
+
+**Type 4 answers the question the round trip left open.** It reads two bytes per
+pixel, one below the other in the reversed row:
+
+```c
+grey  = dword_190A420[ up[v26] ] & 0x00FFFFFF;   /* R = G = B */
+out   = grey | bswap32( up[v26 - 1] );            /* the byte lands in byte 3 */
+```
+
+`v26` runs down from twice the pixel count while the row's bytes sit at offsets
+1..2*pixels, so `up[v26]` is the row's **first** byte and `up[v26-1]` the second:
+PNG's order, grey then alpha, is preserved on the way in, and the internal pixel
+comes out as `0xAARRGGBB` with R = G = B = the ramp entry.
+
+Which of the two bytes the *encoder* puts in which slot is a separate question
+and `sub_407B00` argues against the obvious answer: every one of its five cases
+takes bytes 0 and 1 of the internal DWORD, low byte first, which is what
+`FilterSample(pixel, 2)` already does. Under the layout above those two bytes
+are B and G, both the grey, so the alpha in byte 3 would never be emitted.
+Either PNGOUT really does lose the alpha re-encoding grey+alpha, or
+`sub_407B00` is not the route type 4 takes. There is no reference binary in the
+tree to settle it, so it stays open; what is settled is that the decoder puts
+alpha in byte 3.
+
+### The Huffman helpers, and how they were checked
+
+`sub_40A580`, `sub_40A4A0` and `sub_40A440` were transcribed into a throwaway
+model and driven against every IDAT in `build/`, comparing with `zlib`. That
+settled three things the listing alone does not, and caught two mistakes in my
+own reading:
+
+* `sub_40A580` is puff's `construct()`. It counts `h[0..30]` from the lengths,
+  prefix sums into `offs[0..31]`, then assigns `symbols[offs[len]++] = i`. The
+  assignment **bumps `offs[len]` in place**, so what the consumers see is
+  `offs[k] == sum(h[0..k])`, the *inclusive* cumulative array. Both consumers
+  read that array starting at its first entry; reading it unshifted is what
+  made `sub_40A440` look like a different function.
+* `sub_40A4A0` builds the direct table keyed by the **bit-reversed** code. The
+  inner loop `shr edx,1 / adc eax,eax`, run `maxbits` times, takes bit 0 into
+  CF first and appends it as the new low bit, so it is a true reversal, not the
+  "it just masks" reading it looks like. Slot counts come from `MASK[maxbits-L]`
+  with `maxbits - L` counted down, giving `2^(maxbits-L)` slots a symbol, which
+  is what fills the high (wildcard) bits. **0 mismatches** against canonical
+  deflate codes for the fixed table and for every literal (maxbits 9) and
+  distance (maxbits 6) table in the corpus. Symbols whose codes are longer than
+  `maxbits` correctly get no entry and fall through to `sub_40A440`.
+* `sub_40A440` is puff's `decode()` exactly. `esi` is reloaded as the data
+  pointer every iteration, so it holds only the current bit, and the recurrence
+  is `v = (bit + offs[len] - offs[len+1]) + 2*v` with `v < 0` as the stop test.
+  The return index `offs[len] + v` then equals `index + (code - first)`. This
+  was confirmed symbol-for-symbol against `puff` over 40 consecutive symbols.
+
+Two things the fast path does that are easy to get wrong: it **peeks without
+consuming** and then advances only by `codes[peek]`, and it only does that when
+`codes[peek]` is non-zero.
+
+**Still open: the order of the extra bits.** The listing reads them as
+`sar edi, cl; and edi, mask` with `cl = offset & 7`, and the offset counts up,
+so within a byte the bits arrive **least significant first**. RFC 1951 stores
+them most significant first, and the same LSB-first reader is used for the
+Huffman codes, where the reversal in `sub_40A4A0` compensates. For the extra
+bits there is no visible compensating reversal, and the two readings really do
+differ: modelling both and running the corpus end to end, MSB-first gets
+further (6 files decode exactly, the rest diverge mid-stream) while LSB-first
+fails immediately on the first multi-bit field. So at least one of my readings
+is wrong, and it is not the Huffman side, which is now verified. Note also that
+`dword_18DBA98` and `unk_18DC2A0` are the same array seen through two symbols:
+`0x18DC2A0 - 0x18DBA98 == 0x808 == 257 * 8`, and the inflate body indexes it by
+the raw symbol, so `dword_18DBA98[sym]` is entry `sym - 257` of the length table
+`sub_40AF90` builds. That table is the standard one for symbols 257 to 284, and
+it stops there - 285, the 258 byte code, is not in the table at all.
+
+### The Adam7 tables in `sub_40A630`
+
+`sub_40A630` starts at pass `dword_18DB268` (= interlace * 7) and walks **down**
+to pass 2, stopping at the first pass whose tile is non-empty, so interlaced
+images simply skip their empty trailing passes. The tables are nibble constants
+shifted by `4 * pass`:
+
+| constant | shift | per-pass value |
+|---|---|---|
+| `0x04020100` | `xstart = (c >> 4p) & 0xF` | 0 0 1 0 2 0 4 |
+| `loc_402010` (the *address*, not a constant) | `ystart = (addr >> 4p) & 0xF` | 0 1 0 2 0 4 0 |
+| `0x33221100` | `1 << log2step` → `dword_18D9F90` | 1 1 2 2 4 4 8 |
+| `0x33322110` | `1 << log2step` → `dword_18DA234` | 1 2 2 4 4 8 8 |
+
+The X start is an immediate constant while the Y start is a shift of the
+instruction's own operand address, which is why only the first shows up as a
+literal in a hex dump.
+
+Those starts are **not** the spec's Adam7 grid (`0 4 0 2 0 1 0` by `0 0 4 0 2
+0 1`); they are its transpose, and the two step tables disagree with a plain
+transpose as well. Before any of this is transcribed it has to be checked
+against the encoder's Adam7 emission, because a mismatch would only show up as
+corrupted interlaced output. Recorded here as measured, not as understood.
 
 ### The unidentified 8bpp format (`0x40D150`)
 
@@ -875,23 +1394,174 @@ named `FMT_PAL8`.
 
 ### Still to do inside DecodeImage
 
-The bit-level details of the inflate body (`0x409B40` ... `0x40A31E`), the PNG
-unfilter in `sub_40A8D0`, the Adam7 path in `sub_40A630`, the six other
-decoders, the baseline JPEG decoder in `sub_40B180` (3 492 lines, by far the
-largest), and the entropy coder around `sub_40AF90`. The 22 MB of `.bss` these
-use also has to be re-declared.
+The chunk walk, the inflate body, the unfilter and three of the four Huffman
+helpers are worked through, so what is left splits cleanly:
+
+* `sub_40A580` / `sub_40A4A0` / `sub_40A440`, the Huffman helpers. Transcribed
+  and checked against zlib: all three reproduce puff's `construct`, a correct
+  direct table, and puff's `decode` exactly. The bodies themselves are still to
+  be written out in C.
+* Transcribing any of the above. Nothing has been written to `src\` for
+  `DecodeImage` yet, so a build still reports it unimplemented rather than
+  guessing at the inflate path.
+* `sub_40A630`, the Adam7 path, once the encoder side settles the table
+  question above.
+* Which of a type 4 sample's two bytes the encoder emits. See **The pixel
+  expansion**.
+* The other six decoders, the baseline JPEG decoder in `sub_40B180` (3 492
+  lines, by far the largest), and re-declaring the 22 MB of `.bss` they use.
 
 ## Verification so far
 
 Two independent checks, both runnable.
 
+### tools\pngcheck.cmd - round-trip verification
+
+`tools\pngcheck.c` runs `Optimize()` over a set of images and writes each result
+plus the source pixels; `tools\pngcheck.py` then parses the PNG, checks every
+chunk CRC, hands the IDAT payloads to zlib, undoes the per row filters and
+compares every sample against the source. The unit test can only check the output
+*structurally*; this checks it inflates and carries the right pixels, which is
+the failure mode a structural check cannot see. `tools\lztrace.py` goes one level
+deeper and walks the deflate block symbol by symbol, which is what you want when
+the stream is short rather than merely wrong.
+
+```
+tools\pngcheck.cmd            build the driver, run it, verify
+tools\pngcheck.cmd run        skip the build
+tools\pngcheck.cmd build      build the driver and stop
+```
+
+The driver takes a case selector, which is what makes a failure bisectable -
+a case number on its own, or one plus a comma separated list of others:
+
+```
+build\pngcheck.exe 7          just case 7
+build\pngcheck.exe 7 5,9      cases 7, 5 and 9, in case order
+```
+
+30 cases, and every one of them round trips: all five `/s` strategies, `/r`, a
+ramp, noise and a flat field, forced colour types 0, 2, 3 and 6, an image that
+needs alpha and one that needs it because the same grey is both opaque and
+see-through, each of the five fixed filters, `/n2` and `/n8`, `/b64` and `/b8`,
+odd widths and a one row image. That is every colour type `FilterSample()` can
+feed except 4, every filter, every strategy, all three `SeedBlockTables()`
+presets and both block splitting modes.
+
+### Known defects
+
+`tools\pngcheck.cmd` found eleven. All are fixed; the round trip is clean over
+all 30 cases. The last four were found together and are worth reading together,
+because they are all the same mistake - a field of the row record addressed by
+the wrong offset - in four different places.
+
+* **Fixed - `FinishBlock()` wrote the IDAT length in the wrong place.**
+  `EmitBytes()` appends at `OutCount`, so the four bytes went out at the *end* of
+  the stream instead of being patched back into the chunk header at `ChunkStart`.
+  Every compressed PNG carried a nonsense length - in practice `0x89504E47`, the
+  file's own signature, which is what `Scratch` held when the chunk was opened.
+* **Fixed - no deflate block was ever closed.** `FilterSample()` ended its row
+  with a call through `BlockFullHook`, a function pointer that nothing ever
+  assigned, so `FinishBlock()` never ran: no BFINAL, no Adler-32, no block CRC
+  and no length patch. The original does a direct `jmp loc_4075B0` at the end of
+  `sub_407D80` / `sub_4077C0` / `sub_407B00` / `sub_4071D0`, and it is a real call
+  now.
+* **Fixed - the PLTE, tRNS and bKGD CRCs were wrong.** `WritePngHeader()` seeded
+  the running CRC from `ChunkCrc()`, which returns the *finished* (complemented)
+  CRC, and then kept folding - a double complement. It also declared `crc` as a
+  signed `int`, so `crc >> 8` was an arithmetic shift once the running value went
+  negative. `ChunkCrc()` was always right because it keeps its own accumulator
+  unsigned, which is why IHDR's CRC passed and only the chunks whose CRC is
+  continued after the tag were wrong.
+* **Fixed - the zlib header went out byte for byte reversed.** The two bytes are
+  0x78 then 0x5E - `CMF` = 8 with a 32K window, and `FLG` chosen so
+  `0x78 * 256 + 0x5E` is 31 * 994 exactly. But `PNGOUT_MARK` is 0x5E78, so
+  `>> 8` is 0x5E, and writing that first put 0x5E where the compression-method
+  byte belongs: `CMF = 0x5E` claims compression method 14, which does not exist,
+  and every compressed PNG was rejected with *"incorrect header check"*. Read back
+  the other way the same two bytes are the little endian DWORD 0x5E78 = 24184, so
+  this is also the value `main()` recognises a file of ours by.
+* **Fixed - `ROW_LIMIT` did not point at anything.** It was `(0x1018 / 4)`, which
+  is a dword *past* the end of the row record, so `cap = min(writePos, rowend)`
+  compared against whatever happens to be there and `end <= cap` never held. No
+  match was ever accepted and every row was closed as soon as it was opened - a
+  whole image came out as 368 literals where 5 symbols would do. See the row
+  record notes above.
+* **Fixed - `SeedBlockTables()` wrote the code lengths 16 bytes too high.**
+  `samples + ROW_SYMBOLS` is field `+0x520`, not `+0x510`, so every literal's
+  length stayed zero, every match cost more than a literal, and the compressor
+  emitted nothing but literals even once `ROW_LIMIT` was right. The three presets
+  all write *one* contiguous run of 320 dwords at `+0x510`; the original reaches it
+  through three different addresses and they happen to be one array.
+* **Fixed - `InitBlockTables()` never cleared `MatchLimit`.** The reconstruction
+  had `LensScratch[ROW_SAMPLE_MAX - 1] = 0` standing in for `dword_412668 = 0`,
+  which is the wrong storage. It only worked because the first image in a process
+  found `.bss` zeroed; from the second image on, a stale `MatchLimit` from the
+  previous run sat past the end of the new one, `pos != furthest` held for every
+  position, and the block was closed with nothing in it.
+* **Fixed - `FilterSample()` emitted the bytes of a sample in ascending order.**
+  They go out 2, 1, 0 for 24 bit and 2, 1, 0, 3 for 32 bit, which is PNG's R, G, B
+  order because an internal pixel is one DWORD with B, G, R, A from the bottom
+  up; only the 1 and 2 byte cases walk upwards. Every RGB image came out with its
+  red and blue channels exchanged - and nothing noticed, because the stream still
+  inflates and the length is still right.
+* **Fixed - `FilterPredict()` measured its first distance from the wrong sample.**
+  `sub_40AF40` builds `|a + b - 2c|`, not `|a + c - 2b|`, so it is the sample
+  *diagonally above and to the left* that the three candidates are compared
+  against, not the one above. On most triples the two disagree.
+* **Fixed - the end-of-block code was a variable nothing wrote.** `dword_6F6A78`
+  is not its own variable: it is `dword_6F6678 + 256`, i.e. `LitCodes[256]`, and
+  `AdvanceRow()` writes it with the row's own length for symbol 256 to close
+  every block. Modelled as a separate `int` it kept whatever `.data` held, which
+  happened to be a legal 7 bit code for the seeded tables, so the common cases
+  closed by accident - and `/s3`, whose seed gives symbol 256 a 9 bit code, did
+  not close at all: the stream came out one symbol long and zlib reported
+  *"incomplete or truncated stream"*.
+
+Two more things the round trip turned up that are not defects but are worth
+knowing, because a test image can trip over them:
+
+* **A greyscale image can only have one see-through colour.** Colour type 0 and 3
+  both reach the samples through `FindColor()`, which compares the whole DWORD -
+  alpha included. For colour type 0 the "palette" is the ramp `0xFF000000 +
+  k * step`, and `loc_403019` splices `MinSample` in at its own index, so exactly
+  one entry can carry a transparent alpha. An image with several *different*
+  fully transparent greys therefore looks up misses, and `FindColor()` returns -1,
+  which reaches the filter as the byte 0xFF. The same cap applies to colour type
+  3: an image with more than 256 distinct pixels cannot be named by a PLTE.
+  `tools\pngcheck.c` keeps its test pictures inside both limits, and says so.
+* **A palette's tRNS is a prefix.** One alpha per entry from index 0 up to the
+  last entry that is not opaque; the rest are left out, which PNG reads as opaque.
+  Entries can repeat the same RGB and differ only in that alpha, which is exactly
+  what happens to a picture whose greys are both opaque and see-through, so
+  `tools\pngcheck.py` matches palette entries on `(RGB, alpha)` rather than RGB
+  alone.
+
+`tools\lztrace.py` is what pinned the last two down: it walks the deflate block
+symbol by symbol, which is the only way to tell "the block never ended" from
+"the block ended in the wrong place" - zlib only says the stream is short. It is
+validated by pointing it at a PNG built by Python's `zlib`, which it decodes
+cleanly and whose symbol count it reports exactly. (Note that `zlib` writes
+`78 da` for its own streams where PNGOUT writes `78 5e` - both are valid headers,
+and which one you get is just the compression level.)
+
+Colour type 4 is the one type the round trip cannot cover. The decoder side is
+settled now — see **The pixel expansion** for what a type 4 sample means
+internally — but `sub_407B00`, the 2 byte filter, emits bytes 0 and 1 of the
+internal DWORD, and under that layout both of those are the grey. So either the
+encoder really does drop the alpha re-encoding grey+alpha, or type 4 does not
+reach `sub_407B00` at all; there is no reference binary here to say which, and
+guessing would put a wrong byte order into the encoder. Every other colour type
+round trips: 0, 2, 3 and 6 are all in `tools\pngcheck.c`.
+
 ### tools\selftest.cmd
 
-488 checks over the recovered code: `Swap16`, `GetImageSize` for all
+525 checks over the recovered code: `Swap16`, `GetImageSize` for all
 eight format codes, the `/k` list handling in `ScanChunks`, `FilterPredict()`,
-`CpuFeatures()`, and the optimiser primitives (CRC table, Huffman heap, colour
-hash, `PutBits()`/`EmitBytes()`, `RankValues()`, `FlushRow()`, `WritePngHeader()`, `EstimateEntropy()`, `BestSplit()`, `PlanBlocks()` with its block-end sort, `FilterByte()` with `Adler32Update()`, `AdvanceRow()`, `LzCode()`, and `WriteStored()`).
-They caught fourteen real defects, all now fixed:
+`CpuFeatures()`, the optimiser primitives (CRC table, Huffman heap, colour
+hash, `PutBits()`/`EmitBytes()`, `RankValues()`, `FlushRow()`, `WritePngHeader()`, `EstimateEntropy()`, `BestSplit()`, `PlanBlocks()` with its block-end sort, `FilterByte()` with `Adler32Update()`, `AdvanceRow()`, `LzCode()`, and `WriteStored()`), and `Optimize()` end to end.
+They caught twenty real defects, all now fixed, plus the eleven that
+`tools\pngcheck.cmd` found (see **Known defects** above):
 
 * PNG dimensions are **4 byte** big endian, not 2 byte. `GetImageSize` was
   using `Swap16` where the original calls `_byteswap_ulong` on a DWORD.
@@ -961,6 +1631,38 @@ They caught fourteen real defects, all now fixed:
   checked by every decoder so the PNG is unreadable. Found by handing the
   output to Python's `zlib`, which rejected it with "incorrect data check"
   while every structural check passed.
+* **The greyscale test was a mask, not the original's shifted halves.**
+  `(v & 0xFFFF00FF) == ((v & 0xFF00) << 8)` is zero only for a pixel whose
+  *blue* byte is zero, so it called every ordinary grey a colour and sent
+  greyscale images to a palette. The original's `(v & 0xFFFF) << 8` against
+  `v & 0xFFFF00` is the real `R == G == B` test.
+* **`MinSample` was compared signed.** It starts at `0xFFFFFFFF` and the loop's
+  `jnb` is an unsigned compare, so a transparent black (`0x00000000`) has to
+  win it. Signed, 0 is greater than -1 and the transparent background was never
+  noticed - which is the very pixel that decides whether the image needs alpha.
+* **`InitColorHash()` was called again when building the palette.** The original
+  (`loc_40327E`) only calls `FindColor()` and counts; the palette and the hash
+  were already built by the classification pass. Re-seeding made every pixel
+  look new and appended a second copy of the palette.
+* **`dword_180A568` was declared as two variables.** `CountByte()` counts into
+  it and `EstimateEntropy()` decrements it to get the largest count to
+  tabulate; split in two, the decrement ran on a counter nothing incremented
+  and sized the table from `-1`, so every filter score came back "failed".
+* **`LinBufData` was never assigned.** The unit tests set it by hand, so the
+  filter tests passed while the real path wrote through whatever the previous
+  block left there and every trial loop crashed.
+* **`/f` with no number never got its default.** `loc_402ED4` turns a negative
+  `s->filter` into 5 ("mixed", pick per row) or 0 for a palette; left at -1 the
+  filter switch in `FilterSample()` matched no case and emitted no data at all.
+
+The filter byte order and the predictor's own distance (both of which
+`tools\pngcheck.cmd` caught) are covered above; the unit test now pins them too,
+against explicit byte values rather than against itself:
+
+* `FilterPredict()` is checked for all three of its outcomes on triples chosen so
+  that each one wins, and `FilterSample()` for the emitted byte order of all four
+  widths, because the order is the one thing a round trip cannot see - a stream
+  with its red and blue exchanged still inflates to the right number of bytes.
 
 They also exposed that the original's `strtok` loop in `ScanChunks` steps one
 byte past the terminating NUL after the last token, because it restores the
@@ -987,16 +1689,17 @@ copied verbatim next to an sBIT that is rebuilt.
 
 ### Import table
 
-Everything the original imports from the CRT stays visible in a partial build,
-so `dumpbin /imports build\pngout.exe` can be compared against the `extrn` list
-in `reference/idata.lst` even with the engines missing:
+`dumpbin /imports build\pngout.exe` compared against the `extrn` list in
+`reference/idata.lst` is the objective measure of how much of the original is
+actually reachable:
 
-* **51 of the original's 55 imports are present.** The only name this build
-  has that the original does not is `time`, which every stock VC6 `/MD` program
-  picks up from the CRT as soon as it uses `atof` or `printf("%f")` - a three
-  line program with just those two already imports it, so it says nothing about
-  the reconstruction. (IDA spells the ten `start` helpers `__imp_*` where
-  `dumpbin` says `*`; they are the same imports.)
+* **All 55 of the original's imports are present, with no extras.** This is the
+  acceptance test for `Optimize()`: the last four to appear were
+  `QueryPerformanceCounter`, `QueryPerformanceFrequency`, `rand` and `srand`,
+  precisely the ones used only by it - the "Took %.3f sec." timing and the `/r`
+  randomised initial tables. (IDA spells the ten `start` helpers `__imp_*` where
+  `dumpbin` says `*`, and prefixes CRT names with a cdecl underscore; both are
+  the same imports once the decoration is stripped.)
 * **USER32 and GDI32 match exactly**, in the same order: `OpenClipboard`,
   `GetClipboardData`, `CloseClipboard` / `DeleteDC`, `GetObjectA`,
   `CreateCompatibleDC`, `GetDIBits`.
@@ -1004,12 +1707,9 @@ in `reference/idata.lst` even with the engines missing:
   helpers (`__getmainargs`, `__p___commode`, `__p__fmode`, `__p___initenv`,
   `__set_app_type`, `__imp___initterm`, `__setusermatherr`, `_adjust_fdiv`,
   `__imp___except_handler3`, `__imp__controlfp`).
-* The four missing functions are **`QueryPerformanceCounter`,
-  `QueryPerformanceFrequency`, `rand` and `srand`**, precisely the ones used
-  only by `Optimize()`: the "Took %.3f sec." timing and the `/r` randomised
-  initial tables. **Their appearance is the acceptance test for that
-  function**: a correct `Optimize()` takes the import count to 55 with no
-  extras.
+* **KERNEL32 matches exactly**, all seven: `CreateFileA`,
+  `QueryPerformanceCounter`, `QueryPerformanceFrequency`, `GetFileTime`,
+  `CloseHandle`, `SetFileTime`, `GetTickCount`.
 
 `ShowUsage()` is byte exact, including the literal `0x7F` bytes in the `/f#`
 line that IDA had truncated at 36 characters. The error paths match too:
@@ -1071,11 +1771,14 @@ src/clipboard.c   ReadClipboard
 src/globals.c     .data
 src/optimize.c    CRC table, Huffman heap, colour hash, bit/byte output,
                   deflate tables, per row slots, the row writer, the PNG header,
-                  the /b block splitter, the /s4 stored writer
+                  the /b block splitter, the /s4 stored writer, and the two
+                  no-op defaults (NothingChanged, PutByte)
 src/lz.c          the LZ coder (sub_4065A0) and its byte sink (sub_406530)
+src/trials.c      Optimize() (sub_402AD0): the colour type / bit depth decision,
+                  the size estimate, the /s4 shortcut and the trial loop
 src/predict.c     FilterPredict
 src/cpuid.c       CpuFeatures
-src/stubs.c       the two unrecovered entry points, plus the math error handler
+src/stubs.c       the one unrecovered entry point, plus the math error handler
 tools/            extraction scripts, build.cmd, run.cmd, selftest.cmd, regen.cmd
 reference/        extracted listing/decompilation/strings (generated, gitignored)
 ```

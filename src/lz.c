@@ -330,7 +330,7 @@ int LzCode(const unsigned char *data, int len)
     }
 
     /* how far this row may reach: its own end, and never past what is written */
-    rowend = *ROWOF(RowIndex, ROW_LIMIT);
+    rowend = ROW_LIMIT(RowIndex);
     cap = (writePos < rowend) ? writePos : rowend;
 
     if (LzScan >= limit)
@@ -623,11 +623,11 @@ int LzCode(const unsigned char *data, int len)
 
         /* ---- 0x407000: close the row if it is full ---- */
         unk_42D7C8 = LzScan;
-        if (LzScan >= *ROWOF(RowIndex, ROW_LIMIT)) {
+        if (LzScan >= ROW_LIMIT(RowIndex)) {
             AdvanceRow();
             memset32(MatchCost, 0x7FFFFFFF, 512);
             MatchCost[LzScan & LZ_COSTMASK] = 0x80000000;
-            rowend = *ROWOF(RowIndex, ROW_LIMIT);
+            rowend = ROW_LIMIT(RowIndex);
             cap = (LzWrite < rowend) ? LzWrite : rowend;
         }
     }

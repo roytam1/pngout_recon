@@ -22,6 +22,21 @@
 #include "pngout.h"
 
 /* ------------------------------------------------------------------ */
+/*  sub_404D60: the "nothing happened" stub                           */
+/* ------------------------------------------------------------------ */
+
+/*
+ *  sub_404D60: `xor eax, eax; retn`.  It is installed in place of `s->msg` and
+ *  `s->checkesc` when the caller left either of them null, so Optimize() can call
+ *  both unconditionally - which is what it does, and why this has to exist at all
+ *  rather than being a null check at every call site.
+ */
+int NothingChanged(void)
+{
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /*  one deflate block -> one IDAT chunk                              */
 /* ------------------------------------------------------------------ */
 
@@ -62,6 +77,8 @@ int EmitBlock(unsigned width, unsigned height, int coltype, int bitdepth,
     /* one row's worth of filtered samples, and the work buffer is 8 bytes
        per output byte */
     LinBufBytes = (int)(bitdepth * width + 7) >> 3;
+    fprintf(stderr, "[blk] coltype=%d depth=%d width=%d LinBufBytes=%d\n",
+            coltype, bitdepth, (int)width, LinBufBytes);
     LinBufUsed = 0;
     BitBufPos = 0;
 
@@ -71,6 +88,13 @@ int EmitBlock(unsigned width, unsigned height, int coltype, int bitdepth,
     }
 
     LinBuf = (unsigned char *)malloc(8 * (size_t)LinBufBytes + 8);
+    /*
+     *  The filters index the buffer as dwords one past the allocation's base,
+     *  and the two row slots they alternate between are LinBufBytes dwords
+     *  apart.  LinBufData is that dword view; without it FilterSample() would
+     *  be writing through whatever was left there by the previous block.
+     */
+    LinBufData = (LinBuf != NULL) ? LinBuf + 4 : NULL;
     if (LinBuf == NULL) {
         if (ProgressMsg != NULL)
             ProgressMsg("\rmalloc failed (olinbuf)\n");
@@ -91,8 +115,22 @@ int EmitBlock(unsigned width, unsigned height, int coltype, int bitdepth,
     BitBuf = 0;
 
     PutBits(TAG_IDAT_, 32);
-    PutBits(PNGOUT_MARK >> 8, 8);              /* 0x78 */
-    PutBits(PNGOUT_MARK & 0xFF, 8);            /* 0x5E */
+
+    /*
+     *  The zlib header, and it is also how a file of ours is recognised: the
+     *  two bytes are 0x78 then 0x5E, which read back as the little endian DWORD
+     *  0x5E78 = 24184 - the value main() tests for.
+     *
+     *  Order matters and is not the obvious one.  PNGOUT_MARK is 0x5E78, so
+     *  `>> 8` is 0x5E and `& 0xFF` is 0x78, and writing them in that order puts
+     *  0x5E where the compression method byte belongs.  zlib then rejects the
+     *  whole stream with "incorrect header check", because CMF = 0x5E has a
+     *  compression method of 14, which does not exist.  Written the right way
+     *  round, CMF = 0x78 is CM = 8 with a 32K window and (0x78 * 256 + 0x5E) is
+     *  30814, which is 31 * 994 exactly - as the FCHECK field requires.
+     */
+    PutBits(PNGOUT_MARK & 0xFF, 8);            /* 0x78: CM = 8, CINFO = 7 */
+    PutBits(PNGOUT_MARK >> 8, 8);              /* 0x5E: FCHECK                   */
 
     AdlerSum = 1;                              /* the Adler-32 seed */
     InitBlockTables();
@@ -675,13 +713,26 @@ int InitBlockTables(void)
         unk_41CEC0 = 0;
     }
 
-    unk_6D4968 = 0;
-    unk_6F6B78 = 0;
-    LensScratch[ROW_SAMPLE_MAX - 1] = 0;
-    unk_42D7C8 = 0;
-    RowCost = 0;
-    RowIndex = 0;
+    unk_6D4968 = 0;                         /* 0x405A19: dword_6D4968, the
+                                               write position                  */
+    unk_6F6B78 = 0;                         /* 0x405A1F: dword_6F6B78, the scan
+                                               position                       */
+    MatchLimit = 0;                         /* 0x405A25: dword_412668 */
+    unk_42D7C8 = 0;                         /* 0x405A2B: dword_42D7C8 */
+    RowCost = 0;                           /* 0x405A31: dword_18CBEEC */
+    RowIndex = 0;                          /* 0x405A37: dword_42D7CC */
+
+    /*
+     *  0x405A3D: `mov dword_42E958[ecx], 7FFFFFFFh` with ecx = 0xA18 * RowCount.
+     *  The row record's own field 0 is not what this is for: dword_42E958 sits at
+     *  0xA18 dwords below dword_42F370, which is the *last* row's limit (see
+     *  ROW_LIMIT).  So the store opens the final block - whose end is the end of
+     *  the data anyway - to the whole window, and the last row closes when the
+     *  writer runs out of bytes rather than at a boundary.
+     */
     RowRecord[ROW_STRIDE * RowCount + ROW_SLOT] = 0x7FFFFFFF;
+    if (RowCount > 0)
+        ROW_LIMIT(RowCount - 1) = 0x7FFFFFFF;
 
     return BuildDistanceSlots(0);
 }
@@ -1074,7 +1125,17 @@ static void PutSample(unsigned char *p, int value, int bitdepth)
 int WritePngHeader(int width, int height, int coltype, int bitdepth,
                    int *palette, int palcount)
 {
-    int i, n, last, crc;
+    int i, n, last;
+    /*
+     *  unsigned, deliberately.  The running CRC is folded with
+     *  `CrcTable[crc ^ byte] ^ (crc >> 8)` - and as a *signed* int that shift is
+     *  arithmetic, so once the running value goes negative it sign-extends and
+     *  the CRC comes out wrong.  ChunkCrc() gets this right by keeping its own
+     *  accumulator unsigned, which is why IHDR's CRC was always fine and only the
+     *  chunks whose CRC is continued after the tag - PLTE, tRNS, bKGD - were
+     *  wrong.
+     */
+    unsigned crc;
 
     OutCount = 0;
 
@@ -1169,7 +1230,7 @@ int WritePngHeader(int width, int height, int coltype, int bitdepth,
 
         PutBE(Scratch, 3 * (unsigned)palcount);
         memcpy(Scratch + 4, "PLTE", 4);
-        crc = ChunkCrc(Scratch, 4, 8);
+        crc = ~ChunkCrc(Scratch, 4, 8);   /* the *running* value, not the finished CRC */
         EmitBytes(Scratch, 8);
 
         for (i = 0; i < palcount; i++) {
@@ -1197,7 +1258,7 @@ int WritePngHeader(int width, int height, int coltype, int bitdepth,
         if (last >= 0) {
             PutBE(Scratch, last + 1);
             memcpy(Scratch + 4, "tRNS", 4);
-            crc = ChunkCrc(Scratch, 4, 8);
+            crc = ~ChunkCrc(Scratch, 4, 8);   /* the *running* value, not the finished CRC */
             EmitBytes(Scratch, 8);
 
             for (i = 0; i <= last; i++) {
@@ -1218,7 +1279,7 @@ int WritePngHeader(int width, int height, int coltype, int bitdepth,
          */
         PutBE(Scratch, coltype ? 6u : 2u);
         memcpy(Scratch + 4, "tRNS", 4);
-        crc = ChunkCrc(Scratch, 4, 8);
+        crc = ~ChunkCrc(Scratch, 4, 8);   /* the *running* value, not the finished CRC */
         EmitBytes(Scratch, 8);
 
         n = 8;
@@ -1243,7 +1304,7 @@ int WritePngHeader(int width, int height, int coltype, int bitdepth,
     if (Image->bkgd != 0) {
         PutBE(Scratch, BKGD_LEN(coltype));
         memcpy(Scratch + 4, "bKGD", 4);
-        crc = ChunkCrc(Scratch, 4, 8);
+        crc = ~ChunkCrc(Scratch, 4, 8);   /* the *running* value, not the finished CRC */
         EmitBytes(Scratch, 8);
 
         if (coltype == 3) {
@@ -1290,6 +1351,57 @@ int WritePngHeader(int width, int height, int coltype, int bitdepth,
 /* ------------------------------------------------------------------ */
 /*  the /b block splitter                                              */
 /* ------------------------------------------------------------------ */
+
+/*
+ *  sub_408690: append one byte to the buffer the splitter reads from.
+ *
+ *  It is installed as dword_6D6668, the byte sink, for one pass over the image:
+ *  Optimize() runs the whole image through the filter machinery with this as the
+ *  sink, which turns the *filtered* bytes into a flat buffer, and PlanBlocks()
+ *  then cuts that buffer up.  There is no bounds check here - the buffer is
+ *  sized from height * (4 * width + 1), which is the most a row can produce.
+ */
+int PutByte(int c)
+{
+    SplitBuf[SplitEnd++] = (unsigned char)c;
+    return 0;
+}
+
+/*
+ *  sub_4086B0: work out the scale factor that turns a row index into a
+ *  percentage.
+ *
+ *  The row loops compute
+ *
+ *      percent = ((row * 100 + PercentBias) * PercentScale) >> 32
+ *
+ *  so PercentScale has to be about 0xFFFFFFFF / height for the last row to land
+ *  on 100.  That is exactly what the `div` produces, but only because `mov edx,
+ *  2` is the *high half of the dividend* rather than a constant being compared
+ *  against: edx:eax is 2*2^32 + height, and dividing that by 2*height gives
+ *  2^32 / height.  Read as a plain `height / (2 * height)` the quotient would be
+ *  zero and no progress would ever print.
+ *
+ *  PercentBias is 1 when PercentScale * height does *not* overflow 32 bits, which
+ *  is the "add a little before scaling so the last row reaches 100 instead of
+ *  stopping at 99" correction.  A one or two row image takes the `neg` branch and
+ *  gets -height instead, which makes its percentages negative and so never print.
+ */
+void InitProgressScale(int height)
+{
+    unsigned int scale;
+
+    if ((unsigned int)height >= 2) {
+        unsigned __int64 dividend = ((unsigned __int64)2 << 32) + (unsigned int)height;
+
+        scale = (unsigned int)(dividend / (2u * (unsigned int)height));
+    } else {
+        scale = (unsigned int)(-(int)height);
+    }
+
+    PercentScale = scale;
+    PercentBias = ((unsigned __int64)scale * (unsigned int)height) >> 32 ? 0 : 1;
+}
 
 /*
  *  sub_408000: cut the filtered image into deflate blocks.
@@ -1757,17 +1869,44 @@ void FilterSample(int pixel, int nbytes)
     }
     aboveLeft = above - 1;
 
-    /*
+/*
      *  Every byte of the sample is filtered on its own, against the *same*
      *  byte of its neighbours - so for a 24 bit image the sub filter uses the
-     *  sample to the left's third byte for the third byte, and the predictor
+     *  sample to the left's third byte for its third byte, and the predictor
      *  gets the sample diagonally above and to the left.
+     *
+     *  The byte *order* is the one PNG wants and it is not ascending.  A pixel
+     *  is one DWORD whose bytes are B, G, R, A from the bottom up, and the four
+     *  filters do not agree on how to walk them:
+     *
+     *      nbytes 1  (sub_407D80)  0
+     *             2  (sub_407B00)  0, 1                 grey then alpha
+     *             3  (sub_4077C0)  2, 1, 0              R, G, B
+     *             4  (sub_4071D0)  2, 1, 0, 3           R, G, B, A
+     *
+     *  which is `mov cl, byte ptr [arg_0+2]` / `mov dl, bh` / `and eax, 0FFh`
+     *  in sub_4077C0's case 0, and the same plus `HIBYTE` in sub_4071D0's.
+     *  Emitting them low byte first is the one thing that cannot be caught by a
+     *  round trip: the stream still inflates, and only the *colours* come out
+     *  swapped, which is exactly what an RGB image does.
      */
+    #ifdef LZDEBUG
+    if (ByteSink == CompressByte && LinBufUsed < 3)
+        fprintf(stderr, "[row] n=%d filter=%d lbb=%d sink:", nbytes, CurFilter,
+                LinBufBytes);
+#endif
     for (i = 0; i < nbytes; i++) {
-        int cur = (pixel >> (8 * i)) & 0xFF;
-        int left = (FilterLeft >> (8 * i)) & 0xFF;
-        int up = (words[above] >> (8 * i)) & 0xFF;
-        int ul = (words[aboveLeft] >> (8 * i)) & 0xFF;
+        int b = (nbytes == 4) ? (i < 3 ? 2 - i : 3)
+                              : (nbytes == 3 ? 2 - i : i);
+        int cur = (pixel >> (8 * b)) & 0xFF;
+        int left = (FilterLeft >> (8 * b)) & 0xFF;
+        int up = (words[above] >> (8 * b)) & 0xFF;
+        int ul = (words[aboveLeft] >> (8 * b)) & 0xFF;
+
+#ifdef LZDEBUG
+        if (ByteSink == CompressByte && LinBufUsed < 3 && b == 0)
+            fprintf(stderr, " %02x/%02x/%02x/%02x", cur, left, up, ul);
+#endif
 
         switch (CurFilter) {
         case 0:                                   /* none */
@@ -1807,9 +1946,28 @@ void FilterSample(int pixel, int nbytes)
         return;
 
     LinBufUsed++;
-    if (ByteSink == CompressByte && LinBufUsed >= BlockSymbols &&
-        BlockFullHook != NULL)
-        BlockFullHook();
+#ifdef LZDEBUG
+    fprintf(stderr, "[row] n=%d filter=%d lbb=%d\n", nbytes, CurFilter, LinBufBytes);
+#endif
+    /*
+     *  The block is full: close it.  In the original this is a direct
+     *  `jmp loc_4075B0` at the end of sub_407D80, sub_4077C0, sub_407B00 and
+     *  sub_4071D0 alike - all four end with
+     *
+     *      cmp eax, offset sub_406530   ; the sink is the LZ coder?
+     *      ...
+     *      cmp eax, dword_41266C        ; and is this the last row of a block?
+     *      jl  done
+     *      jmp loc_4075B0
+     *
+     *  It used to be a hook (`BlockFullHook`) that the row loop was supposed to
+     *  install, and nothing ever installed it, so no block was ever terminated
+     *  and every compressed PNG came out with no BFINAL, no Adler-32, no block
+     *  CRC and an unwritten IDAT length.  Calling FinishBlock() directly is both
+     *  what the original does and the only thing that can work here.
+     */
+    if (ByteSink == CompressByte && LinBufUsed >= BlockSymbols)
+        FinishBlock();
 }
 
 void FilterByte(int pixel)            /* sub_407D80, 8 bit: one byte a call */
@@ -1960,11 +2118,21 @@ void FinishBlock(void)
     PutBE(Scratch, ~BitCrc);
     EmitBytes(Scratch, 4);
 
-    /* the IDAT's length is everything written since its chunk header, less the
-       8 byte header and the 4 byte CRC just added */
+    /*
+     *  The IDAT's length field.  EmitBlock() reserved four bytes for it when it
+     *  opened the chunk; now it is patched **in place** at ChunkStart.  It is
+     *  not emitted through EmitBytes(), which appends at OutCount - that would
+     *  leave four stray bytes at the end of the stream and the chunk header
+     *  still holding whatever Scratch happened to contain when the chunk was
+     *  opened (in practice the file's own signature, so the field read
+     *  0x89504E47 and no decoder would accept the file).
+     *
+     *  The length covers everything written since the chunk header, less the
+     *  8 byte header and the 4 byte CRC that has just been appended.
+     */
     len = Swap32((unsigned int)(OutCount - ChunkStart - 12));
-    memcpy(Scratch, &len, 4);
-    EmitBytes(Scratch, 4);
+    if (ChunkStart >= 0 && ChunkStart + 4 <= Image->outsize)
+        memcpy(Image->outbuf + ChunkStart, &len, 4);
 
     for (i = Image->chunktail; i < Image->chunkend; i++) {
         unsigned char *c = (unsigned char *)Image->chunks[i];
@@ -2124,6 +2292,20 @@ int WriteStored(void)                  /* sub_4086E0 */
     case 0:
     case 3:
         bitdepth = unk_180A570;
+        /*
+         *  loc_4086E0 / loc_405150.  Note this is NOT the same quantity the
+         *  compressed path uses, and the two must not be conflated.
+         *
+         *  Here it is the whole stored row *including* the filter type byte -
+         *  1 + n * width, exactly as the cases below and `lea eax, [edx+edx+1]`
+         *  in the original have it - because this value is what gets written as
+         *  the zlib stored-block LEN.
+         *
+         *  WritePngHeader() sets the same global for the compressed path, and
+         *  there it is the *sample* bytes only, with no +1, because there
+         *  FilterSample() counts sample bytes and emits the filter type byte
+         *  separately on the call where BitBufPos is still 0.
+         */
         LinBufBytes = ((bitdepth * width + 7) >> 3) + 1;
         InitColorHash(unk_180B578);
         for (i = unk_180B978 - 1; i >= 0; --i)

@@ -114,6 +114,14 @@ unsigned int BitCrc;           /* 0x412EB8: running CRC of the output     */
 /* s->msg, published so the optimiser can report progress */
 void (*ProgressMsg)(const char *fmt, ...);   /* 0x185BEC4 */
 
+/*
+ *  The /v timing pair.  Optimize() takes the clock reading once, before the
+ *  trials, and reports the difference at the end - so the elapsed time is the
+ *  whole search, not any one trial.
+ */
+LARGE_INTEGER StartCount;                   /* esp+PerformanceCount */
+LARGE_INTEGER ClockFrequency;               /* esp+Frequency */
+
 /* block state, set up by EmitBlock() */
 int      BlockSymbols;         /* 0x41266C */
 int      LinBufBytes;          /* 0x411D54 */
@@ -127,7 +135,12 @@ unsigned char Scratch[64];
 int      RowIndex;             /* 0x42D7CC */
 int      RowCount;             /* 0x6D5570 */
 int      AdlerSum;             /* 0x706B84: Adler-32 of the unfiltered data */
-int      RowHeaderCode;        /* 0x6F6A78 */
+/* dword_6F6A78 is not its own variable: it is dword_6F6678 + 256, i.e.
+   LitCodes[256] - the code for symbol 256, which is deflate's end-of-block.
+   AdvanceRow() writes it with the row's own code length for symbol 256 (field
+   +0x910), which is how every block is closed; it has to be the same table
+   entry RankValues() filled, or the block never ends and the decoder runs off
+   the end of the stream. */
 int      RowCost;              /* 0x18CBEEC */
 int      LensScratch[ROW_SAMPLE_MAX];    /* 0x412168 */
 
@@ -196,7 +209,6 @@ int      BestCost[256];                 /* 0x6D5170 */
 /* 0x42E560: the histogram the filter trials fill, 256 dwords */
 int      Entropy[256];
 int      CurFilter;                   /* dword_185BEBC: 0 .. 4, the filter in use */
-int      EntropyMax;                   /* dword_180A568: the largest count in it   */
 int     *EntropyLut;                   /* dword_18CBEE8: count * ln(count) * scale */
 int      EntropyLutSize;               /* dword_18CBEE4                        */
 
@@ -216,6 +228,51 @@ int      unk_180A570;                    /* dword_180A570: /d#, the bit depth to
 int      unk_185BED0;                    /* dword_185BED0: /c#, the colour type to write */
 int      unk_180B978;                    /* dword_180B978: /ks, and the palette length */
 int      unk_180B578[MAX_COLORS];        /* dword_180B578: the palette, 0xAARRGGBB    */
+
+/* ------------------------------------------------------------------ */
+/*  the state Optimize() carries between trials, src/trials.c          */
+/* ------------------------------------------------------------------ */
+
+/*
+ *  dword_411D60.  One array, two jobs: in colour type 0 it is the "this grey
+ *  level is present" flags the analysis pass fills, in colour type 3 it is the
+ *  per entry pixel count the palette sort orders by.  The palette and the flags
+ *  live at opposite ends of the same 1KB span - unk_411D64 is dword_411D60's
+ *  *second* entry, so the two swap-and-reorder loops at 0x4031B7 and 0x4034D1
+ *  move them together in a single pass.
+ */
+int      PaletteUse[MAX_COLORS];         /* dword_411D60 */
+
+/*
+ *  unk_411F5C .. unk_41215C, 128 dwords.  Section 3 (.data) is 512 bytes of
+ *  file image with a 0x14F9838 virtual size, so everything past 0x411200 is
+ *  uninitialised .bss and this table reads as zero at run time - which is why
+ *  `or edx, [ecx]` in the grayscale scan never contributes anything and the scan
+ *  is really over PaletteUse[] alone.
+ *
+ *  The one other thing the loop does is skip grey level 85 (unk_412008 is table
+ *  entry 43 and the counter runs 128 down to 1): 0x55's nibbles match, so the
+ *  exemption changes nothing, but it is kept because it is in the original.
+ */
+const int GrayLevelFlags[128] = { 0 };
+
+/* sub_4086B0: the progress scale, 0xFFFFFFFF / height plus its remainder */
+unsigned int PercentScale;               /* dword_185BAB0 */
+int      PercentBias;                     /* dword_1808F88 */
+
+int      BestTrialSize;                   /* esp+var_48 */
+int      TrialEstimate;                   /* esp+var_50 */
+int      TrialSizes[1024];                /* dword_180A578 */
+int      TrialSign[1024];                 /* dword_1809568 */
+unsigned char RowFilters[ROW_FILTER_BYTES];     /* byte_180BA90, the current  */
+unsigned char BestRowFilters[ROW_FILTER_BYTES]; /* unk_187BED8, the winner's */
+int      BestPalette[MAX_COLORS];         /* unk_1808F90, the palette that won */
+int      HaveBestTrial;                   /* dword_180BA80 */
+unsigned char *FilterChoice;              /* Block: the /f6 per row filters */
+
+/* the /b splitter's working buffer, freed as soon as PlanBlocks() returns */
+unsigned char *SplitBuf;                  /* dword_18CBEF4 */
+int      SplitEnd;                        /* dword_18CBEF8 */
 
 /* ------------------------------------------------------------------ */
 /*  the row records, 0x42E958                                            */

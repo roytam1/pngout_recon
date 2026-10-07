@@ -209,6 +209,24 @@ static int find_idat(const unsigned char *p, int len)
     return -1;
 }
 
+/* the same walk looking for any chunk tag; returns -1 when it is not there */
+static int find_chunk(const unsigned char *p, int len, const char *tag)
+{
+    int o = 8;
+
+    while (o + 8 <= len) {
+        unsigned int clen = ((unsigned)p[o] << 24) | ((unsigned)p[o + 1] << 16) |
+                            ((unsigned)p[o + 2] << 8) | p[o + 3];
+
+        if (memcmp(p + o + 4, tag, 4) == 0)
+            return o;
+        if (memcmp(p + o + 4, "IEND", 4) == 0)
+            return -1;
+        o += 12 + (int)clen;
+    }
+    return -1;
+}
+
 /*
  *  dword_185BEC4 is s->msg, the printf-style progress line main() installs.
  *  sub_4086E0 ends with a bare "\r" and "Out:%8d bytes (stored)", so the test
@@ -415,11 +433,17 @@ static void lzsetup(int strategy, int limit)
     for (i = 0; i < ROW_DISTSLOTS; i++)           /* the distance symbols */
         ROWOF(0, ROW_SYMBOLS)[ROW_DISTFREQ - ROW_SAMPLES + i] = LZ_CODEBITS;
     *ROWOF(0, ROW_ROWBITS) = 0;
-    *ROWOF(0, ROW_LIMIT) = limit;
 
     InitCrcTable();
     BuildDeflateTables();
     InitBlockTables();
+
+    /*
+     *  After InitBlockTables(), which is where sub_405150 calls sub_4058A0 from
+     *  and which opens the *last* block's end to the whole window.  PlanBlocks()
+     *  has run by then in the real program too.
+     */
+    ROW_LIMIT(RowCount > 0 ? RowCount - 1 : 0) = limit;
 
     /*
      *  The codes RankValues() left behind are replaced by the tagged ones.
@@ -618,17 +642,24 @@ int main(void)
 
 /* ---------------- FilterPredict (sub_40AF40) ----------------
  *
- *  Returns whichever of the three candidates is closest to b, measured as
- *      |a3-a2|   vs   |a1-a2|   vs   |a1+a3-2*a2|
- *  picking a1 when the first wins, then a2 if |a1-a2| exceeds the third.
+ *  Three distances, and it is `c` - not `b` - that the first is measured
+ *  from:
+ *
+ *      d1 = |a + b - 2c|
+ *      d2 = |b - c|
+ *      d3 = |a - c|
+ *
+ *  Returns `a` when d2 is no larger than either of the others, `b` when
+ *  d3 <= d1, and `c` otherwise.  The callers pass (left, up, upleft), so
+ *  `c` is the sample diagonally above and to the left.
  */
     check("Predict(0,0,0)",     FilterPredict(0, 0, 0), 0);
-    check("Predict(10,0,0)",    FilterPredict(10, 0, 0), 10);   /* a3 == a2 */
-    check("Predict(1,2,3)",     FilterPredict(1, 2, 3), 2);      /* a1+a3-2a2 == 0 */
-    check("Predict(100,7,0)",   FilterPredict(100, 7, 0), 100);  /* a1 wins on tie */
-    check("Predict(-5,5,5)",    FilterPredict(-5, 5, 5), -5);     /* a1 wins on tie */
-    check("Predict(255,0,255)", FilterPredict(255, 0, 255), 255); /* all equal */
-    check("Predict(3,10,4)",    FilterPredict(3, 10, 4), 3);     /* a1 nearest */
+    check("Predict(10,0,0)",    FilterPredict(10, 0, 0), 10);   /* d2 == 0   */
+    check("Predict(1,2,3)",     FilterPredict(1, 2, 3), 1);     /* d2 == 1   */
+    check("Predict(100,7,0)",   FilterPredict(100, 7, 0), 100); /* a on a tie */
+    check("Predict(-5,5,5)",    FilterPredict(-5, 5, 5), -5);    /* a on a tie */
+    check("Predict(255,0,255)", FilterPredict(255, 0, 255), 0);  /* d3 == 0   */
+    check("Predict(3,10,4)",    FilterPredict(3, 10, 4), 10);    /* d3 == 1 wins over d2 == 6 */
 
     /* ---------------- CpuFeatures (sub_40B060) ---------------- */
     {
@@ -1842,19 +1873,26 @@ int main(void)
         /*
          *  Row 4, the predictor, fed the same bytes as row 3 so that the row
          *  above matches it.  This is not PNG's Paeth - it picks whichever of
-         *  the three candidates is closest - and on a ramp the left byte wins,
-         *  which turns the row into a constant.  The first byte reads the word
-         *  in front of the data area for its left-of-above byte, as the
-         *  original does.
+         *  the three candidates is closest, measuring the first distance from
+         *  the *upleft* sample rather than from `up`.  On a ramp that is the
+         *  same answer as `up` would be, so the whole row comes out as zeroes.
+         *  The first byte reads the word in front of the data area for its
+         *  left-of-above byte, as the original does.
+         *
+         *      left  up  upleft   |a+b-2c|  |b-c|  |a-c|   result
+         *         0  40      0        40      40      0   up
+         *        40  50     40        10      10      0   up
+         *        50  60     50        10      10      0   up
+         *        60  70     60        10      10      0   up
          */
         TrialFilter = 4;
         for (i = 0; i < 4; i++)
             FilterByte((unsigned char)(40 + 10 * i));
         check("the predictor announces itself", got[20], 4);
         check("the first byte of an even row reads below the data",
-              got[21], 40);
-        check("a ramp becomes a constant", got[22], 10);
-        check("all of it", got[23] + got[24], 20);
+              got[21], 0);
+        check("and takes `up` rather than the left byte", got[22], 0);
+        check("all of it", got[23] + got[24], 0);
 
         check("everything the sink saw", gotn, 25);
 
@@ -1968,6 +2006,11 @@ int main(void)
          *  Two rows of two samples.  The sub filter uses the *same* byte of
          *  the sample to the left, so the second sample of a row comes out as
          *  one repeated byte rather than as a little endian subtraction.
+         *
+         *  The bytes also come out in PNG's order, not ascending: a pixel is
+         *  one DWORD whose bytes are B, G, R, A from the bottom up, and a
+         *  32 bit sample is emitted 2, 1, 0, 3.  So the first sample here,
+         *  0x20304010, goes out as 30 40 10 20.
          */
         TrialFilter = 1;
         gotn = 0;
@@ -1976,9 +2019,9 @@ int main(void)
         check("32 bit: the filter type comes first", got[0], 1);
         check("and four bytes go out per sample", gotn, 9);
         check("the first sample has nothing to its left",
-              bpack(4, got + 1), 0x20304010);
+              (int)bpack(4, got + 1), 0x20104030);
         check("the second is the first, byte by byte",
-              bpack(4, got + 5), 0x30303070);
+              (int)bpack(4, got + 5), 0x30703030);
 
         /* 16 bit: two bytes a sample */
         LinBufUsed = 0;
@@ -1990,8 +2033,8 @@ int main(void)
         check("the first sample passes through", bpack(2, got + 1), 0x1234);
         check("and the second minus the first", bpack(2, got + 3), 0x4444);
 
-        /* 24 bit: three bytes a sample, and the argument's high byte is not
-           one of them */
+        /* 24 bit: three bytes a sample, the argument's high byte is not
+           one of them, and they go out 2, 1, 0 */
         LinBufUsed = 0;
         BitBufPos = 0;
         gotn = 0;
@@ -1999,9 +2042,9 @@ int main(void)
         FilterPixel24(0x445566);
         check("24 bit: three bytes per sample", gotn, 7);
         check("the top byte of the argument is ignored",
-              bpack(3, got + 1), 0x112233);
+              (int)bpack(3, got + 1), 0x332211);
         check("and only the low three are filtered",
-              bpack(3, got + 4), 0x333333);
+              (int)bpack(3, got + 4), 0x333333);
 
         /*
          *  The up filter, across two rows: row 0 lands in the upper slot and
@@ -2014,14 +2057,14 @@ int main(void)
         FilterPixel32(0x20304010);
         FilterPixel32(0x50607080);
         check("the first row has nothing above it",
-              (int)bpack(4, got + 1), 0x20304010);
-        check("in either sample", (int)bpack(4, got + 5), 0x50607080);
+              (int)bpack(4, got + 1), 0x20104030);
+        check("in either sample", (int)bpack(4, got + 5), 0x50807060);
         BitBufPos = 0;
         gotn = 0;
         FilterPixel32(0x01020304);
         FilterPixel32(0x50607080);
         check("32 bit up: against the row above, byte by byte",
-              (int)bpack(4, got + 1), (int)0xE1D2C3F4u);
+              (int)bpack(4, got + 1), (int)0xE1F4C3D2u);
         check("a sample equal to the row above comes out as zeroes",
               (int)bpack(4, got + 5), 0);
 
@@ -2175,10 +2218,11 @@ int main(void)
         i = OutCount - 4;         /* just before the length field went out */
 
         /* five bits went out, then padding, then the Adler-32 and the block
-           CRC, then the IDAT length - and the length has to come out right */
+           CRC.  The IDAT length is *not* among them: it is patched back into
+           the chunk header at ChunkStart, where it was reserved. */
         check("the block closed", OutCount > n, 1);
-        check("the trailer is the adler and the two lengths",
-              OutCount - n, 1 + 4 + 4 + 4);
+        check("the trailer is the adler and the block crc",
+              OutCount - n, 1 + 4 + 4);
 
         before = out + n;
         check("the padding is the rest of the byte", (before[0] >> 5) & 7,
@@ -2191,14 +2235,19 @@ int main(void)
               (unsigned)before[5] << 24 | before[6] << 16 |
               before[7] << 8 | before[8], (unsigned)~BitCrc);
         {
-            unsigned int len = (unsigned)before[9] << 24 |
-                               before[10] << 16 | before[11] << 8 |
-                               before[12];
+            /*
+             *  The length lives where the chunk header reserved it, so it is
+             *  read from ChunkStart and measured against the output size at the
+             *  moment it was patched - which is OutCount now, because nothing
+             *  has been written since.
+             */
+            unsigned char *lp = out + ChunkStart;
+            unsigned int len = (unsigned)lp[0] << 24 | lp[1] << 16 |
+                               lp[2] << 8 | lp[3];
 
-            /* the length does not count itself, so it is taken against */
-            /* the output size before those four bytes went out */
+            /* the length does not count itself, nor the CRC */
             check("the IDAT length counts what was written",
-                  len, (unsigned)(i - ChunkStart - 12));
+                  len, (unsigned)(OutCount - ChunkStart - 12));
         }
 
         /* the chunks after the image data go out whole */
@@ -2218,14 +2267,68 @@ int main(void)
             n = OutCount;
             FinishBlock();
             /* the block's own trailer goes out first - it has no padding
-               this time - and then the chunk, whole */
+               this time, and the IDAT length is patched at ChunkStart rather
+               than emitted here - and then the chunk, whole */
             check("a trailing chunk goes out whole", OutCount - n,
-                  4 + 4 + 4 + 13);
+                  4 + 4 + 13);
             check("and it comes out unchanged",
-                  memcmp(out + n + 12, tail, 13), 0);
+                  memcmp(out + n + 8, tail, 13), 0);
         }
 
-        Image = NULL;
+        /*
+         *  EmitBlock()'s zlib header, which the checks above deliberately ran
+         *  after - EmitBlock() rewrites OutCount and ChunkStart wholesale, so
+         *  running it here would destroy the state they are asserting on.
+         *
+         *  These two bytes are also how main() recognises a file of ours: read
+         *  little endian they are the DWORD 0x5E78 = 24184.  The order is not
+         *  the obvious one, because PNGOUT_MARK is 0x5E78 and so `>> 8` is
+         *  0x5E.  Written the wrong way round CMF comes out as 0x5E, which
+         *  claims compression method 14, and every compressed PNG is rejected
+         *  with "incorrect header check".
+         *
+         *  Checked by what the bytes have to *be*, not by what the code says:
+         *  CM = 8 with a 32K window, and FCHECK making the pair a multiple of 31.
+         */
+        {
+            static IMAGEDESC sim;
+            static unsigned char sout[64];
+            static unsigned char spx[4 * 8 * 2];
+            int cmf, flg, w = 8, h = 2;
+
+            memset(&sim, 0, sizeof(sim));
+            memset(sout, 0, sizeof(sout));
+            memset(spx, 0, sizeof(spx));
+            Image = &sim;
+            sim.outbuf = sout;
+            sim.outsize = sizeof(sout);
+            sim.strategy = 0;
+            sim.pixels = (unsigned int *)spx;
+            sim.stride = w * 4;
+            sim.width = w;
+            sim.height = h;
+            RowCount = 1;
+            RowIndex = 0;
+            MinSample = -1;
+            unk_185BED0 = 0;
+            unk_180A570 = 8;
+            unk_180B978 = 0;
+
+            check("EmitBlock wrote a block", EmitBlock(w, h, 0, 8, NULL, 0), 1);
+
+            /* 33 bytes of signature and IHDR, then 4 reserved for the IDAT
+               length, then "IDAT", then the two zlib bytes at 41 and 42 */
+            cmf = sout[41];
+            flg = sout[42];
+            check("zlib: compression method is 8", cmf & 15, 8);
+            check("zlib: 32K window", cmf >> 4, 7);
+            check("zlib: FCHECK makes the pair a multiple of 31",
+                  (cmf * 256 + flg) % 31, 0);
+            check("zlib: the two bytes are PNGOUT's own signature",
+                  cmf + flg * 256, 24184);
+
+            Image = NULL;
+        }
     }
 
     /* ---- sub_4065A0: the LZ coder ------------------------------------ */
@@ -2439,7 +2542,7 @@ int bucket, links = 0, deepest = 0;
 
             lzsetup(1, n / 2);              /* the first block is half of it */
             RowCount = 2;              /* lzsetup resets this to 1 */
-            *ROWOF(1, ROW_LIMIT) = 0x7FFFFFFF;   /* the second row is open ended */
+            ROW_LIMIT(1) = 0x7FFFFFFF;   /* the second row is open ended */
             lzfeed(lzinput, n);
             LzCode((const unsigned char *)0, 0);
 
@@ -2780,6 +2883,192 @@ int bucket, links = 0, deepest = 0;
 
         Image = NULL;
         (void)pal;
+    }
+
+    /* ---- sub_402AD0: Optimize() --------------------------------------- */
+    {
+        static IMAGEDESC simg;
+        static SETTINGS set;
+        static unsigned char sout[1 << 18];
+        static unsigned char spix[4 * 20 * 16];
+        int w = 20, h = 16, i, r, c, n, delta;
+
+        ProgressMsg = sink_msg;
+        CheckEscHook = NULL;           /* NULL is fine: Optimize substitutes */
+
+        /* a full range of greys, so the ramp is the whole 0..255 */
+        for (r = 0; r < h; r++)
+            for (c = 0; c < w; c++) {
+                unsigned char *p = spix + 4 * (r * w + c);
+                int v = (r * w + c) * 256 / (w * h);
+
+                p[0] = (unsigned char)v;         /* R */
+                p[1] = (unsigned char)v;         /* G */
+                p[2] = (unsigned char)v;         /* B */
+                p[3] = 0xFF;                    /* A - opaque, no tRNS needed */
+            }
+
+        memset(&simg, 0, sizeof(simg));
+        Image = &simg;
+        simg.pixels = (unsigned int *)spix;
+        simg.stride = w * 4;
+        simg.width = w;
+        simg.height = h;
+        simg.outbuf = sout;
+        simg.outsize = sizeof(sout);
+
+        /* ---- phase A: a grey image is written as colour type 0 ---- */
+        memset(&set, 0, sizeof(set));
+        set.pixels = spix;
+        set.pitch = w * 4;
+        set.width = w;
+        set.height = h;
+        set.outbuf = sout;
+        set.origsize = (int)sizeof(sout);
+        set.msg = sink_msg;
+        set.checkesc = NULL;
+        set.coltype = -1;              /* let Optimize() choose */
+        set.filter = -1;
+        set.bitdepth = -1;
+        set.strategy = 4;              /* /s4 first: the simplest full run */
+        set.blocksplit = 0.0;
+
+        messages[0] = 0;
+        nmsgs = 0;
+        delta = Optimize(&set);
+        check("Optimize: /s4 produced a PNG", delta > 0, 1);
+        check("Optimize: /s4 wrote a PNG signature",
+              memcmp(set.outbuf, "\x89PNG\x0D\x0A\x1A\x0A", 8), 0);
+        check("Optimize: /s4 chose colour type 0", unk_185BED0, 0);
+        check("Optimize: /s4 chose bit depth 8", unk_180A570, 8);
+        check("Optimize: /s4 announced the type",
+              strstr(messages, "/c0") != NULL, 1);
+        check("Optimize: /s4 announced the depth",
+              strstr(messages, "/d8") != NULL, 1);
+
+        /* the stored IDAT has to actually hold the rows */
+        n = find_idat(set.outbuf, delta);
+        check("Optimize: /s4 has an IDAT", n > 0, 1);
+        check("Optimize: /s4 LinBufBytes is one row", LinBufBytes, w + 1);
+
+        /* ---- the ramp: 256 equally spaced greys, opaque ---- */
+        check("Optimize: the ramp has 256 entries", unk_180B978, 256);
+        check("Optimize: and it starts at opaque black",
+              (unsigned)unk_180B578[0], 0xFF000000u);
+        check("Optimize: and steps by one per entry",
+              (unsigned)unk_180B578[1] - (unsigned)unk_180B578[0], 0x010101u);
+        check("Optimize: and ends at opaque white",
+              (unsigned)unk_180B578[255], 0xFFFFFFFFu);
+
+        /* ---- MinSample: an all-opaque image has none, so no tRNS ---- */
+        check("Optimize: an opaque image needs no tRNS", MinSample, -1);
+        check("Optimize: and no tRNS chunk went out",
+              find_chunk(set.outbuf, delta, "tRNS") < 0, 1);
+
+        /* ---- the same image with a real /s0, run through the trial loop ---- */
+        set.strategy = 0;              /* Xtreme: the full trial search */
+        messages[0] = 0;
+        nmsgs = 0;
+        delta = Optimize(&set);
+        check("Optimize: Xtreme produced a PNG", delta > 0, 1);
+        check("Optimize: Xtreme wrote a signature",
+              memcmp(set.outbuf, "\x89PNG\x0D\x0A\x1A\x0A", 8), 0);
+        check("Optimize: Xtreme kept colour type 0", unk_185BED0, 0);
+        check("Optimize: Xtreme's output has an IDAT",
+              find_idat(set.outbuf, delta) > 0, 1);
+        /*
+         *  No IEND here: IEND reaches the output as one of the chunks kept from
+         *  the file being read, and this test keeps none (chunkend is 0).  The
+         *  /s4 cases below do close with IEND because WriteStored writes it.
+         */
+        check("Optimize: Xtreme beats /s4", delta < 2389, 1);
+
+        /* ---- an image with fewer than 256 colours becomes a palette ---- */
+        for (i = 0; i < w * h; i++) {
+            unsigned char *p = spix + 4 * i;
+            unsigned char v = (unsigned char)((i % 3) ? 0x00 : 0x80);
+
+            p[0] = p[1] = p[2] = v;
+            p[3] = 0xFF;
+        }
+        set.strategy = 4;
+        messages[0] = 0;
+        nmsgs = 0;
+        delta = Optimize(&set);
+        check("Optimize: two colours pick colour type 3", unk_185BED0, 3);
+        check("Optimize: and one bit depth for two entries", unk_180A570, 1);
+        check("Optimize: the palette has two entries", unk_180B978, 2);
+        check("Optimize: a palette was announced",
+              strstr(messages, "colors") != NULL, 1);
+
+        /*
+         *  More than 256 distinct colours and no transparency: the only legal
+         *  encodings left are RGB and RGBA, and with nothing transparent it is
+         *  RGB.  A *few* colours would not do - PNGOUT would write a palette,
+         *  which is smaller, so this image has to exceed the palette first.
+         *  (p[0], p[1]) together name the pixel index, so every pixel differs.
+         */
+        for (i = 0; i < w * h; i++) {
+            unsigned char *p = spix + 4 * i;
+
+            p[0] = (unsigned char)(i & 0xFF);
+            p[1] = (unsigned char)(i >> 8);
+            p[2] = (unsigned char)(i * 37);
+            p[3] = 0xFF;
+        }
+        set.strategy = 4;
+        messages[0] = 0;
+        nmsgs = 0;
+        delta = Optimize(&set);
+        check("Optimize: over 256 colours beats a palette", unk_185BED0, 2);
+        check("Optimize: at 8 bits a sample", unk_180A570, 8);
+
+        /* ---- forcing colour type 0 on a colour image is refused ---- */
+        set.coltype = 0;
+        messages[0] = 0;
+        nmsgs = 0;
+        delta = Optimize(&set);
+        check("Optimize: /c0 on a colour image fails", delta, 0x7FFFFFFF);
+        check("Optimize: and says it is not grayscale",
+              strstr(messages, "not grayscale") != NULL, 1);
+        set.coltype = -1;
+
+        /*
+         *  The same again with a pixel made transparent.  PNGOUT only treats
+         *  that as real transparency when some *opaque* pixel shares its RGB
+         *  triple - a lone transparent black is just a tRNS - so pixel 0 is made
+         *  a copy of pixel 256's colour and then given a zero alpha, and it is
+         *  the surviving opaque twin that forces colour type 6.
+         */
+        spix[4 * 256 + 0] = 0;
+        spix[4 * 256 + 1] = 0;
+        spix[4 * 256 + 2] = 0;
+        spix[3] = 0x00;
+        messages[0] = 0;
+        nmsgs = 0;
+        delta = Optimize(&set);
+        check("Optimize: transparency forces RGBA", unk_185BED0, 6);
+        /*
+         *  Nothing is printed: the "try /c6 instead" messages only appear when
+         *  the user *forced* a colour type the image cannot use.  A type chosen
+         *  automatically just gets written out.
+         */
+        check("Optimize: an automatic choice says nothing",
+              strstr(messages, "try /c") == NULL, 1);
+
+        /* ---- /s4 is taken without any trial at all ---- */
+        set.strategy = 4;
+        messages[0] = 0;
+        nmsgs = 0;
+        delta = Optimize(&set);
+        check("Optimize: /s4 with alpha still writes a PNG", delta > 0, 1);
+        check("Optimize: and keeps colour type 6", unk_185BED0, 6);
+        check("Optimize: and its IEND closes the file",
+              memcmp(set.outbuf + delta - 12,
+                     "\0\0\0\0IEND\xAE\x42\x60\x82", 12), 0);
+
+        Image = NULL;
+        ProgressMsg = NULL;
     }
 
     printf("\n%s  (%d failure%s)\n", failures ? "FAILED" : "PASSED",

@@ -1,18 +1,14 @@
 /*
  *  stubs.c   -   entry points that are not reconstructed yet
  *
- *  PNGOUT is two large engines on top of the driver that is finished:
+ *  PNGOUT is one large engine left on top of a driver that is finished:
  *
  *    sub_409560  DecodeImage()  - PNG / JPEG / GIF / BMP / PCX / DDS / TGA
  *                                decoders plus the tRNS and bit depth
  *                                analysis.  ~4.4KB of x86.
- *    sub_402AD0  Optimize()     - the trial and error search over filters,
- *                                block splits and Huffman tables that is
- *                                the whole point of the program.
- *                                ~8.9KB of x86.
  *
- *  Both abort loudly rather than quietly producing a wrong PNG, so nothing
- *  built from this tree can be mistaken for a working reconstruction.
+ *  It aborts loudly rather than quietly producing a wrong PNG, so nothing built
+ *  from this tree can be mistaken for a working reconstruction.
  */
 
 #include <stdio.h>
@@ -37,13 +33,6 @@ int DecodeImage(unsigned char *fileimg, int filesize, unsigned char *pixels,
     (void)width; (void)height; (void)unused7; (void)unused8;
     NotReconstructed("DecodeImage()", "0x409560");
     return -1;
-}
-
-int Optimize(SETTINGS *s)
-{
-    (void)s;
-    NotReconstructed("Optimize()", "0x402AD0");
-    return 0x7FFFFFFF;
 }
 
 /* ---------------------------------------------------------------- */

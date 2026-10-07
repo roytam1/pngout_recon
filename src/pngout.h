@@ -81,9 +81,32 @@
  *  is both NumBlockList and RowCount) - which is why the LZ coder closes a row
  *  exactly when a block ends.
  */
-#define ROW_LIMIT     (0x1018 / 4)     /* 1 dword: the end of this row     */
+/*
+ *  0x4065F8:
+ *
+ *      mov  edx, dword_42D7CC
+ *      imul edx, 0A18h
+ *      mov  eax, dword_42F370[edx]
+ *
+ *  0x42F370 is *not* a field of the row record: it is 0xA18 dwords past the
+ *  row record's base (0x42E958), i.e. exactly the next record's field 0 -
+ *  which is where the /b block list's `end` field lives (BlockRecord is at
+ *  0x42F364 and `end` is its fourth dword).  So the row limit *is* the block
+ *  end, and reading it as an offset inside the row record reads a dword past
+ *  the end of the record instead: `end <= cap` then never holds, no match is
+ *  ever accepted, and every row is closed as soon as it is opened.
+ */
+#define ROW_LIMIT(n)  (*BlockEnd(n))
 #define ROW_SAMPLE_MAX 320             /* the samples really are this long */
 #define ROW_SAMPLE_SYMS 286            /* how many of them the code covers */
+/*
+ *  byte_180BA90 and unk_187BED8 hold one *byte* per row per block - the filter
+ *  the trial settled on - packed 320 to a block with no padding, which is why
+ *  the copy loops at 0x403A5E and 0x404982 walk them 320 at a time while the
+ *  row records themselves keep the 0xA18 dword stride.  320 rows is the internal
+ *  maximum width, so a block's worth is 320 bytes.
+ */
+#define ROW_FILTER_BYTES (320 * MAX_BLOCKS)
 
 /* the address of one field of one record */
 #define ROWOF(row, field)   (&RowRecord[ROW_STRIDE * (row) + (field)])
@@ -179,12 +202,25 @@ typedef struct ImageDescStruct {
     int           bkgd;     /* +30  the bKGD colour, 0xAARRGGBB, or 0    */
     int           ndistinct;/* +34  how many distinct values the image has */
 
-    int           pad1[5];  /* +38 .. +48 */
+    /*
+     *  The five fields Optimize() publishes for the bit writer once, at
+     *  0x403505, right after it has decided what to write:
+     *
+     *      +0x38  the palette it built          +0x3C  how many entries
+     *      +0x40  the filter to use             +0x44  the colour type
+     *      +0x48  the bit depth
+     */
+    int          *palpalette;  /* +38 */
+    int           palcount;    /* +3C */
+    int           filtermode;   /* +40 */
+    int           outcoltype;   /* +44 */
+    int           outbitdepth;  /* +48 */
 
     int           strategy; /* +4C  0 Xtreme, 1 Intense, 2 Longest Match,
                                3 Huffman only, 4 uncompressed           */
 
-    int           pad2[1];  /* +50 */
+    int           randomize;/* +50  /r: start each trial from a fresh random
+                                set of code lengths                     */
 
     int           maxblocks;/* +54  /b#, or 0 to pick the cuts by saving */
     double        splitthreshold; /* +58: cut a block when the saving beats
@@ -289,6 +325,9 @@ extern unsigned int BitBuf;       /* dword_412674 */
 extern unsigned int BitCrc;       /* dword_412EB8 */
 extern IMAGEDESC  *Image;         /* dword_42E960 */
 extern void      (*ProgressMsg)(const char *fmt, ...);   /* dword_185BEC4 */
+/* the /v timing pair Optimize() brackets the whole search with */
+extern LARGE_INTEGER StartCount;         /* esp+PerformanceCount */
+extern LARGE_INTEGER ClockFrequency;     /* esp+Frequency */
 
 /* --- block state, set up by EmitBlock() -------------------------- */
 extern int      BlockSymbols;     /* dword_41266C */
@@ -300,8 +339,14 @@ extern int      ChunkStart;       /* dword_412160, start of the IDAT header */
 extern unsigned char Scratch[64];  /* dword_412E78: the chunk staging area  */
 extern int      RowIndex;         /* dword_42D7CC */
 extern int      RowCount;         /* dword_6D5570 */
+/*
+ *  dword_6F6A78 is dword_6F6678 + 256: it is LitCodes[256], the code for symbol
+ *  256, and AdvanceRow() writes it with the row's own length for symbol 256 to
+ *  close the block.  It used to be modelled as a variable of its own, which
+ *  nothing ever assigned.
+ */
+#define RowHeaderCode    LitCodes[256]
 extern int      AdlerSum;         /* dword_706B84: Adler-32 of the raw data */
-extern int      RowHeaderCode;    /* dword_6F6A78, the code for one row tag */
 extern int      RowCost;          /* dword_18CBEEC, the rows' cost so far  */
 /*
  *  dword_412168: 320 code lengths as dwords, a mirror of a row's sample
@@ -416,7 +461,15 @@ extern int      MatchArea[0x8000];   /* 0x6B4968 */
 
 extern int      Entropy[256];        /* dword_42E560, the trial histogram */
 extern int      CurFilter;           /* dword_185BEBC, the filter in use    */
-extern int      EntropyMax;           /* dword_180A568, its largest count    */
+/*
+ *  dword_180A568 is ONE variable under two names.  loc_406510 (the histogram
+ *  sink) counts the bytes of a row into it, and EstimateEntropy() then
+ *  *decrements* it to get the largest count it has to tabulate - the filter
+ *  type byte is in the count too, so the largest symbol count is one less.  Had
+ *  these been declared separately, EstimateEntropy() would keep decrementing a
+ *  counter nothing ever increments and the tabulation would size itself from -1.
+ */
+#define EntropyMax      FilterByteCount
 extern int     *EntropyLut;           /* dword_18CBEE8                        */
 extern int      EntropyLutSize;       /* dword_18CBEE4                        */
 unsigned int EstimateEntropy(int *hist, int buckets);
@@ -461,9 +514,50 @@ extern int      unk_185BEC8, unk_180BA84, unk_185BEB8, unk_411D58, unk_41CEC0;
 extern int      unk_42D7C8;
 extern unsigned char unk_42E55C;
 
+/* ------------------------------------------------------------------ */
+/*  the state sub_402AD0 (Optimize) carries between its trials          */
+/* ------------------------------------------------------------------ */
+
+/*
+ *  PaletteUse[] is dword_411D60.  In colour type 0 it is the "this grey level
+ *  occurs" flags the analysis pass fills; in colour type 3 it is the per entry
+ *  pixel count the palette sort orders by.  GrayLevelFlags[] is unk_411F5C, the
+ *  128 dword table the grayscale pass ORs against it - it lives in .bss and
+ *  reads as zero, so the pass is really over PaletteUse[] alone.  See
+ *  GrayLevelsUsed() in src/trials.c.
+ */
+extern int      PaletteUse[MAX_COLORS];    /* dword_411D60 */
+extern const int GrayLevelFlags[128];      /* unk_411F5C .. unk_41215C */
+
+/*
+ *  The progress scale sub_4086B0 sets up.  PercentScale is 0xFFFFFFFF / height
+ *  (rounded up, so it is at least 1) and PercentBias is the remainder, which the
+ *  row loops add in before the multiply so the last row reaches 100 rather than
+ *  stopping short of it.
+ */
+extern unsigned int PercentScale;  /* dword_185BAB0 */
+extern int      PercentBias;       /* dword_1808F88 */
+
+/* the best trial so far, and the per trial records that get compared against it */
+extern int      BestTrialSize;     /* esp+var_48, the smallest size seen       */
+extern int      TrialEstimate;     /* esp+var_50, the /s4 upper bound         */
+extern int      TrialSizes[1024];  /* dword_180A578: the size of each trial   */
+extern int      TrialSign[1024];   /* dword_1809568: a signature of each one */
+extern unsigned char RowFilters[ROW_FILTER_BYTES];   /* byte_180BA90, current */
+extern unsigned char BestRowFilters[ROW_FILTER_BYTES]; /* unk_187BED8, saved  */
+extern int      BestPalette[MAX_COLORS];  /* unk_1808F90, the palette that won  */
+extern int      HaveBestTrial;     /* dword_180BA80: a winning trial is saved */
+extern unsigned char *FilterChoice; /* Block: the /f6 per row filter choices  */
+
+/* the /b splitter's working buffer, dword_18CBEF4, and its end, 18CBEF8 */
+extern unsigned char *SplitBuf;
+extern int      SplitEnd;
+
 int  BuildDeflateTables(void);
 int  InitBlockTables(void);
 int  BuildDistanceSlots(int row);
+void InitProgressScale(int height);   /* sub_4086B0 */
+int  PutByte(int c);                  /* sub_408690, the /b splitter's sink */
 extern int      DistSlots[64];        /* dword_6D5578 */
 extern unsigned char SlotOrder[32];      /* byte_185BA90 */
 /*
@@ -563,6 +657,9 @@ void FlushLzCoder(void);
 
 /* sub_407D80: filter one image byte and hand it to the trial''s sink */
 void FilterByte(int byte);
+void FilterPixel16(int pixel);               /* sub_407B00, grey + alpha */
+void FilterPixel24(int pixel);               /* sub_4077C0, RGB            */
+void FilterPixel32(int pixel);               /* sub_4071D0, RGBA           */
 int  CountByte(int byte);                  /* loc_406510, the histogram sink */
 unsigned int Adler32Update(unsigned int sum, int byte);   /* sub_406560 */
 int  CompressByte(int byte);               /* sub_406530, the LZ coder''s sink */
