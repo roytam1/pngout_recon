@@ -183,16 +183,15 @@ static void TooManyFilenames(void)
     ShowUsage();
     exit(1);
 }
-
 /* ------------------------------------------------------------------ */
 /*  0x401180 - main                                                    */
 /* ------------------------------------------------------------------ */
 
 int main(int argc, char **argv, char **envp)
 {
-    SETTINGS s;
     unsigned char *fileimg = NULL;       /* the whole input file           */
     unsigned char *trns = NULL;          /* the tRNS chunk payload        */
+    SETTINGS s;
     unsigned char *clip = NULL;          /* clipboard pixels               */
     char  infilename[MAX_PATH];
     char  outfilename[MAX_PATH];
@@ -207,6 +206,18 @@ int main(int argc, char **argv, char **envp)
     FILE *in;
     FILETIME lastaccesstime;
     HANDLE h;
+
+    /*
+     *  The option defaults the SETTINGS layout documents.  Without these the
+     *  three "automatic" fields are whatever was on the stack, and
+     *  Optimize() reads s.coltype straight into the output colour type - so
+     *  a run with no /c on the command line picks an arbitrary one.
+     */
+    memset(&s, 0, sizeof s);
+    s.filter     = -1;                 /* automatic */
+    s.coltype    = -1;                 /* automatic */
+    s.bitdepth   = -1;                 /* automatic */
+    s.blocksplit = 256.0;
 
     (void)envp;
 
@@ -552,6 +563,9 @@ int main(int argc, char **argv, char **envp)
         if (fmt == FMT_PNG) {
             unk_190A1C4 = s.height;
             trns = (unsigned char *)malloc((size_t)s.height);
+            /* The decoder records each input row's filter byte here, which is
+             * what the tRNS guess further down reads. */
+            FilterChoice = trns;
         }
 
         if (DecodeImage(fileimg, insize, s.pixels, s.pitch,
@@ -707,7 +721,11 @@ int main(int argc, char **argv, char **envp)
              *  Optimising in place grew the file and no output name was
              *  given, so keep the original bytes.
              */
-            if (haveout) {
+            /*
+             *  The output goes to stdout only when the *input* was "-";
+             *  naming an output file must write that file.
+             */
+            if (instdin) {
                 if (fwrite(fileimg, 1, (size_t)insize, stdout) == (size_t)insize)
                     fflush(stdout);
             } else if ((in = fopen(outfilename, "wb")) != NULL) {
@@ -743,7 +761,8 @@ writeit:
         goto done;
     }
 
-    if (haveout) {
+    /* stdout only when the input was "-"; otherwise the named output file. */
+    if (instdin) {
         if (fwrite(s.outbuf, 1, (size_t)delta, stdout) == (size_t)delta) {
             delta = 0;
             if (KeepFileTime)

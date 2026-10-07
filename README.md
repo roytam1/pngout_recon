@@ -135,13 +135,18 @@ silently produce a wrong PNG.
 |---|---|---|---|
 | `0x409560` | `DecodeImage()` | 4 353 B | dispatches to the PNG/JPEG/GIF/BMP/PCX/DDS/TGA decoders and publishes `OutColType`, `OutBitDepth`, `NumBlocks`, `dword_190A420[]`, `unk_190A820` |
 
+The inflate inside it is verified byte for byte against `zlib`, and `src/decode.c`
+implements the PNG path - chunk walk, bit reader and pump, Huffman, inflate,
+unfilter and row expansion - for colour types 0, 2, 3, 4 and 6 at bit depths 1,
+2, 4 and 8. Interlaced input is refused rather than guessed at.
+
 The PNG half is worked through and written up above: format dispatch, the
 signature, the IHDR/PLTE/bKGD/tRNS handlers, the sub-8-bit table expansion, the
 sample count and row byte count, the bit reader and input pump, the whole
 inflate body, the unfilter, the pixel expansion, and the Adam7 constants. The
-Huffman helpers are the last thing on the critical path for a PNG that decodes.
-No C has been written for any of it, so a build reports the entry point as
-unimplemented rather than guessing at the inflate path.
+inflate is verified byte for byte against `zlib`, so what is left is writing it
+out in C. Nothing has been written for any of it yet, so a build reports the
+entry point as unimplemented rather than guessing.
 
 ## Optimize (0x402AD0): how it fits together
 
@@ -1338,21 +1343,141 @@ Two things the fast path does that are easy to get wrong: it **peeks without
 consuming** and then advances only by `codes[peek]`, and it only does that when
 `codes[peek]` is non-zero.
 
-**Still open: the order of the extra bits.** The listing reads them as
-`sar edi, cl; and edi, mask` with `cl = offset & 7`, and the offset counts up,
-so within a byte the bits arrive **least significant first**. RFC 1951 stores
-them most significant first, and the same LSB-first reader is used for the
-Huffman codes, where the reversal in `sub_40A4A0` compensates. For the extra
-bits there is no visible compensating reversal, and the two readings really do
-differ: modelling both and running the corpus end to end, MSB-first gets
-further (6 files decode exactly, the rest diverge mid-stream) while LSB-first
-fails immediately on the first multi-bit field. So at least one of my readings
-is wrong, and it is not the Huffman side, which is now verified. Note also that
-`dword_18DBA98` and `unk_18DC2A0` are the same array seen through two symbols:
-`0x18DC2A0 - 0x18DBA98 == 0x808 == 257 * 8`, and the inflate body indexes it by
-the raw symbol, so `dword_18DBA98[sym]` is entry `sym - 257` of the length table
-`sub_40AF90` builds. That table is the standard one for symbols 257 to 284, and
-it stops there - 285, the 258 byte code, is not in the table at all.
+**What is verified.** The inflate model is verified end to end:
+
+* every one of the 31 IDAT streams in `build/` decodes byte for byte against
+  `zlib`, and 16 further PNGs generated at `zlib` levels 0, 1, 6 and 9 crossed
+  with the default, `Z_FILTERED`, `Z_RLE` and `Z_FIXED` strategies decode
+  exactly as well;
+* that covers stored, fixed and dynamic blocks, codes longer than the 9 bit peek
+  so the `sub_40A440` fallback runs, and multi-bit length and distance fields.
+
+**The extra bits are read least significant bit first**, which is what the
+listing says: `sar edi, cl; and edi, mask` with `cl = offset & 7` and the offset
+counting up takes the low bit of the byte first, and the value is assembled the
+same naive way the Huffman path assembles a code. RFC 1951 stores these fields
+most significant first, so this is worth stating plainly rather than
+second-guessing: it is what the reconstruction does, and it is what decodes real
+streams. The Huffman path is unaffected by the same fact because
+`sub_40A4A0` reverses the canonical codes when it builds its table.
+
+One trap in the distance table, which cost most of the debugging here and is
+worth writing down: the first **four** distance codes have **no** extra bits.
+PNGOUT's `sub_40AF90` builds them by bumping the extra-bit counter on odd indices
+from 2 onwards, which gives `0,0,0,0,1,1,2,2,3,3,...`. The tempting
+`extra = i / 2` is wrong at indices 2 and 3, and reading one bit too many there
+desynchronises the stream with no local symptom.
+
+The pieces underneath are pinned individually as well:
+
+* the code-length parse was done twice over, once by matching canonical codes
+  explicitly and once with `puff`, producing identical lengths and the same
+  ending bit;
+* the direct table was checked against canonical deflate codes for every
+  literal and distance alphabet in the corpus, 0 mismatches;
+* driven against `puff` on a real file, the model agrees symbol for symbol and
+  bit for bit for 4000 consecutive symbols.
+
+**The unfilter's shape, and a trap in reading it.** `sub_40A8D0` is one loop, and
+Hex-Rays renders its exit in a way that reads backwards:
+
+```c
+    if (dword_18D9FA4 > 0)              return;   /* row not finished        */
+    if (dword_18DA23C < dword_18DA254)  expand_row();  /* 0x40AB9D jnb skips it */
+    dword_18DA23C += dword_18DA234;    /* ... but the advance ALWAYS runs */
+```
+
+`jnb loc_40AE33` at `0x40AB9D` skips *only the expansion* when the row index has
+reached the height; `loc_40AE33` is the advance, and the expansion falls straight
+into it. So every completed row is expanded and then the next row is started,
+and the function returns only when the input runs out or a row is left
+half-built. Reading the `jnb` as "skip the advance" - which the decompilation's
+`break` strongly invites - yields a decoder that expands one row per call and
+then does nothing, because `dword_18D9FA4` is left at zero. That is exactly the
+contradiction that stopped the first attempt at `src/decode.c`.
+
+The row index `dword_18DA23C` starts at `ystart + arg_1C` and steps by
+`dword_18DA234`; the height it is compared against, `dword_18DA254`, is
+`arg_14`, and the call site at `0x401E5F` shows `arg_14` is the fourth output of
+`GetImageSize`, i.e. the height. `dword_18D9FA4`, the bytes left in the current
+row, carries across calls, which is how a row can straddle a 16 KB block.
+
+The expansion side is self-consistent and worth keeping: `dword_18DB270` and
+`dword_18DB274` come out as `samples * width - 2` and `-2` for colour type 2 with
+no interlace, which walks exactly `width` pixels.
+
+`src/decode.c` now implements the PNG path: chunk walk, bit reader and pump, the
+three Huffman helpers, the inflate body, the unfilter and the row expansion, for
+colour types 0, 2, 3, 4 and 6 at depths 1, 2, 4 and 8. Interlaced input is
+refused rather than guessed at.
+
+**How far it is verified, precisely.** The inflate half is verified byte for byte
+against `zlib` on all 31 corpus streams and 16 generated ones. The decoder runs
+end to end through `main()`: `pngout.exe /c6 /force png_0.png out.png` reports
+`In: png_0.png /c2 /f5` - the right colour type, depth and PNGOUT's own filter -
+and writes a 32x24 file. **The pixels do not match yet**: comparing the output
+against the source shows all 768 differing, so the expansion's byte placement is
+wrong. The jump table at `0x40A97A` dispatches on `coltype - 2`, so
+`coltype 2` is the block at `0x40ADB0` and `coltype 4` the one at `0x40AD5A`;
+the `coltype 6` block is the one that has not been read yet, and the `coltype 2`
+byte sources need checking against it. The unfilter itself is exercised and
+produces rows of the right length, so the defect is in the expansion, not
+upstream.
+
+**The decoder now produces pixels, and here is exactly where it stands.**
+
+An 8x4 depth-8 greyscale image with every filter byte zero comes back
+pixel-exact with no non-opaque alpha. A 4x4 RGB image with every filter byte zero
+comes back with **row 0 exact and rows 1-3 wrong**, so the remaining defect is
+per-row state rather than the expansion - every row goes through identical
+indexing. Across the 15 RGB corpus images, 3 round-trip exactly and 12 differ.
+Greyscale and palette inputs have not been compared pixel-for-pixel yet.
+
+**Five defects found by testing pixels, all fixed:**
+
+* **`Unfilter()` cached the filter type before resolving it.** It did
+  `f = CurFilter`, and only when `f < 0` did it call `StartFilterByte(buf[0])` -
+  which sets `CurFilter`, not the local. The switch then ran on a stale `-1`,
+  matched nothing, and the whole inflate produced no pixels at all. This was the
+  root cause: every decode silently wrote nothing, and the destination stayed
+  uninitialised heap, which is what `ScanImage()` was reporting as
+  "requires full alpha".
+* The type-2 and type-6 expansions read `Up[v+1]` and `Up[v+2]` - *ascending* -
+  not descending (`0x40ADB0`, `0x40AD20`). Against the back-to-front staging row
+  that yields the file's B, G, R, landing the pixel as `0xFFBBGGRR`. Type 4
+  reads `Up[v]` and `Up[v-1]` and is right as first written.
+* Colour types 0 and 3 were never expanded. `def_40ABE8` only advances the
+  destination pointer, because the original inflates those two straight into the
+  destination. Staging the row separately means the cases must be written out.
+* Sub-byte depths indexed `Up[v >> 3]` against a downward bit index, which cannot
+  work against the reversed row. `PackedSample()` maps back to an ascending row
+  position first.
+* The destination is a running pointer (`dword_18CBF00`, stepped at
+  `loc_40AE2D`), not `base + pitch * row`. It must also be initialised **once** -
+  putting it in the per-row `ResetPass()` made `DestRow += DestPitch` a no-op.
+
+**Two `main()` defects, both fixed.**
+
+* `SETTINGS s;` was never initialised, so `s.coltype`, `s.filter` and `s.bitdepth`
+  were whatever was on the stack - and `Optimize()` reads `s.coltype` straight
+  into the output colour type, so a run with no `/c` picked an arbitrary one.
+  They now get the "automatic" defaults the layout documents, plus
+  `blocksplit = 256.0`.
+* The write path tested `haveout` to decide stdout versus a file, but `haveout`
+  means *an output filename was given*. So naming an output file sent the PNG to
+  stdout instead. The test is `instdin`, which is what actually means "the
+  stream is stdout".
+
+Both were invisible until now because `DecodeImage` aborted before either could
+run.
+
+Also worth recording: `dword_18DBA98` and `unk_18DC2A0` are the same array seen
+through two symbols. `0x18DC2A0 - 0x18DBA98 == 0x808 == 257 * 8`, and the inflate
+body indexes it by the raw symbol, so `dword_18DBA98[sym]` is entry `sym - 257`
+of the length table `sub_40AF90` builds. That table is the standard one for
+symbols 257 to 284, and the loop stops there - **symbol 285, the 258 byte code,
+is written explicitly just after it** as `dword_18DC380 = 0` and
+`dword_18DC384 = 258`, so the table has 29 entries, not 28.
 
 ### The Adam7 tables in `sub_40A630`
 
@@ -1394,13 +1519,13 @@ named `FMT_PAL8`.
 
 ### Still to do inside DecodeImage
 
-The chunk walk, the inflate body, the unfilter and three of the four Huffman
-helpers are worked through, so what is left splits cleanly:
+The chunk walk, the unfilter and three of the four Huffman helpers are worked
+through and the helpers are verified against zlib. What is left:
 
-* `sub_40A580` / `sub_40A4A0` / `sub_40A440`, the Huffman helpers. Transcribed
-  and checked against zlib: all three reproduce puff's `construct`, a correct
-  direct table, and puff's `decode` exactly. The bodies themselves are still to
-  be written out in C.
+* Transcribing the inflate body into C. The model is verified byte for byte
+  against `zlib` on all 31 corpus streams and 16 generated ones, so this is
+  mechanical rather than open-ended; see **The Huffman helpers** for the pinned
+  conventions.
 * Transcribing any of the above. Nothing has been written to `src\` for
   `DecodeImage` yet, so a build still reports it unimplemented rather than
   guessing at the inflate path.

@@ -93,8 +93,8 @@ unsigned char OutColType;        /* 0x190A824: colour type we will write    */
 unsigned char OutBitDepth;       /* 0x190A825: bit depth we will write      */
 int NumBlocks;                   /* 0x190A400: how many deflate blocks the
                                  *          best trial used                 */
-int dword_190A420[6];            /* 0x190A420: table filled in by the
-                                 *          decoders                       */
+int dword_190A420[256];           /* 0x190A420: the greyscale ramp or the
+                                  *          palette, 256 entries           */
 int unk_190A820;                 /* 0x190A820: number of palette entries    */
 int unk_190A1C4;                 /* 0x190A1C4: height of the tRNS chunk    */
 int unk_190A828;                 /* 0x190A828: 24184 marks a PNG we wrote  */
