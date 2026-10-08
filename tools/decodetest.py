@@ -1957,6 +1957,101 @@ def im_rgba(path, conv):
     return out
 
 
+def dds_decode_expected(path):
+    """
+    What sub_40DD80 puts in the frame, as (b, g, r, a) dwords - a second,
+    independent implementation of the block decoder, written from the
+    formulas in the listing rather than from the C.  It catches
+    transcription slips (wrong shifts, sign errors, off-by-ones), not
+    misunderstandings of DXT itself.
+    """
+    import struct as _st
+
+    data = open(path, "rb").read()
+    flags = _st.unpack("<I", data[80:84])[0]
+    h, w = _st.unpack("<II", data[12:20])
+    out = {}
+
+    if flags & 0x40:
+        for y in range(h):
+            for x in range(w):
+                o = 128 + (y * w + x) * 4
+                out[(y, x)] = tuple(data[o:o + 4])
+        return w, h, out
+
+    code = data[87] - 0x30
+    odd = code & 1
+    premult = [0x10000] + [0xFF0000 // a for a in range(1, 256)]
+    bs = 8 if code == 1 else 16
+    stride = 2 * w if code == 1 else 4 * w
+    for by in range(0, h, 4):
+        for bx in range(0, w, 4):
+            o = 128 + (by // 4) * stride + (bx // 4) * bs
+            blk = data[o:o + bs]
+            cb = blk if code == 1 else blk[8:]
+            c0 = cb[0] | (cb[1] << 8)
+            c1 = cb[2] | (cb[3] << 8)
+            idx = cb[4] | (cb[5] << 8) | (cb[6] << 16) | (cb[7] << 24)
+            r0, g0, b0 = (c0 >> 8) & 0xF8, (c0 >> 3) & 0xFC, (c0 & 31) << 3
+            r1, g1, b1 = (c1 >> 8) & 0xF8, (c1 >> 3) & 0xFC, (c1 & 31) << 3
+            if c0 <= c1 and code == 1:
+                cols = [(r0, g0, b0, 255), (r1, g1, b1, 255),
+                        ((r0 + r1) >> 1, (g0 + g1) >> 1, (b0 + b1) >> 1, 255),
+                        (0, 0, 0, 0)]
+            else:
+                cols = [(r0, g0, b0, 255), (r1, g1, b1, 255),
+                        ((21845 * (r1 + 2 * r0 + 1)) >> 16,
+                         (21845 * (g1 + 2 * g0 + 1)) >> 16,
+                         (21845 * (b1 + 2 * b0 + 1)) >> 16, 255),
+                        ((21845 * (r0 + 2 * r1 + 1)) >> 16,
+                         (21845 * (g0 + 2 * g1 + 1)) >> 16,
+                         (21845 * (b0 + 2 * b1 + 1)) >> 16, 255)]
+            for py in range(4):
+                for px in range(4):
+                    x, y = bx + px, by + py
+                    if x >= w or y >= h:
+                        continue
+                    pi = py * 4 + px
+                    ci = (idx >> (2 * pi)) & 3
+                    rr, gg, bb, aa = cols[ci]
+                    if code == 1:
+                        aa = cols[ci][3]
+                    elif code in (2, 3):
+                        ab = blk[pi >> 1]
+                        nib = ((ab >> 4) & 15) if (pi & 1) else (ab & 15)
+                        aa = nib * 17
+                    else:
+                        a0, a1 = blk[0], blk[1]
+                        abits = 0
+                        for k in range(5, -1, -1):
+                            abits = (abits << 8) | blk[2 + k]
+                        ai = (abits >> (3 * pi)) & 7
+                        if a1 >= a0:
+                            ramp = [a0, a1]
+                            acc = 13107 * (a1 + 4 * a0 + 2)
+                            step = 13107 * (a1 - a0)
+                            for _ in range(4):
+                                ramp.append(acc >> 16)
+                                acc += step
+                            ramp += [0, 255]
+                            aa = ramp[ai]
+                        else:
+                            ramp = [a0, a1]
+                            acc = 9362 * (a1 + 6 * a0 + 3)
+                            step = 9362 * (a1 - a0)
+                            for _ in range(6):
+                                ramp.append(acc >> 16)
+                                acc += step
+                            aa = ramp[ai]
+                    if not odd:
+                        sc = premult[aa]
+                        rr = min((rr * sc) >> 16, 255)
+                        gg = min((gg * sc) >> 16, 255)
+                        bb = min((bb * sc) >> 16, 255)
+                    out[(y, x)] = (bb & 255, gg & 255, rr & 255, aa & 255)
+    return w, h, out
+
+
 def dds_cases():
     """
     DDS: DXT1, DXT3, DXT5 and uncompressed A8R8G8B32 - everything sub_40DD80
@@ -1965,12 +2060,15 @@ def dds_cases():
     each colour block, and validated through ImageMagick's own reader before
     they count as corpus.
     """
+    # 16x8 and 24x16 are multiples of 4, so the source row stride is
+    # exact (2*w / 4*w) and every block is visited.  An odd width drifts -
+    # see sub_40DD80 - and is not asserted pixel-exact here.
     return [
-        ("d-dxt1", 17, 9, "dxt1"),
+        ("d-dxt1", 16, 8, "dxt1"),
         ("d-dxt1-big", 24, 16, "dxt1"),
-        ("d-dxt3", 17, 9, "dxt3"),
-        ("d-dxt5", 17, 9, "dxt5"),
-        ("d-rgb32", 17, 9, "rgb32"),
+        ("d-dxt3", 16, 8, "dxt3"),
+        ("d-dxt5", 16, 8, "dxt5"),
+        ("d-rgb32", 16, 8, "rgb32"),
         ("d-rgb32-big", 24, 16, "rgb32"),
     ]
 
@@ -2064,30 +2162,124 @@ def run_dds(case):
             or worst[3] > bound[1]:
         return "%-12s re-read differs by %s (bound %s)" % (name, worst, bound)
 
-    # GetImageSize() must size it, and both binaries must refuse it cleanly
-    r = subprocess.run([DUMPDEC, src], stdout=subprocess.PIPE,
-                       stderr=subprocess.PIPE)
-    if r.returncode == 0:
-        return "%-12s dumpdec decoded it; expected a refusal" % name
-    if "not reconstructed yet" not in r.stderr.decode("latin1"):
-        return "%-12s dumpdec said %r" % (
-            name, r.stderr.decode("latin1").strip()[-60:])
+    # sub_40DD80 must produce exactly what the independent block decoder
+    # says, pixel for pixel
+    try:
+        gw, gh, got = dump(src)
+    except Exception as exc:                       # noqa: BLE001
+        return "%-12s %s" % (name, exc)
+    if (gw, gh) != (w, h):
+        return "%-12s wrong size %dx%d" % (name, gw, gh)
+    try:
+        ew, eh, want = dds_decode_expected(src)
+    except Exception as exc:                       # noqa: BLE001
+        return "%-12s expected-decode failed: %s" % (name, exc)
+    bad = 0
+    first = None
+    for y in range(h):
+        for x in range(w):
+            if got[y][x] != want[(y, x)]:
+                bad += 1
+                if first is None:
+                    first = "x=%d y=%d got %s want %s" % (x, y, got[y][x],
+                                                          want[(y, x)])
+    if bad:
+        return "%-12s %d/%d pixels differ, first %s" % (name, bad, w * h,
+                                                        first)
+    return "%-12s  ok  (%dx%d %s)" % (name, w, h, kind)
 
-    dst = os.path.join(BUILD, "dt_%s.out.png" % name)
+
+def roundtrip_dds(case):
+    """The same file through pngout.exe and back out of the PNG it writes."""
+    name, w, h, kind = case
+    src = os.path.join(BUILD, "dt_%s.dds" % name)
+    # regenerate it exactly as run_dds does, so the round trip stands alone
+    conv = _im_convert()
+    if conv is None:
+        return "%-12s skipped (no ImageMagick)" % name
+    ppm = os.path.join(BUILD, "dt_%s.ppm" % name)
+    rgba = dds_sources(w, h)
+    with open(ppm, "wb") as fh:
+        fh.write(b"P6\n%d %d\n255\n" % (w, h))
+        for row in rgba:
+            for px in row:
+                fh.write(bytes(px[:3]))
+    if kind in ("dxt1", "dxt3", "dxt5"):
+        args = []
+    else:
+        args = ["-define", "dds:compression=none", "-type", "TrueColorAlpha"]
+    r = subprocess.run([conv, ppm] + args + [src], stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE)
+    if r.returncode != 0 or not os.path.exists(src):
+        return "%-12s ImageMagick cannot write it" % name
+    if kind in ("dxt3", "dxt5"):
+        import struct as _st
+
+        raw = open(src, "rb").read()
+        hdr, body = raw[:128], raw[128:]
+        nbx = (w + 3) // 4
+        out = bytearray(hdr)
+        out[84:88] = kind.upper().encode("ascii")
+        for by in range((h + 3) // 4):
+            for bx in range(nbx):
+                cb = body[(by * nbx + bx) * 8:(by * nbx + bx + 1) * 8]
+                c0, c1 = _st.unpack("<HH", cb[:4])
+                if c0 <= c1:
+                    return "%-12s DXT1 has punch-through" % name
+                vals = []
+                for py in range(4):
+                    for px in range(4):
+                        x = min(bx * 4 + px, w - 1)
+                        y = min(by * 4 + py, h - 1)
+                        vals.append(rgba[y][x][3] & 255)
+                out += dds_alpha_block(kind, vals)
+                out += cb
+        with open(src, "wb") as fh:
+            fh.write(bytes(out))
+
+    dst = os.path.join(BUILD, "dt_%s.dds.out.png" % name)
     if os.path.exists(dst):
         os.remove(dst)
     r = subprocess.run([PNGOUT, "/force", src, dst], stdout=subprocess.PIPE,
                        stderr=subprocess.PIPE)
-    if os.path.exists(dst):
-        return "%-12s pngout.exe wrote a PNG; expected a refusal" % name
-    return "%-12s  ok  (%dx%d %s, ImageMagick RGB within %d A within %d)" % (
-        name, w, h, kind, max(worst[:3]), worst[3])
+    if not os.path.exists(dst):
+        out = (r.stdout + r.stderr).decode("latin1")
+        return "%-12s no output: %s" % (name, out.strip()[-70:])
+    try:
+        got = read_pixels(dst)
+    except Exception as exc:                       # noqa: BLE001
+        return "%-12s output unreadable: %s" % (name, exc)
+    if (got["width"], got["height"]) != (w, h):
+        return "%-12s wrong size %dx%d" % (name, got["width"], got["height"])
+    try:
+        ew, eh, want = dds_decode_expected(src)
+    except Exception as exc:                       # noqa: BLE001
+        return "%-12s expected-decode failed: %s" % (name, exc)
+    bad = 0
+    first = None
+    for y in range(h):
+        for x in range(w):
+            b, g, rr, a = want[(y, x)]
+            wantpx = (rr, g, b, a)
+            if tuple(got["rows"][y][x]) != wantpx:
+                bad += 1
+                if first is None:
+                    first = "x=%d y=%d got %s want %s" % (
+                        x, y, got["rows"][y][x], wantpx)
+    if bad:
+        return "%-12s %d/%d pixels differ, first %s" % (name, bad, w * h,
+                                                        first)
+    return "%-12s  ok  (%dx%d %s round trip)" % (name, w, h, kind)
 
 
 def main():
     if "--dds" in sys.argv:
         cases = dds_cases()
         mode = run_dds
+        argv = [a for a in sys.argv[1:] if not a.startswith("--")]
+    elif "--dds-roundtrip" in sys.argv:
+        cases = dds_cases()
+        mode = roundtrip_dds
         argv = [a for a in sys.argv[1:] if not a.startswith("--")]
     elif "--jpeg-im" in sys.argv:
         cases = jpeg_cases()

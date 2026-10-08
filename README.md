@@ -2480,47 +2480,45 @@ So finishing JPEG needs two things, and neither is analysis any more:
    wrong segment, so the same extended dump may answer it - which is why 1 and 2
    are really one job.
 
-### `sub_40DD80`, DDS (format code 7) — analysed, not transcribed
+### `sub_40DD80`, DDS (format code 7)
 
-1158 listing lines, 1705 bytes. Not transcribed yet. The front end is short and
-completely determined, so it is worth writing down:
+Transcribed as `DecodeDds()`, 1158 listing lines, and verified pixel-exact
+with six cases in each direction.
 
-* The 124 byte header is followed by the pixel data at `ebx + 0x80`
-  (`add ebx, 80h`), and the surface size is at `+0x0C`/`+0x10` — height and
-  width, as `sub_409260` reads them.
-* `dword +0x50` is `ddspf.flags`, and it is tested twice, in this order:
+The front end is as analysed: `ddspf.flags` at +80, DDPF_RGB (0x40) taking an
+uncompressed A8R8G8B32 surface with the four masks exactly, DDPF_FOURCC (0x4)
+reading `'D' 'X' 'T' c` with `c - '0'` in 1..5, and `and eax, 1` at `0x40DEFE`
+sending the odd codes down the straight path.
 
-  * **`DDPF_RGB` (0x40)** — an uncompressed surface. The requirements are all
-    spelled out at `0x40DDAA`: 32 bits a pixel (`+0x58`), and the four masks
-    exactly `0x00FF0000`, `0x0000FF00`, `0x000000FF`, `0xFF000000`. Anything
-    else goes to the reject at `0x40E41C`. What follows is a plain row copy —
-    `rep movsd` plus a `rep movsb` for the remainder — from the surface to the
-    destination, clipped against the width and height it was passed at
-    `0x40DE2C` and `0x40DE3B`.
-  * **`DDPF_FOURCC` (0x4)** — a compressed surface. `0x40DEB7` reads the fourCC as
-    `'D' 'X' 'T' c` (`cmp al, 44h` / `cmp [ebx+55h], 58h` /
-    `cmp [ebx+56h], 54h`) and requires `c - '0'` to be between 1 and 5, which is
-    DXT1 through DXT5. The bit that matters next is `and eax, 1` at `0x40DEFE`:
-    the *odd* codes (DXT1, DXT3, DXT5) take the four-colour DXT1 block and the
-    even ones (DXT2, DXT4) the three-colour punch-through variant.
+**The even codes store premultiplied colour and the decoder divides it back
+out.** `0x40DF0E` builds a 256-entry table with `v101[a] = 0xFF0000 / a`
+(`v101[0] = 0x10000`, to avoid the divide by zero), and each channel goes out
+as `(channel * v101[alpha]) >> 16` with saturation - i.e. channel * 255 / alpha.
+So DXT2 and DXT4 are un-premultiplied to straight RGB here, and the odd codes
+skip it. The even codes also never punch through: the `c0 <= c1` test requires
+`v63 == 1` as well.
 
-So the whole of the non-block part is about forty instructions and the rest is
-the block decoder — a DXT1/DXT2 colour block, the DXT3 and DXT5 explicit-alpha
-blocks, and the per-format block sizing. Nothing has been transcribed yet, but the reason it had not been - that DXT
-files could not be written by anything in the tree - is gone. ImageMagick
-writes DXT1 (its default, and it ignores requests for DXT3/DXT5) and
-uncompressed 32-bit with `-type TrueColorAlpha`, which gives exactly the four
-masks `0x40DDAA` requires. DXT3 and DXT5 start life as ImageMagick's DXT1 with
-an 8-byte alpha block prepended to each colour block - explicit 4-bit nibbles
-for DXT3, two endpoints plus 48 bits of 3-bit indices for DXT5 with the
-endpoints ordered max-then-min so the eight-value interpolation is used - and
-both are validated through ImageMagick's own reader before they count as
-corpus (RGB within the DXT1 bound, alpha within 14 for DXT3 and 4 for DXT5).
-`python tools/decodetest.py --dds` runs six cases over the four, generated
-and read back by ImageMagick itself, sized and refused cleanly. The colour
-half of a DXT3/5 file must be four-colour throughout, so the builder refuses
-a punch-through block rather than extending it - which an opaque source never
-produces anyway.
+The colour block is a DXT1 block for every code. The endpoints expand with
+R = `(c >> 8) & 0xF8`, G = `(c >> 3) & 0xFC`, B = `(c & 31) << 3` - G is `<< 2`,
+not the usual `<< 3 | >> 3 - and the four-colour ramp is `(21845 * x) >> 16`,
+i.e. /3, while DXT1 with `c0 <= c1` takes the average and a transparent fourth.
+The alpha is per code: DXT1 from a four-entry table, DXT2/3 an explicit nibble
+times 17 (low nibble first), DXT4/5 an 8-entry ramp with `(13107 * x) >> 16`
+(/5) for the six-value case and `(9362 * x) >> 16` (/7) for the eight-value
+one - and those two constants are the right way round, the six-value branch
+being `a1 >= a0`, which is worth checking because the decompiler's branch order
+invites reading them swapped. The 3-bit indices are read as unaligned fields
+out of the six bytes, the same way the original's dword-at-an-offset does.
+
+The source row stride is `2 * width` for DXT1 and `4 * width` otherwise, which
+is `(width/4) * blocksize` only for a multiple of 4 - otherwise the rows drift,
+and the edge blocks are still visited with per-pixel clipping. In the original,
+and reproduced; the cases use multiples of 4 so the stride is exact.
+
+`tools/decodetest.py --dds` and `--dds-roundtrip` check six cases - DXT1,
+DXT3, DXT5 and uncompressed32, in two sizes - with the expected pixels computed
+by an independent block decoder in the harness, so the C is checked against the
+formulas rather than against itself.
 
 ### Still to do inside DecodeImage
 
@@ -2532,16 +2530,17 @@ verified pixel for pixel. What is left:
   at, because the pass table it reads is not a partition of the image and so
   could not be checked against anything - see **The Adam7 tables** above.
 * The other two decoders — JPEG and DDS — and re-declaring the 22 MB of
-  `.bss` they use. Six of the eight input formats are transcribed now: PNG, the
-  8bpp palettised one, GIF, PCX, Targa and BMP. The two left, measured:
+  `.bss` they use. Seven of the eight input formats are transcribed now: PNG, the
+  8bpp palettised one, GIF, PCX, Targa, BMP and DDS. The one left, measured:
 
   | original | listing lines | bytes | note |
   |---|---|---|---|
-  | `0x40DD80` DDS | 1 158 | 1 705 | front end read, above; needs hand-built DXT to check |
-  | `0x40B180` JPEG | 3 491 | 5 058 | baseline sequential, with Huffman, IDCT, upsampling, YCbCr |
+  | `0x40B180` JPEG | 3 491 | 5 058 | front end read, above; entropy body blocked on two reference gaps |
 
-  JPEG is about twice GIF and wants a pass of its own. Its corpus now exists -
-  `tools/jpeglib.py`, 33 cases - so the remaining work is the entropy body.
+  The corpus exists - `tools/jpeglib.py`, 33 cases, plus a progressive file -
+  and the IDCT, the Huffman reader, the progressive refinement and the colour
+  conversion are all read. What is missing is eight dwords at `0x4110D8` and
+  the writer of two `.bss` arrays; see the JPEG section.
 
 ## Verification so far
 
@@ -2572,7 +2571,8 @@ python tools\decodetest.py --gif-roundtrip   the same eleven through pngout.exe
 python tools\decodetest.py --jpeg       JPEG, 33 cases (see below)
 python tools\decodetest.py --jpeg-im    the same 33 through ImageMagick,
                                     plus a progressive file it generates
-python tools\decodetest.py --dds        DDS, 4 cases via ImageMagick
+python tools\decodetest.py --dds        DDS, 6 cases
+python tools\decodetest.py --dds-roundtrip   the same six through pngout.exe
 ```
 
 `--jpeg` is the odd one out: `sub_40B180` is not transcribed, so there are no

@@ -2213,6 +2213,273 @@ static int DecodeGif(const unsigned char *data, int size, unsigned char *pixels,
     return 0;
 }
 
+/* ------------------------------------------------------------------ */
+/*  sub_40DD80: DDS, format code 7                                    */
+/* ------------------------------------------------------------------ */
+
+/*
+ *  sub_40DD80: DDS, format code 7.
+ *
+ *  Two arms, chosen by ddspf.flags at +80 in this order.  DDPF_RGB (0x40) is an
+ *  uncompressed surface and takes four masks exactly - 0x00FF0000, 0x0000FF00,
+ *  0x000000FF, 0xFF000000 at 0x40DDAA, 32 bits a pixel, anything else to the
+ *  reject - then a plain row copy with clipping.  DDPF_FOURCC (0x4) reads the
+ *  fourCC as 'D' 'X' 'T' c and requires c - '0' in 1..5; `and eax, 1` at
+ *  0x40DEFE sends the odd codes down the straight path and the even ones
+ *  through the un-premultiply.
+ *
+ *  The colour block is a DXT1 block for every code: two 565 endpoints and four
+ *  bytes of 2-bit indices.  The endpoints expand with R = (c >> 8) & 0xF8,
+ *  G = (c >> 3) & 0xFC and B = (c & 31) << 3 - note G is << 2, not the usual
+ *  << 3 | >> 3 - and the four-colour ramp is (21845 * x) >> 16, i.e. /3, while
+ *  DXT1 with c0 <= c1 uses the average and a transparent fourth.  The even
+ *  codes never punch through; the `c0 <= c1` test also requires v63 == 1.
+ *
+ *  The alpha is per code: DXT1 from a four-entry table ([255,255,255,255], or
+ *  [255,255,255,0] punched), DXT2/3 an explicit nibble * 17, DXT4/5 an 8-entry
+ *  ramp built with (13107 * x) >> 16 (/5) for the six-value case and
+ *  (9362 * x) >> 16 (/7) for the eight-value one, indexed by 3-bit fields.
+ *  The even codes then divide the colour back out through v101[a] =
+ *  0xFF0000 / a (v101[0] = 0x10000), i.e. channel * 255 / alpha with saturation
+ *  - DXT2/4 store premultiplied colour and this recovers straight RGB.
+ *
+ *  The source row stride is 2 * width for DXT1 and 4 * width otherwise
+ *  (0x40DF3B/0x40DF44: v78), which is (width/4) * blocksize only when the width
+ *  is a multiple of 4.  Otherwise the rows drift, and the edge blocks are
+ *  still visited with per-pixel clipping - in the original, and reproduced.
+ */
+static int DecodeDds(const unsigned char *data, int size, unsigned char *pixels,
+                     int pitch, unsigned int width, unsigned int height,
+                     int xorigin, int yorigin)
+{
+    unsigned flags, w, h, code;
+    const unsigned char *row0;
+    int bx, by, px, py, odd;
+    int R[4], G[4], B[4], A[4];
+    int i;
+    static int premult[256];
+    static int premult_done = 0;
+
+    (void)size;
+
+    OutColType = 6;
+    OutBitDepth = 8;
+
+    flags = *(const unsigned *)(data + 80);
+    h = *(const unsigned *)(data + 12);
+    w = *(const unsigned *)(data + 16);
+
+    /* ---- DDPF_RGB: uncompressed A8R8G8B32, 0x40DDAA ---- */
+
+    if (flags & 0x40) {
+        const unsigned char *s;
+        unsigned char *d;
+        int cw = (int)w, ch = (int)h;
+
+        if (*(const unsigned *)(data + 88) != 32 ||
+            *(const unsigned *)(data + 92) != 0x00FF0000u ||
+            *(const unsigned *)(data + 96) != 0x0000FF00u ||
+            *(const unsigned *)(data + 100) != 0x000000FFu ||
+            *(const unsigned *)(data + 104) != 0xFF000000u)
+            return -1;
+
+        d = pixels + (size_t)yorigin * pitch + (size_t)xorigin * 4;
+        s = data + 128;
+        if (xorigin < 0) {
+            d = pixels + (size_t)yorigin * pitch;
+            s -= 4 * xorigin;
+            cw += xorigin;
+        }
+        if (cw > (int)(width - xorigin))
+            cw = (int)(width - xorigin);
+        if (ch > (int)(height - yorigin))
+            ch = (int)(height - yorigin);
+        for (i = 0; i < ch; i++) {
+            if (i + yorigin < (int)height)
+                memcpy(d, s, (size_t)cw * 4);
+            d += pitch;
+            s += (size_t)cw * 4;
+        }
+        return 0;
+    }
+
+    if (!(flags & 4))
+        return -1;
+
+    /* ---- DDPF_FOURCC: 'D' 'X' 'T' c, 0x40DEB7 ---- */
+
+    if (data[84] != 'D' || data[85] != 'X' || data[86] != 'T')
+        return -1;
+    code = (unsigned)(data[87] - '0');
+    if (code < 1 || code > 5)
+        return -1;
+    odd = (int)(code & 1);
+
+    /* the un-premultiply table, 0x40DF0E: v101[a] = 0xFF0000 / a */
+    if (!premult_done) {
+        for (i = 1; i < 256; i++)
+            premult[i] = (int)(0xFF0000u / (unsigned)i);
+        premult[0] = 0x10000;
+        premult_done = 1;
+    }
+
+    row0 = data + 128;
+    {
+        int stride = (code == 1) ? 2 * (int)w : 4 * (int)w;
+
+        for (by = 0; by < (int)h; by += 4) {
+            const unsigned char *blkrow =
+                row0 + (size_t)(by / 4) * (size_t)stride;
+            for (bx = 0; bx < (int)w; bx += 4) {
+                const unsigned char *blk = blkrow + (size_t)(bx / 4) *
+                    (code == 1 ? 8 : 16);
+                const unsigned char *cb = blk + (code == 1 ? 0 : 8);
+                unsigned c0 = (unsigned)cb[0] | ((unsigned)cb[1] << 8);
+                unsigned c1 = (unsigned)cb[2] | ((unsigned)cb[3] << 8);
+                unsigned idx = (unsigned)cb[4] | ((unsigned)cb[5] << 8) |
+                               ((unsigned)cb[6] << 16) | ((unsigned)cb[7] << 24);
+                int r0 = (int)((c0 >> 8) & 0xF8);
+                int g0 = (int)((c0 >> 3) & 0xFC);
+                int b0 = (int)((c0 & 31) << 3);
+                int r1 = (int)((c1 >> 8) & 0xF8);
+                int g1 = (int)((c1 >> 3) & 0xFC);
+                int b1 = (int)((c1 & 31) << 3);
+
+                R[0] = r0; G[0] = g0; B[0] = b0; A[0] = 255;
+                R[1] = r1; G[1] = g1; B[1] = b1; A[1] = 255;
+                if (c0 <= c1 && code == 1) {
+                    /* punch-through: the average, then transparent */
+                    R[2] = (r0 + r1) >> 1;
+                    G[2] = (g0 + g1) >> 1;
+                    B[2] = (b0 + b1) >> 1;
+                    A[2] = 255;
+                    R[3] = G[3] = B[3] = A[3] = 0;
+                } else {
+                    R[2] = (int)((21845u * (unsigned)(r1 + 2 * r0 + 1)) >> 16);
+                    G[2] = (int)((21845u * (unsigned)(g1 + 2 * g0 + 1)) >> 16);
+                    B[2] = (int)((21845u * (unsigned)(b1 + 2 * b0 + 1)) >> 16);
+                    A[2] = 255;
+                    R[3] = (int)((21845u * (unsigned)(r0 + 2 * r1 + 1)) >> 16);
+                    G[3] = (int)((21845u * (unsigned)(g0 + 2 * g1 + 1)) >> 16);
+                    B[3] = (int)((21845u * (unsigned)(b0 + 2 * b1 + 1)) >> 16);
+                    A[3] = 255;
+                }
+
+                /* ---- the per-pixel loop, with clipping ---- */
+                for (py = 0; py < 4; py++) {
+                    int dy = yorigin + by + py;
+
+                    if (dy < 0 || dy >= (int)height)
+                        continue;
+                    for (px = 0; px < 4; px++) {
+                        int dx = xorigin + bx + px;
+                        int pi = py * 4 + px;
+                        int ci = (int)((idx >> (2 * pi)) & 3);
+                        int rr = R[ci], gg = G[ci], bb = B[ci], aa = A[ci];
+
+                        if (dx < 0 || dx >= (int)width)
+                            continue;
+
+                        if (code == 1) {
+                            aa = A[ci];
+                        } else if (code == 2 || code == 3) {
+                            /* explicit 4-bit alpha, low nibble first */
+                            unsigned ab = blk[(pi >> 1)];
+                            int nib = (pi & 1) ? (ab >> 4) & 15 : ab & 15;
+
+                            aa = nib * 17;
+                        } else {
+                            /* interpolated alpha, 3-bit indices LSB first */
+                            unsigned a0 = blk[0], a1 = blk[1];
+                            int ai, b, o;
+                            unsigned w16;
+
+                            /*
+                             *  A 3-bit field can straddle two bytes, so two
+                             *  are loaded - except at the end of the six,
+                             *  where the field always fits in the last byte.
+                             *  (VC6 has no `long long`, so not a 48-bit int.)
+                             */
+                            b = (3 * pi) >> 3;
+                            o = (3 * pi) & 7;
+                            w16 = blk[2 + b] |
+                                  ((b < 5 ? blk[2 + b + 1] : 0) << 8);
+                            ai = (int)((w16 >> o) & 7);
+                            if ((int)a1 >= (int)a0) {
+                                /* six values, then 0 and 255 */
+                                int ramp[8];
+
+                                ramp[0] = (int)a0;
+                                ramp[1] = (int)a1;
+                                {
+                                    int acc = (int)(13107u *
+                                        (unsigned)(a1 + 4 * (int)a0 + 2));
+                                    int step = (int)(13107u * (unsigned)
+                                        ((int)a1 - (int)a0));
+                                    int t;
+
+                                    for (t = 2; t < 6; t++) {
+                                        ramp[t] = acc >> 16;
+                                        acc += step;
+                                    }
+                                }
+                                ramp[6] = 0;
+                                ramp[7] = 255;
+                                aa = ramp[ai];
+                            } else {
+                                /* eight values */
+                                int ramp[8];
+
+                                ramp[0] = (int)a0;
+                                ramp[1] = (int)a1;
+                                {
+                                    int acc = (int)(9362u *
+                                        (unsigned)(a1 + 6 * (int)a0 + 3));
+                                    int step = (int)(9362u * (unsigned)
+                                        ((int)a1 - (int)a0));
+                                    int t;
+
+                                    for (t = 2; t < 8; t++) {
+                                        ramp[t] = acc >> 16;
+                                        acc += step;
+                                    }
+                                }
+                                aa = ramp[ai];
+                            }
+                        }
+
+                        if (!odd) {
+                            /* DXT2/4 store premultiplied: divide it back out */
+                            int s = premult[aa & 255];
+
+                            rr = (rr * s) >> 16;
+                            if (rr > 255)
+                                rr = 255;
+                            gg = (gg * s) >> 16;
+                            if (gg > 255)
+                                gg = 255;
+                            bb = (bb * s) >> 16;
+                            if (bb > 255)
+                                bb = 255;
+                        }
+
+                        {
+                            unsigned char *dst = pixels +
+                                (size_t)dy * pitch + (size_t)dx * 4;
+
+                            dst[0] = (unsigned char)(bb & 255);
+                            dst[1] = (unsigned char)(gg & 255);
+                            dst[2] = (unsigned char)(rr & 255);
+                            dst[3] = (unsigned char)(aa & 255);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return 0;
+}
+
 int DecodeImage(unsigned char *fileimg, int filesize, unsigned char *pixels,
                 int pitch, unsigned int width, unsigned int height,
                 int unused7, int unused8)
@@ -2223,7 +2490,7 @@ int DecodeImage(unsigned char *fileimg, int filesize, unsigned char *pixels,
     /*
      *  sub_409560's dispatch, in its order.  The format codes it returns are
      *  1 PNG, 2 JPEG, 3 GIF, 4 the 8bpp palette below, 5 BMP, 6 PCX, 7 DDS and
-     *  8 Targa; of those 1, 3, 4, 5, 6 and 8 are transcribed.
+     *  8 Targa; of those 1, 3, 4, 5, 6, 7 and 8 are transcribed.
      */
     if (fileimg && filesize >= 2) {
         if (fileimg[0] == 0x89 && fileimg[1] == 'P')
@@ -2246,6 +2513,11 @@ int DecodeImage(unsigned char *fileimg, int filesize, unsigned char *pixels,
             return DecodeGif(fileimg, filesize, pixels, pitch, width, height,
                              unused7, unused8);
 
+        if (*(const unsigned int *)fileimg == 0x20534444u &&
+            *(const unsigned int *)(fileimg + 4) == 124u)
+            return DecodeDds(fileimg, filesize, pixels, pitch, width, height,
+                             unused7, unused8);
+
         /*
          *  0x409627: no magic, so Targa is guessed from the header being self
          *  consistent.  The test is the same one GetImageSize() makes, so a file
@@ -2263,7 +2535,7 @@ int DecodeImage(unsigned char *fileimg, int filesize, unsigned char *pixels,
     }
 
     printf("\n*** That input format has not been reconstructed yet.\n"
-           "*** This build decodes PNG, GIF, BMP, PCX, Targa and the 8bpp"
+           "*** This build decodes PNG, GIF, BMP, PCX, Targa, DDS and the 8bpp"
            " palettised format; see README.md.\n\n");
     exit(3);
     return -1;
