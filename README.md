@@ -2492,6 +2492,42 @@ addresses), and not in `reference/data.lst` either - so it fills through a
 register-held pointer somewhere, and tracing that pointer is the remaining job.
 Everything else about the decoder is known, standard, and has its values.
 
+#### Those tables are `.data`, not `.bss` - and the cheap hypotheses are out
+
+`pngout.exe.lst` settles the segment question directly:
+
+```
+.data:018CDF70 dword_18CDF70   dd ?
+.data:018CDF74 dword_18CDF74   dd ?
+.data:018D6358 dword_18D6358   dd ?
+.data:018D635C dword_18D635C   dd ?
+```
+
+So they are `.data`, zero-initialised (`dd ?`), read only by `sub_408D80` (the
+DATA XREFs are all `sub_408D80+...`), and never written by any instruction that
+names them. The `.bss` framing in the notes above is wrong; the addresses and
+the zero-initialisation were right, the segment was not.
+
+Three more eliminations, all against the listing rather than the
+decompilation:
+
+* `sub_408D80`'s stores are fully accounted for - twenty distinct targets,
+  all stack locals or the register-held pixel pointers - so Hex-Rays did not
+  drop a table-building block there. That function is completely read.
+* There is no `imul reg, <large decimal>` in twenty-two million lines of
+  listing. The colour coefficients are not decimal immediates - so the
+  builder either uses hex immediates, three-operand forms, or no multiply at
+  all (addition loops, or a copy from `.rdata`).
+* The function map accounts for every byte with no hidden builder, and no
+  instruction loads those bases into a register.
+
+What is left is a full data-flow trace: find the `rep movsd`/`rep stosd` or
+arithmetic loop whose destination is computed rather than literal, most likely
+by working backwards from a `.rdata` source or forwards from an init flag. It
+is real reverse-engineering work, not another grep, and it is still the only
+thing between here and the JPEG transcription - but everything it is *not* is
+now written down, which is what makes it a scoped job instead of a hunt.
+
 #### Narrowing the `.bss` writer: three clean bills and what is left
 
 The two interleaved arrays the colour conversion reads were chased through
