@@ -1968,6 +1968,38 @@ switch at `0x40D06F`, so it is possible the pair is doing something the reading
 above misses. That needs a GIF with a local colour table and a real LZW stream
 to settle, which is why nothing has been transcribed from it yet.
 
+### `sub_40DD80`, DDS (format code 7) — analysed, not transcribed
+
+1158 listing lines, 1705 bytes. Not transcribed yet. The front end is short and
+completely determined, so it is worth writing down:
+
+* The 124 byte header is followed by the pixel data at `ebx + 0x80`
+  (`add ebx, 80h`), and the surface size is at `+0x0C`/`+0x10` — height and
+  width, as `sub_409260` reads them.
+* `dword +0x50` is `ddspf.flags`, and it is tested twice, in this order:
+
+  * **`DDPF_RGB` (0x40)** — an uncompressed surface. The requirements are all
+    spelled out at `0x40DDAA`: 32 bits a pixel (`+0x58`), and the four masks
+    exactly `0x00FF0000`, `0x0000FF00`, `0x000000FF`, `0xFF000000`. Anything
+    else goes to the reject at `0x40E41C`. What follows is a plain row copy —
+    `rep movsd` plus a `rep movsb` for the remainder — from the surface to the
+    destination, clipped against the width and height it was passed at
+    `0x40DE2C` and `0x40DE3B`.
+  * **`DDPF_FOURCC` (0x4)** — a compressed surface. `0x40DEB7` reads the fourCC as
+    `'D' 'X' 'T' c` (`cmp al, 44h` / `cmp [ebx+55h], 58h` /
+    `cmp [ebx+56h], 54h`) and requires `c - '0'` to be between 1 and 5, which is
+    DXT1 through DXT5. The bit that matters next is `and eax, 1` at `0x40DEFE`:
+    the *odd* codes (DXT1, DXT3, DXT5) take the four-colour DXT1 block and the
+    even ones (DXT2, DXT4) the three-colour punch-through variant.
+
+So the whole of the non-block part is about forty instructions and the rest is
+the block decoder — a DXT1/DXT2 colour block, the DXT3 and DXT5 explicit-alpha
+blocks, and the per-format block sizing. Nothing has been transcribed, because
+there is no way to check a transcription of it here: DXT files cannot be
+written by anything in the tree, so a hand-built one would test my understanding
+of the *encoder* side of the format as much as the decoder, and PNGOUT would
+have to be fed the result.
+
 ### Still to do inside DecodeImage
 
 The chunk walk, the bit reader and its pump, the three Huffman helpers, the
@@ -1977,10 +2009,17 @@ verified pixel for pixel. What is left:
 * `sub_40A630`, the Adam7 path. Interlaced input is refused rather than guessed
   at, because the pass table it reads is not a partition of the image and so
   could not be checked against anything - see **The Adam7 tables** above.
-* The other three decoders — JPEG, GIF and DDS — the baseline JPEG decoder in
-  `sub_40B180` (3 492 lines, by far the largest), and re-declaring the 22 MB of
+* The other three decoders — JPEG, GIF and DDS — and re-declaring the 22 MB of
   `.bss` they use. Six of the eight input formats are transcribed now: PNG, the
-  8bpp palettised one, PCX, Targa and BMP, with JPEG the next biggest win.
+  8bpp palettised one, PCX, Targa and BMP. The three left, measured:
+
+  | original | listing lines | bytes | note |
+  |---|---|---|---|
+  | `0x40CA70` GIF | 1 311 | 1 717 | front end read, one open question, above |
+  | `0x40DD80` DDS | 1 158 | 1 705 | front end read, above; needs hand-built DXT to check |
+  | `0x40B180` JPEG | 3 491 | 5 058 | baseline sequential, with Huffman, IDCT, upsampling, YCbCr |
+
+  JPEG is about two and a half GIFs and wants a pass of its own.
 
 ## Verification so far
 
