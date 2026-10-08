@@ -2887,8 +2887,8 @@ static void JpegMakeT(void)
 
 static void JpegMakeTables(void)
 {
-    static const int m[4] = {1000000, 725000, -100000, -400000};
-    static const int c[4] = {-8388608, -6388608, -4194304, -4194304};
+    static const int m[4] = {1000000, 750000, -100000, -400000};
+    static const int c[4] = {-8388608, -8388608, -4194304, -4194304};
     int i, k;
     int *t[4];
 
@@ -3133,8 +3133,12 @@ static int JpegOutput444(unsigned char *pixels, int pitch,
                     } else {
                         Cb = Cbblk[pos];
                         Cr = Crblk[pos];
-                        v6 = ((Cb >> 19) / 2) * 2;
-                        res = ((Cr >> 19) / 2) * 2;
+                        /* Floor to even (not trunc toward zero): Python fit
+                         * uses //2*2 (floor), and C /2 truncates -357/2 to
+                         * -178 (*2 = -356) instead of floor -358.  Off by 2
+                         * in index shifts tables enough for 1-2 levels. */
+                        v6 = (Cb >> 19) & ~1;
+                        res = (Cr >> 19) & ~1;
                     }
                     A = JpegTabLookup(JpegTA, v6);
                     B = JpegTabLookup(JpegTB, res);
@@ -3257,8 +3261,9 @@ static int DecodeJpeg(const unsigned char *data, int size,
                          *  tables cover extremes.  Anything else (progressive,
                          *  restart subset, h=2) waits for its path.
                          */
-                        JpegOutput444(pixels, pitch, width, height,
-                                      xorigin, yorigin);
+                        if (JpegOutput444(pixels, pitch, width, height,
+                                             xorigin, yorigin) == 0)
+                            return 0;
                     }
                 }
             }
