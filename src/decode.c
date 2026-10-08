@@ -1084,6 +1084,185 @@ static int DecodePal8(const unsigned char *data, unsigned char *pixels,
     return 0;
 }
 
+/*
+ *  sub_40DAC0: PCX, format code 6.  The header is recognised by its first four
+ *  bytes as one dword, 0x0801050A, i.e. 0A 05 01 08 - version 5, RLE encoding,
+ *  8 bits a pixel - and the image size comes from the window bounds at +4..+0B,
+ *  `xmax - xmin + 1` by `ymax - ymin + 1`, exactly as GetImageSize() computes
+ *  it.
+ *
+ *  Two very different cases share the RLE reader:
+ *
+ *    - `nplanes` 0 or 1: palettised.  With nplanes 0 the 256 entry palette is
+ *      read from the *end* of the file (`lea eax, [edi+eax-300h]`, where eax is
+ *      the file size) and `dword_190A820` is set to 256.  Its transform is not
+ *      the 8bpp format's: there is no `<< 2` and the bias is 256 rather than 64,
+ *
+ *          pal[i] = ((p[0] - 256) << 16) + (p[1] << 8) + p[2]
+ *
+ *      which is the identity on the RGB triple, because subtracting 256 borrows
+ *      into the top byte and leaves it at 0xFF for every r <= 255.  So the entry
+ *      is the dword whose bytes are B, G, R, FF going up - opaque, as it should
+ *      be.
+ *
+ *    - `nplanes` 3: RGB, one RLE stream per plane, and the plane number selects
+ *      *which byte of the pixel* gets the sample.  The loop starts at plane
+ *      `nplanes - 1` = 2 and counts down to -1, where it resets to 2, so the
+ *      planes arrive in PCX's own order R, G, B and land in bytes 2, 1, 0 of
+ *      `0xAARRGGBB`.  PCX has no alpha, so `0x40DBF0` fills byte 3 of every
+ *      pixel in the clipped rectangle with 0xFF first and `byte_190A824` becomes
+ *      2.
+ *
+ *  The RLE reader is `0x40DC7A`: a byte below 0xC0 is a literal with a count of
+ *  one, a byte at or above it has `& 0x3F` repeats of the byte after it.  A
+ *  count of zero (`0xC0`) advances to the next scanline without writing
+ *  anything.
+ *
+ *  The clipping is the odd part and is the original's: the store tests the row
+ *  against the height it was passed and the *byte* offset against four times the
+ *  width, and the scanline length comes from `bytesPerLine` when that is longer
+ *  than the row count - two quantities in different units, compared as though
+ *  they were the same.  It is reproduced as measured.  The row loop runs to
+ *  `height + yorigin` in rows and lets the store clip.
+ */
+static int DecodePcx(const unsigned char *data, int size, unsigned char *pixels,
+                     int pitch, unsigned int width, unsigned int height,
+                     int xorigin, int yorigin)
+{
+    const unsigned char *src;
+    int w, h, nplanes, bytesperline;
+int rowend, rowlimit, colstart, startcol, newh, colend4, row, col;
+    int plane;
+
+    if (*(const unsigned int *)data != 0x0801050Au)
+        return -1;
+
+    w = (short)(*(const short *)(data + 8) - *(const short *)(data + 4)) + 1;
+    if (w <= 0)
+        return -1;
+    h = (short)(*(const short *)(data + 10) - *(const short *)(data + 6)) + 1;
+    if (h <= 0)
+        return -1;
+
+    nplanes      = data[0x41];
+    bytesperline = (short)*(const unsigned short *)(data + 0x42);
+
+    src = data + 0x80;
+
+    if (nplanes == 0) {
+        const unsigned char *p = data + size - 0x300;
+        int i;
+
+        for (i = 0; i < 256; i++, p += 3)
+            Pal[i] = (((int)p[0] - 0x100) << 16) + ((int)p[1] << 8) + p[2];
+
+        OutColType = 3;
+        OutBitDepth = 8;
+        unk_190A820 = 256;
+    }
+
+    /* ---- 0x40DBB3: the row count the store is clipped against ---- */
+
+    rowend = h + yorigin;
+    if ((int)height < rowend)
+        rowend = (int)height;
+
+if (nplanes == 3) {
+        int colend = (int)width, rowfirst, colfirst, c;
+
+        OutColType = 2;
+
+        colfirst = (xorigin > 0) ? xorigin : 0;      /* setle / dec / and ecx */
+        rowfirst = (yorigin > 0) ? yorigin : 0;
+        if (w + xorigin < colend)
+            colend = w + xorigin;
+
+        for (row = rowfirst; row < rowend; row++) {
+            unsigned char *p = pixels + (size_t)pitch * row + 3;
+
+            for (c = colfirst; c < colend; c++)
+                p[(size_t)c * 4] = 0xFF;
+        }
+    } else if (nplanes != 1) {
+        return 0;             /* 0x40DCFC / 0x40DD75: neither, so nothing runs */
+    }
+
+    /* ---- 0x40DC00: the common tail ---- */
+
+    rowlimit = rowend + xorigin;
+    if (bytesperline > rowend) {
+        if ((int)width < rowlimit)
+            width = (unsigned)rowlimit;
+        rowlimit += bytesperline - rowend;
+    }
+
+    colstart = xorigin * 4;                        /* 0x40DC5E */
+    newh     = h + yorigin;                         /* var_4 at 0x40DC1D */
+    colend4  = (int)width * 4;                      /* 0x40DC50 */
+    rowlimit *= 4;                                  /* 0x40DC55 */
+    startcol = (nplanes - 1) + colstart;            /* 0x40DC6D */
+
+    row = yorigin;                                  /* 0x40DC38 */
+
+    for (;;) {
+        unsigned char *rowbase = pixels + (size_t)pitch * row;
+        int count, value;
+
+        if (nplanes == 1)
+            col = colstart;
+        else
+            col = startcol, plane = 2;
+
+        /*
+         *  0x40DC7A / 0x40DD01: one run.  A byte below 0xC0 is a literal with
+         *  a count of one; at or above it, `& 0x3F` repeats of the byte after.
+         *  A count of zero advances to the next scanline writing nothing.
+         */
+        for (;;) {
+            if (*src < 0xC0) {
+                count = 1;
+                value = *src++;
+            } else {
+                count = *src++ & 0x3F;
+                value = *src++;
+            }
+
+            while (count > 0) {
+                if (row < (int)height && col < colend4) {
+                    if (nplanes == 1)
+                        *(int *)(rowbase + col) = Pal[value & 0xFF];
+                    else
+                        rowbase[col] = (unsigned char)value;
+                }
+
+                col += 4;
+
+                if (col >= rowlimit) {
+                    if (nplanes == 1) {
+                        row++;
+                        rowbase = pixels + (size_t)pitch * row;
+                        col = colstart;
+                    } else if (--plane < 0) {
+                        plane = 2;                 /* 0x40DD5A */
+                        row++;
+                        rowbase = pixels + (size_t)pitch * row;
+                        col = plane + colstart;
+                    } else {
+                        col = plane + colstart;
+                    }
+                }
+                count--;
+            }
+
+            if (row >= newh)
+                goto done;              /* 0x40DCE8 / 0x40DD6B: row == limit */
+        }
+    }
+
+done:
+    return 0;
+}
+
 int DecodeImage(unsigned char *fileimg, int filesize, unsigned char *pixels,
                 int pitch, unsigned int width, unsigned int height,
                 int unused7, int unused8)
@@ -1104,6 +1283,10 @@ int DecodeImage(unsigned char *fileimg, int filesize, unsigned char *pixels,
             fileimg[10] == 8 && fileimg[11] == 0)
             return DecodePal8(fileimg, pixels, pitch, width, height,
                               unused7, unused8);
+
+        if (*(const unsigned int *)fileimg == 0x0801050Au)
+            return DecodePcx(fileimg, filesize, pixels, pitch, width, height,
+                             unused7, unused8);
     }
 
     printf("\n*** That input format has not been reconstructed yet.\n"

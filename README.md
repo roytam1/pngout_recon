@@ -1716,7 +1716,7 @@ named `FMT_PAL8`.
 from `0x40D150` to `0x40D243`, and `DecodeImage()`'s dispatch in `sub_409560`
 is now the original's: format code 1 PNG, 2 `FF D8` JPEG, 3 GIF, 4 this one, 5
 `'BM'`, 6 `0A 05 01 08`, 7 `'DDS '` with a 124 byte header, then a
-self-consistency test for Targa. Of those, 1 and 4 are implemented; the rest
+self-consistency test for Targa. Of those, 1, 4 and 6 are implemented; the rest
 report that the format has not been reconstructed.
 
 The whole function is:
@@ -1755,6 +1755,58 @@ Reaching a working round trip turned up three real defects in the *encoder*
 side, all in code that no previous test could reach, because until this format
 existed nothing ever left `palflag` non-zero - see **Known defects**.
 
+### `sub_40DAC0`, PCX (format code 6)
+
+Transcribed as `DecodePcx()`, 703 bytes of listing. Recognised by the first four
+bytes as one dword, `0x0801050A` = `0A 05 01 08` — version 5, RLE, 8 bits a pixel
+— and the size comes from the window bounds at +4..+0B as `xmax - xmin + 1` by
+`ymax - ymin + 1`, which `GetImageSize()` already computed.
+
+Two cases share the RLE reader:
+
+* **`nplanes` 0 or 1: palettised.** With `nplanes` 0 the 256 entry palette is
+  read from the **end** of the file (`lea eax, [edi+eax-300h]`, where `eax` is
+  the file size) and `dword_190A820` becomes 256. Its transform is *not* the 8bpp
+  format's — there is no `<< 2` and the bias is 256, not 64:
+
+  ```c
+  pal[i] = ((p[0] - 256) << 16) + (p[1] << 8) + p[2];
+  ```
+
+  which is the identity on the RGB triple, because subtracting 256 borrows into
+  the top byte and leaves it at `0xFF` for every `r <= 255`. The entry comes out
+  as the dword whose bytes are B, G, R, FF going up — opaque, as it should be.
+  Worth writing down because the `- 256` looks like a mistake and is not one.
+
+* **`nplanes` 3: RGB**, one RLE stream per plane, and **the plane number selects
+  which byte of the pixel gets the sample**. The loop starts at `nplanes - 1` = 2
+  and counts down to −1, where it resets to 2 (`dec edi` / `jns` at `0x40DD4E`,
+  `mov edi, 2` at `0x40DD5A`), so the streams arrive in PCX's own order R, G, B
+  and land in bytes 2, 1, 0 of `0xAARRGGBB`. PCX has no alpha, so `0x40DBF0`
+  fills byte 3 of every pixel in the clipped rectangle with `0xFF` first and
+  `byte_190A824` becomes 2. The three planes of **one row** are adjacent, which
+  is what this plane counter assumes.
+
+The RLE reader is `0x40DC7A`: a byte below `0xC0` is a literal with a count of
+one, a byte at or above it has `& 0x3F` repeats of the byte after it, and a
+count of zero (`0xC0`) advances to the next scanline writing nothing.
+
+`nplanes` is neither 1 nor 3 — including the `nplanes == 0` that just loaded the
+palette — and `0x40DCFC` / `0x40DD75` send it straight to the epilogue, so a
+0-plane or 2-plane file sets up a palette and decodes no pixels at all. That is
+in the original.
+
+The clipping is the odd part, and it is reproduced as measured. The store tests
+the row against the height it was passed and the **byte** offset against four
+times the width (`0x40DCBA`, `0x40DCC0`), and the scanline length comes from
+`bytesPerLine` when that is longer than the row *count* (`0x40DC36`) — two
+quantities in different units compared as though they were the same. The row loop
+runs to `height + yorigin` in rows and lets the store clip.
+
+`tools\decodetest.py --pcx` and `--pcx-roundtrip` check four cases each way,
+including one whose `bytesPerLine` is wider than the image, which is what
+exercises that comparison.
+
 ### Still to do inside DecodeImage
 
 The chunk walk, the bit reader and its pump, the three Huffman helpers, the
@@ -1764,9 +1816,8 @@ verified pixel for pixel. What is left:
 * `sub_40A630`, the Adam7 path. Interlaced input is refused rather than guessed
   at, because the pass table it reads is not a partition of the image and so
   could not be checked against anything - see **The Adam7 tables** above.
-* The other five decoders (JPEG, GIF, BMP, PCX, DDS, Targa - six of the eight
-  formats; PNG and the 8bpp one are done), the baseline JPEG decoder in
-  `sub_40B180` (3 492
+* The other four decoders (JPEG, GIF, BMP, DDS, Targa), the baseline JPEG
+  decoder in `sub_40B180` (3 492
   lines, by far the largest), and re-declaring the 22 MB of `.bss` they use.
 
 ## Verification so far
@@ -1787,6 +1838,8 @@ python tools\decodetest.py 37,41         two of them
 python tools\decodetest.py --roundtrip   21 of them through pngout.exe
 python tools\decodetest.py --pal8        the 8bpp format, 3 cases
 python tools\decodetest.py --pal8-roundtrip   the same three through pngout.exe
+python tools\decodetest.py --pcx         three plane PCX, 4 cases
+python tools\decodetest.py --pcx-roundtrip   the same four through pngout.exe
 ```
 
 The probe has to put stdout in binary mode (`_setmode(1, O_BINARY)`, as `main()`

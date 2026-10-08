@@ -559,6 +559,125 @@ def write_pal8(path, w, h, indices, palette):
     return path
 
 
+def rle_pcx(seq):
+    """PCX run length encoding: a byte >= 0xC0 is `count = b & 0x3F` repeats."""
+    out = bytearray()
+    i, n = 0, len(seq)
+    while i < n:
+        v = seq[i]
+        j = i
+        while j < n and seq[j] == v and j - i < 63:
+            j += 1
+        run = j - i
+        if run >= 2 or v >= 0xC0:
+            out.append(0xC0 | run)
+            out.append(v)
+        else:
+            out.append(v)
+        i = j
+    return bytes(out)
+
+
+def write_pcx(path, w, h, pixels, nplanes=3, bytesperline=None):
+    """
+    Write a three plane 8bpp PCX, format code 6.
+
+    The header is recognised by its first four bytes as one dword, 0x0801050A -
+    0A 05 01 08 - and the image size comes from the window bounds at +4..+0B.
+    The layout sub_40DAC0 reads is the standard one: reserved byte at 0x40,
+    nplanes at 0x41, bytesPerLine at 0x42, paletteInfo at 0x44, data at 0x80.
+
+    All three planes of one row are adjacent - R then G then B - because that is
+    what 0x40DD01 assumes: the plane counter goes 2, 1, 0 and only wraps to the
+    next row when it falls below zero.
+    """
+    if bytesperline is None:
+        bytesperline = w
+    hdr = bytearray(0x80)
+    hdr[0:4] = bytes([0x0A, 0x05, 0x01, 0x08])
+    struct.pack_into("<hhhh", hdr, 4, 0, 0, w - 1, h - 1)
+    struct.pack_into("<HH", hdr, 0x0C, 72, 72)
+    hdr[0x41] = nplanes
+    struct.pack_into("<H", hdr, 0x42, bytesperline)
+    struct.pack_into("<H", hdr, 0x44, 1)
+    body = bytearray()
+    for y in range(h):
+        for plane in (2, 1, 0):
+            row = [pixels[y][x][2 - plane] for x in range(w)]
+            row += [0] * (bytesperline - w)
+            body += rle_pcx(row)
+    with open(path, "wb") as fh:
+        fh.write(bytes(hdr) + bytes(body))
+    return path
+
+
+def run_pcx(case):
+    """
+    The same comparison as run(), for a three plane PCX.
+
+    A three plane file has no alpha, so loc_40DBF0 fills byte 3 of every pixel in
+    the clipped rectangle with 0xFF and the pixel comes out (B, G, R, FF) in
+    internal order - the planes go 2, 1, 0, and the plane number is the byte
+    offset within the pixel.
+    """
+    name, w, h, pixels, bytesperline = case
+    src = os.path.join(BUILD, "dt_%s.pcx" % name)
+    write_pcx(src, w, h, pixels, bytesperline=bytesperline)
+    try:
+        gw, gh, got = dump(src)
+    except Exception as exc:                       # noqa: BLE001
+        return "%-14s %s" % (name, exc)
+    if (gw, gh) != (w, h):
+        return "%-14s wrong size %dx%d" % (name, gw, gh)
+    bad = 0
+    first = None
+    for y in range(h):
+        for x in range(w):
+            r, g, b = pixels[y][x]
+            px = (b, g, r, 255)
+            if got[y][x] != px:
+                bad += 1
+                if first is None:
+                    first = "x=%d y=%d got %s want %s" % (x, y, got[y][x], px)
+    if bad:
+        return "%-14s %d/%d pixels differ, first %s" % (name, bad, w * h, first)
+    return "%-14s  ok  (%dx%d pcx3)" % (name, w, h)
+
+
+def roundtrip_pcx(case):
+    """The same file through pngout.exe and back out of the PNG it writes."""
+    name, w, h, pixels, bytesperline = case
+    src = os.path.join(BUILD, "dt_%s.pcx" % name)
+    dst = os.path.join(BUILD, "dt_%s.pcx.out.png" % name)
+    write_pcx(src, w, h, pixels, bytesperline=bytesperline)
+    if os.path.exists(dst):
+        os.remove(dst)
+    r = subprocess.run([PNGOUT, "/force", src, dst], stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE)
+    if not os.path.exists(dst):
+        out = (r.stdout + r.stderr).decode("latin1")
+        return "%-14s no output: %s" % (name, out.strip()[-70:])
+    try:
+        got = read_pixels(dst)
+    except Exception as exc:                       # noqa: BLE001
+        return "%-14s output unreadable: %s" % (name, exc)
+    if (got["width"], got["height"]) != (w, h):
+        return "%-14s wrong size %dx%d" % (name, got["width"], got["height"])
+    bad = 0
+    first = None
+    for y in range(h):
+        for x in range(w):
+            px = pixels[y][x] + (255,)
+            if tuple(got["rows"][y][x]) != px:
+                bad += 1
+                if first is None:
+                    first = "x=%d y=%d got %s want %s" % (
+                        x, y, got["rows"][y][x], px)
+    if bad:
+        return "%-14s %d/%d pixels differ, first %s" % (name, bad, w * h, first)
+    return "%-14s  ok  (%dx%d pcx3 round trip)" % (name, w, h)
+
+
 def pal8_expected(palette):
     """
     What loc_40D150 makes of one palette entry, as an internal 0xAARRGGBB dword.
@@ -751,6 +870,30 @@ def pal8_cases():
     return out
 
 
+def pcx_cases():
+    """Three plane PCX: the decode, and then the round trip."""
+    out = []
+    w, h = 13, 9
+    out.append(("x-grad", w, h, [[((x * 29 + y * 7) & 0xFF,
+                                   (x * 11 + y * 53) & 0xFF,
+                                   (x * 3 + y * 97) & 0xFF)
+                                  for x in range(w)] for y in range(h)], None))
+    # long runs, so the RLE escapes are actually used
+    out.append(("x-runs", w, h, [[(17, 200, 3)] * w for _y in range(h)], None))
+    # bytesPerLine wider than the image: the scanline limit is bytesPerLine when
+    # that is the larger of the two, which is the odd comparison at 0x40DC36
+    out.append(("x-bpl24", w, h, [[((x * 41) & 0xFF, (y * 67) & 0xFF,
+                                    ((x + y) * 23) & 0xFF)
+                                   for x in range(w)] for y in range(h)], 24))
+    # something with more colours than a 256 entry palette holds, so the
+    # round trip cannot pick one
+    out.append(("x-many", 24, 18, [[((x * 5) & 0xFF, (y * 7) & 0xFF,
+                                     ((x * y) // 3) & 0xFF)
+                                    for x in range(24)] for y in range(18)],
+                None))
+    return out
+
+
 def main():
     if "--pal8" in sys.argv:
         cases = pal8_cases()
@@ -759,6 +902,14 @@ def main():
     elif "--pal8-roundtrip" in sys.argv:
         cases = pal8_cases()
         mode = roundtrip_pal8
+        argv = [a for a in sys.argv[1:] if not a.startswith("--")]
+    elif "--pcx" in sys.argv:
+        cases = pcx_cases()
+        mode = run_pcx
+        argv = [a for a in sys.argv[1:] if not a.startswith("--")]
+    elif "--pcx-roundtrip" in sys.argv:
+        cases = pcx_cases()
+        mode = roundtrip_pcx
         argv = [a for a in sys.argv[1:] if not a.startswith("--")]
     elif "--roundtrip" in sys.argv:
         cases = roundtrip_cases()
