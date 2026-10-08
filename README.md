@@ -2506,11 +2506,16 @@ completely determined, so it is worth writing down:
 
 So the whole of the non-block part is about forty instructions and the rest is
 the block decoder — a DXT1/DXT2 colour block, the DXT3 and DXT5 explicit-alpha
-blocks, and the per-format block sizing. Nothing has been transcribed, because
-there is no way to check a transcription of it here: DXT files cannot be
-written by anything in the tree, so a hand-built one would test my understanding
-of the *encoder* side of the format as much as the decoder, and PNGOUT would
-have to be fed the result.
+blocks, and the per-format block sizing. Nothing has been transcribed yet, but the reason it had not been - that DXT
+files could not be written by anything in the tree - is gone. ImageMagick
+writes DXT1 (its default, and it ignores requests for DXT3/DXT5) and
+uncompressed 32-bit with `-type TrueColorAlpha`, which gives exactly the four
+masks `0x40DDAA` requires. `python tools/decodetest.py --dds` runs four cases
+over those two, generated and read back by ImageMagick itself, sized and
+refused cleanly. DXT3 and DXT5 are still ungenerated: their colour blocks are
+ImageMagick's DXT1 with an alpha block prepended, which is straightforward but
+not yet done, and wants its own validation pass through ImageMagick's reader
+before it counts as corpus.
 
 ### Still to do inside DecodeImage
 
@@ -2562,6 +2567,7 @@ python tools\decodetest.py --gif-roundtrip   the same eleven through pngout.exe
 python tools\decodetest.py --jpeg       JPEG, 33 cases (see below)
 python tools\decodetest.py --jpeg-im    the same 33 through ImageMagick,
                                     plus a progressive file it generates
+python tools\decodetest.py --dds        DDS, 4 cases via ImageMagick
 ```
 
 `--jpeg` is the odd one out: `sub_40B180` is not transcribed, so there are no
