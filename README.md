@@ -2301,6 +2301,25 @@ with hardcoded tables, pixels verify vs ImageMagick. All prior steps (front
 end, entropy, IDCT, dequant, equation form, unsigned wrap, grey biases) are
 committed and green; this mapping is the only missing link.
 
+#### Flats cannot determine mapping; gradients can (underdetermination proof)
+
+A flat image has constant `Y/Cb/Cr`, so `v6`/`result` are constant (one index
+pair) and the equation gives 3 RGB constraints on up to 4 table values at
+those indices - underdetermined (ranges, not points), and worse, MULTIPLE
+`(mapping, values)` combos can ALL give exact pixels (e.g. `v6=result=1020`
+vs `v6=1020,result=0` with different `B/D` both match red flat exactly with
+suitable values). Hence flats prove consistency of a hypothesis but never
+uniqueness; green/blue contradictions under one mapping do not refute it
+under another. Gradients break the tie: varying `Y/Cb/Cr` give many distinct
+`(v6,result,Y)` triples, and only the TRUE mapping yields table values
+consistent across all of them (wrong mappings contradict, as red-vs-blue
+already showed for shared-index hypotheses). So the joint problem
+(mapping + values together) is solvable - but ONLY from gradients with
+layout simulation giving exact per-pixel indices, not from flats. All flat
+solves to date are consistency checks, not determinations; the gradient
+joint solve is the defined next step and the first one that can actually
+conclude.
+
 #### Shared-index contradiction proves plane/component in the index
 
 `B[1020]` would need `[+746M,+751M)` for red but `[-113M,-109M)` for blue -
