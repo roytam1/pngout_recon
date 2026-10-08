@@ -1496,6 +1496,298 @@ case 1:
     return 0;
 }
 
+/*
+ *  Locals for the BMP path.  `sub_40D560` keeps the channel bit counts and the
+ *  masks in six consecutive globals - three counts and three masks - and the
+ *  conversion below works on that pair directly rather than on three separate
+ *  shift/mask pairs, because that is how the original stores them:
+ *
+ *      dword_190A420/424/428   the *shifts*  (r, g, b)
+ *      dword_190A42C/430/434   the *counts*  (r, g, b)
+ *
+ *  A 16 or 32 bit image starts with both filled in by hand (`0x40D695` for 32,
+ *  `0x40D6B9` for 16), BI_BITFIELDS overwrites them from the three mask dwords
+ *  at `data + biSize` (`0x40D6EF`), and then `0x40D73F` turns counts into masks:
+ *
+ *      shift = 24 - count - shift      for R
+ *      shift = 16 - count - shift      for G
+ *      shift =  8 - count - shift      for B
+ *      mask  = (-1 << (24 - count)) & 0xFF0000     r
+ *      mask  = (-1 << (16 - count)) & 0x00FF00     g
+ *      mask  = (-1 << ( 8 - count)) & 0x0000FF     b
+ *
+ *  which puts each channel's bits at the top of its own byte and leaves the
+ *  count alone where the pixel case wants it.  The hardcoded defaults are
+ *  count 8 / shift 16, 8 / 8, 8 / 0 for 32 bits - no rotation at all - and
+ *  5 / 10, 5 / 5, 5 / 0 for 16, which rotates by 9, 6 and 3 and masks five bits
+ *  each.  So a 16 bit BMP is RGB565 read without any scaling: the channels come
+ *  out as v << 3, R and B topping out at 0xF8 and G at 0x78, and the borrow out
+ *  of the `- 0x1000000` leaves the alpha byte at 0xFF.
+ *
+ *  The bit counts are read by the shift-and-count loop at `0x40D710`, which
+ *  skips the zeros below the mask and then counts the ones - capped at 32.
+ */
+typedef struct BmpMasks {
+    int  shift[3];                 /* dword_190A420, +4, +8   */
+    unsigned int mask[3];          /* dword_190A42C, +4, +8   */
+} BmpMasks;
+
+static unsigned int BmpCountBits(unsigned int m)
+{
+    int lead = 0, ones = 0;
+
+    if (m == 0)
+        return 0;
+    while (lead < 32 && !(m & 1)) {
+        m >>= 1;
+        lead++;
+    }
+    while (ones < 32 && (m & 1)) {
+        m >>= 1;
+        ones++;
+    }
+    return (unsigned int)ones;
+}
+
+static void BmpMakeMasks(BmpMasks *bm, const int *counts, const int *shifts)
+{
+    static const int tops[3] = { 24, 16, 8 };
+    static const unsigned int ands[3] = { 0xFF0000u, 0x00FF00u, 0x0000FFu };
+    int k;
+
+    for (k = 0; k < 3; k++) {
+        bm->shift[k] = tops[k] - (int)counts[k] - shifts[k];
+        bm->mask[k] = (0xFFFFFFFFu << (tops[k] - (int)counts[k])) & ands[k];
+    }
+}
+
+/*
+ *  sub_40D560: BMP, format code 5.
+ *
+ *  Two header shapes, and which one it is says where everything is:
+ *
+ *    BITMAPCOREHEADER, biSize 12: width a word at +0x12, height a word at
+ *      +0x14, bit count at +0x18, and no compression field at all.
+ *    BITMAPINFOHEADER, biSize 40: width a dword at +0x12, height at +0x16,
+ *      bit count at +0x1C, compression a dword at +0x1E, and for BI_BITFIELDS
+ *      three channel masks at +0x36.
+ *
+ *  `0x40D5F1` refuses a compression field that is neither 0 nor 3, so 16 bit
+ *  images arrive as masked RGB rather than as plain RGB555.
+ *
+ *  The palette, for a bit depth below 16, is read from `data + biSize` in
+ *  strides of 3 (core) or 4 (info) until it reaches `data + biOffset`, which is
+ *  `0x40D62B` and `0x40D640`: `lea eax, [esi+ebp+0Eh]` puts the walk at the end
+ *  of the header and `cmp eax, esi` against the pixel data stops it.  Each entry
+ *  is stored `| 0xFF000000`, which forces the alpha opaque - a 24 bit BGR field
+ *  has only three bytes, and the fourth is read from whatever follows.  That is
+ *  in the original, and for a 3 byte entry at the very end of the file it reads
+ *  past the buffer.
+ *
+ *  Two entries and a two bit image get black and white installed first
+ *  (`0x40D60F`), and the palette loop then overwrites them if the file carries
+ *  any.
+ *
+ *  Rows are padded to four bytes: `((width * bpp + 31) >> 3) & ~3` at
+ *  `0x40D7CA`.  A positive height is bottom up, and the original handles that by
+ *  stepping the source pointer *backwards* from the last row (`0x40D7EC`:
+ *  `add ebp, ebx` then `neg eax`) while the destination steps forwards; a
+ *  negative height is the top-down flag and flips the other way (`0x40D7E4`).
+ *  Either way the destination comes out the right way up.
+ *
+ *  The clip is the original's and is done before the switch: `0x40D820` tests the
+ *  row against the height and `0x40D82C` the column against the width, and the
+ *  per-case loops clamp the column again against the row's own limit.
+ */
+static int DecodeBmp(const unsigned char *data, int size, unsigned char *pixels,
+                     int pitch, unsigned int width, unsigned int height,
+                     int xorigin, int yorigin)
+{
+    const unsigned char *pixeldata, *row;
+    int hdrsize, w, h, bpp, compression, stride, ydir, rows;
+    int y, col, xcount, dcol, drow;
+    BmpMasks bm;
+    (void)size;
+
+    hdrsize = *(const short *)(data + 0x0E);
+    if (hdrsize == 12) {
+        if (*(const unsigned short *)(data + 0x16) != 1)
+            return -1;
+        w = *(const unsigned short *)(data + 0x12);
+        h = *(const unsigned short *)(data + 0x14);
+        bpp = *(const unsigned short *)(data + 0x18);
+        compression = 0;
+    } else {
+        if (*(const unsigned short *)(data + 0x1A) != 1)
+            return -1;
+        w = *(const int *)(data + 0x12);
+        h = *(const int *)(data + 0x16);
+        bpp = *(const unsigned short *)(data + 0x1C);
+        compression = *(const int *)(data + 0x1E);
+    }
+
+    if (w <= 0 || h == 0)
+        return -1;
+    if (bpp < 1 || bpp > 32)
+        return -1;
+    if (compression != 0 && compression != 3)
+        return -1;
+
+    pixeldata = data + *(const unsigned int *)(data + 0x0A);
+
+    /* ---- the colour type, the palette and the channel masks ---- */
+
+if (bpp < 16) {
+        int n = 0;
+        /*
+         *  0x40D62B: `lea eax, [esi+ebp+0Eh]` with esi = biSize and ebp =
+         *  fileimg, so the walk starts at fileimg + 14 + biSize - *after* the
+         *  14 byte file header, not at fileimg + biSize.  The stride is
+         *  `add ebx, 3` on top of `setnz bl`, i.e. 3 for a core header and 4
+         *  for an info one, and the stop is fileimg + biOffset, which
+         *  `0x40D62F` builds from the +0x0A field.
+         */
+        const unsigned char *p = data + 14 + hdrsize;
+        int stride = (hdrsize == 12) ? 3 : 4;
+
+        if (bpp == 2) {
+            Pal[0] = 0xFFFFFFFFu;
+            Pal[1] = 0xFF000000u;
+        }
+
+        /* the original has no cap here; 256 is only here so that a file with
+         * more palette than a PLTE can hold cannot run off the ramp */
+        while (p < pixeldata && n < 256) {
+            unsigned int e;
+
+            memcpy(&e, p, (size_t)stride);
+            Pal[n++] = e | 0xFF000000u;
+            p += stride;
+        }
+
+        OutColType = 3;
+        OutBitDepth = (unsigned char)bpp;
+        unk_190A820 = n;
+    } else {
+        int counts[3], shifts[3];
+
+        OutColType = 2;
+
+        if (bpp == 16) {
+            counts[0] = counts[1] = counts[2] = 5;
+            shifts[0] = 10;
+            shifts[1] = 5;
+            shifts[2] = 0;
+        } else {
+            counts[0] = counts[1] = counts[2] = 8;
+            shifts[0] = 16;
+            shifts[1] = 8;
+            shifts[2] = 0;
+        }
+
+if (compression == 3) {
+            /* 0x40D6EF: `lea edx, [esi+ebp+0Eh]`, again past the file header */
+            const unsigned int *m =
+                (const unsigned int *)(data + 14 + hdrsize +
+                                       *(const int *)(data + 0x36));
+            int k;
+
+            for (k = 0; k < 3; k++) {
+                unsigned int v = m[k];
+
+                shifts[k] = 0;
+                while (shifts[k] < 32 && !(v & 1)) {
+                    v >>= 1;
+                    shifts[k]++;
+                }
+                counts[k] = (int)BmpCountBits(m[k]);
+            }
+        }
+
+        BmpMakeMasks(&bm, counts, shifts);
+    }
+
+    /* ---- 0x40D7C4: the stride, the direction and the two row pointers ---- */
+
+    stride = ((w * bpp + 31) >> 3) & ~3;
+    if (h < 0) {
+        ydir = -1;                     /* top-down */
+        rows = -h;
+        row = pixeldata;
+        drow = 1;
+    } else {
+        ydir = 1;                      /* bottom-up */
+        rows = h;
+        row = pixeldata + (size_t)(rows - 1) * stride;
+        drow = -1;
+    }
+
+    dcol = (ydir < 0) ? 1 : 1;        /* columns always run left to right */
+
+    for (y = 0; y < rows; y++) {
+        unsigned char *dest;
+
+        /* the clip the original does before the switch, 0x40D820 */
+        if (yorigin + y < 0 || yorigin + y >= (int)height) {
+            row += (size_t)drow * stride;
+            continue;
+        }
+
+        dest = pixels + (size_t)pitch * (yorigin + y) + (size_t)xorigin * 4;
+        xcount = w;
+        if (xorigin < 0) {
+            dest -= (size_t)xorigin * 4;
+            xcount += xorigin;
+            if (xcount < 0)
+                xcount = 0;
+        }
+        if (xorigin + xcount > (int)width)
+            xcount = (int)width - xorigin;
+
+        for (col = 0; col < xcount; col++) {
+            unsigned int px;
+
+            switch (bpp) {
+            case 1:
+                px = Pal[(row[col >> 3] >> (7 - (col & 7))) & 1];
+                break;
+
+            case 4:
+                px = Pal[(row[col >> 1] >> (((col & 1) ^ 1) * 4)) & 0xF];
+                break;
+
+            case 8:
+                px = Pal[row[col]];
+                break;
+
+            case 16: {
+                unsigned int v = *(const unsigned short *)(row + (size_t)col * 2);
+                unsigned int r = (v << bm.shift[0]) & bm.mask[0];
+                unsigned int g = (v << bm.shift[1]) & bm.mask[1];
+                unsigned int b = (v << bm.shift[2]) & bm.mask[2];
+
+                px = r + g + b - 0x1000000u;
+                break;
+            }
+
+            case 32:
+                px = *(const unsigned int *)(row + (size_t)col * 4);
+                break;
+
+            default:
+                px = *(const unsigned int *)(row + (size_t)col * 3) | 0xFF000000u;
+                break;
+            }
+
+            *(int *)(dest + (size_t)col * 4) = (int)px;
+        }
+
+        row += (size_t)drow * stride;
+    }
+
+    return 0;
+}
+
 int DecodeImage(unsigned char *fileimg, int filesize, unsigned char *pixels,
                 int pitch, unsigned int width, unsigned int height,
                 int unused7, int unused8)
@@ -1516,6 +1808,10 @@ int DecodeImage(unsigned char *fileimg, int filesize, unsigned char *pixels,
             fileimg[10] == 8 && fileimg[11] == 0)
             return DecodePal8(fileimg, pixels, pitch, width, height,
                               unused7, unused8);
+
+        if (fileimg[0] == 'B' && fileimg[1] == 'M')
+            return DecodeBmp(fileimg, filesize, pixels, pitch, width, height,
+                             unused7, unused8);
 
         if (*(const unsigned int *)fileimg == 0x0801050Au)
             return DecodePcx(fileimg, filesize, pixels, pitch, width, height,

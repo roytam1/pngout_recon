@@ -1070,6 +1070,189 @@ def pcx_cases():
     return out
 
 
+def bmp_palette(pixels, w, h, bpp):
+    """
+    The palette the writer builds for a palettised image, and the same table the
+    checker compares against.
+
+    sub_40D560 reads the entries as BGR(A) and forces the alpha opaque
+    (`entry | 0xFF000000`), so the table is stored in PNG's RGB order here and
+    the checker reverses it again - the same reversal every other case in this
+    script needs, because the internal pixel is one dword read B, G, R, A from
+    the bottom up.
+    """
+    n = 1 << bpp
+    used = sorted(set(pixels[y][x][0] & (n - 1) for y in range(h)
+                      for x in range(w)))
+    out = []
+    for i in range(n):
+        v = used[i % len(used)]
+        if bpp > 1:
+            out.append(((v * 16) & 0xFF, (v * 8) & 0xFF, (v * 4) & 0xFF))
+        else:
+            out.append((v * 255, v * 255, v * 255))
+    return out
+
+
+def write_bmp(path, w, h, pixels, bpp=24, core=False, compression=0):
+    """
+    Write a BMP, format code 5.
+
+    Both header shapes the original accepts: BITMAPCOREHEADER (biSize 12, a 3
+    byte palette entry, width and height words) and BITMAPINFOHEADER (biSize 40,
+    a 4 byte entry, everything a dword).  The palette and, for BI_BITFIELDS, the
+    three channel masks sit right after the header, which is where
+    `lea eax, [esi+ebp+0Eh]` looks - *after* the 14 byte file header, not at
+    `fileimg + biSize`, and getting that wrong is invisible until a palettised
+    image comes out with every entry shifted by three and a half.
+
+    Rows are stored bottom up unless the height is negative, and padded to four
+    bytes, so the writer emits them in the order sub_40D560 walks them.
+    """
+    stride = ((w * bpp + 31) >> 3) & ~3
+    pal = bmp_palette(pixels, w, h, bpp) if bpp <= 8 else []
+
+    rows = []
+    for y in range(h - 1, -1, -1):
+        r = bytearray()
+        if bpp == 24:
+            for x in range(w):
+                r += bytes([pixels[y][x][2], pixels[y][x][1], pixels[y][x][0]])
+        elif bpp == 32:
+            for x in range(w):
+                px = pixels[y][x]
+                r += bytes([px[2], px[1], px[0], px[3]])
+        elif bpp == 16:
+            for x in range(w):
+                pr, pg, pb, _pa = pixels[y][x]
+                r += struct.pack("<H", ((pr >> 3) << 10) | ((pg >> 3) << 5) |
+                                    (pb >> 3))
+        elif bpp == 8:
+            for x in range(w):
+                r.append(pixels[y][x][0] & 0xFF)
+        elif bpp == 4:
+            for x in range(0, w, 2):
+                hi = pixels[y][x][0] & 0xF
+                lo = (pixels[y][x + 1][0] & 0xF) if x + 1 < w else 0
+                r.append((hi << 4) | lo)
+        else:
+            for bytei in range((w + 7) // 8):
+                b = 0
+                for bit in range(8):
+                    x = bytei * 8 + bit
+                    if x < w and pixels[y][x][0] & 1:
+                        b |= 0x80 >> bit
+                r.append(b)
+        r += bytes(stride - len(r))
+        rows.append(bytes(r))
+
+    palbytes = bytearray()
+    for pr, pg, pb in pal:
+        palbytes += bytes([pb, pg, pr]) if core else bytes([pb, pg, pr, 0])
+    if compression == 3:
+        masks = (0x7C00, 0x03E0, 0x001F) if bpp == 16 else \
+                (0x00FF0000, 0x0000FF00, 0x000000FF)
+        palbytes += b"".join(struct.pack("<I", m) for m in masks)
+
+    hdrsize = 12 if core else 40
+    off = 14 + hdrsize + len(palbytes)
+    body = b"".join(rows)
+    fh = b"BM" + struct.pack("<IHHI", off + len(body), 0, 0, off)
+    if core:
+        info = struct.pack("<IHHHH", 12, w, h, 1, bpp)
+    else:
+        info = struct.pack("<IiiHHIIiiII", 40, w, h, 1, bpp, compression,
+                           len(palbytes), 2835, 2835, 0, 0)
+    with open(path, "wb") as f:
+        f.write(fh + info + bytes(palbytes) + body)
+    return path
+
+
+def bmp_expected(px, bpp, pal):
+    """What sub_40D560 makes of one pixel, as an internal 0xAARRGGBB dword."""
+    r, g, b, a = px
+    if bpp == 32:
+        return (b, g, r, a)
+    if bpp == 24:
+        return (b, g, r, 255)
+    if bpp == 16:
+        # RGB565 with no scaling at all: each channel is its 5 bits `v << 3`,
+        # so R and B reach 0xF8 and G, five bits at position 6, tops out at
+        # 0x78.  The alpha byte comes from the borrow out of the - 0x1000000.
+        r5, g5, b5 = (r >> 3) & 31, (g >> 3) & 31, (b >> 3) & 31
+        return ((b5 << 3) & 0xFF, (g5 << 3) & 0xFF, (r5 << 3) & 0xFF, 255)
+    if bpp == 8:
+        pr, pg, pb = pal[px[0] & 0xFF]
+        return (pb, pg, pr, 255)
+    if bpp == 4:
+        pr, pg, pb = pal[px[0] & 0xF]
+        return (pb, pg, pr, 255)
+    pr, pg, pb = pal[px[0] & 1]
+    return (pb, pg, pr, 255)
+
+
+def run_bmp(case):
+    """The same comparison as run(), for BMP."""
+    name, w, h, pixels, bpp, core = case
+    src = os.path.join(BUILD, "dt_%s.bmp" % name)
+    write_bmp(src, w, h, pixels, bpp, core)
+    pal = bmp_palette(pixels, w, h, bpp) if bpp <= 8 else []
+    try:
+        gw, gh, got = dump(src)
+    except Exception as exc:                       # noqa: BLE001
+        return "%-14s %s" % (name, exc)
+    if (gw, gh) != (w, h):
+        return "%-14s wrong size %dx%d" % (name, gw, gh)
+    bad = 0
+    first = None
+    for y in range(h):
+        for x in range(w):
+            px = bmp_expected(pixels[y][x], bpp, pal)
+            if got[y][x] != px:
+                bad += 1
+                if first is None:
+                    first = "x=%d y=%d got %s want %s" % (x, y, got[y][x], px)
+    if bad:
+        return "%-14s %d/%d pixels differ, first %s" % (name, bad, w * h, first)
+    return "%-14s  ok  (%dx%d bmp d%d)" % (name, w, h, bpp)
+
+
+def roundtrip_bmp(case):
+    """The same file through pngout.exe and back out of the PNG it writes."""
+    name, w, h, pixels, bpp, core = case
+    src = os.path.join(BUILD, "dt_%s.bmp" % name)
+    dst = os.path.join(BUILD, "dt_%s.bmp.out.png" % name)
+    write_bmp(src, w, h, pixels, bpp, core)
+    pal = bmp_palette(pixels, w, h, bpp) if bpp <= 8 else []
+    if os.path.exists(dst):
+        os.remove(dst)
+    r = subprocess.run([PNGOUT, "/force", src, dst], stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE)
+    if not os.path.exists(dst):
+        out = (r.stdout + r.stderr).decode("latin1")
+        return "%-14s no output: %s" % (name, out.strip()[-70:])
+    try:
+        got = read_pixels(dst)
+    except Exception as exc:                       # noqa: BLE001
+        return "%-14s output unreadable: %s" % (name, exc)
+    if (got["width"], got["height"]) != (w, h):
+        return "%-14s wrong size %dx%d" % (name, got["width"], got["height"])
+    bad = 0
+    first = None
+    for y in range(h):
+        for x in range(w):
+            px = bmp_expected(pixels[y][x], bpp, pal)
+            want = (px[2], px[1], px[0], px[3])
+            if tuple(got["rows"][y][x]) != want:
+                bad += 1
+                if first is None:
+                    first = "x=%d y=%d got %s want %s" % (
+                        x, y, got["rows"][y][x], want)
+    if bad:
+        return "%-14s %d/%d pixels differ, first %s" % (name, bad, w * h, first)
+    return "%-14s  ok  (%dx%d bmp d%d round trip)" % (name, w, h, bpp)
+
+
 def targa_cases():
     """Targa: every depth, both origins, RLE and raw, and a colour map."""
     w, h = 11, 6
@@ -1099,8 +1282,38 @@ def targa_cases():
     return out
 
 
+def bmp_cases():
+    """BMP: both header shapes, every depth the original decodes."""
+    w, h = 9, 5
+    p24 = [[((x * 23 + y * 11) & 0xFF, (x * 17 + y * 41) & 0xFF,
+             (x * 7 + y * 61) & 0xFF, 255) for x in range(w)] for y in range(h)]
+    p32 = [[((x * 23 + y * 11) & 0xFF, (x * 17 + y * 41) & 0xFF,
+             (x * 7 + y * 61) & 0xFF, (x * 40 + 16) & 0xFF)
+            for x in range(w)] for y in range(h)]
+    # 5 bit channels, so the `v << 3` truncation is visible
+    p16 = [[((x * 32) & 0xF8, ((x * 8 + y * 8) & 0xF8), ((y * 40) & 0xF8), 255)
+            for x in range(w)] for y in range(h)]
+    p8 = [[((x + y) % 16, 0, 0, 255) for x in range(w)] for y in range(h)]
+    return [
+        ("b-rgb24", w, h, p24, 24, False),
+        ("b-rgb24-core", w, h, p24, 24, True),
+        ("b-rgba32", w, h, p32, 32, False),
+        ("b-rgb16", w, h, p16, 16, False),
+        ("b-pal8", w, h, p8, 8, False),
+        ("b-pal8-core", w, h, p8, 8, True),
+    ]
+
+
 def main():
-    if "--targa" in sys.argv:
+    if "--bmp" in sys.argv:
+        cases = bmp_cases()
+        mode = run_bmp
+        argv = [a for a in sys.argv[1:] if not a.startswith("--")]
+    elif "--bmp-roundtrip" in sys.argv:
+        cases = bmp_cases()
+        mode = roundtrip_bmp
+        argv = [a for a in sys.argv[1:] if not a.startswith("--")]
+    elif "--targa" in sys.argv:
         cases = targa_cases()
         mode = run_targa
         argv = [a for a in sys.argv[1:] if not a.startswith("--")]

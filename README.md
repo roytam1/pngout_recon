@@ -1866,6 +1866,67 @@ respectively. `tools\decodetest.py --targa` and `--targa-roundtrip` check twelve
 cases, covering all four origin corners, all three depths, RLE and raw, and long
 runs so the run packets are actually used.
 
+### `sub_40D560`, BMP (format code 5)
+
+Transcribed as `DecodeBmp()`, 1340 bytes of listing. Two header shapes, and
+which one it is says where everything is:
+
+| | `biSize` | width | height | bits | compression | palette entry |
+|---|---|---|---|---|---|---|
+| `BITMAPCOREHEADER` | 12 | word `+0x12` | word `+0x14` | word `+0x18` | none | 3 bytes |
+| `BITMAPINFOHEADER` | 40 | dword `+0x12` | dword `+0x16` | word `+0x1C` | dword `+0x1E` | 4 bytes |
+
+`0x40D5F1` refuses a compression field that is neither 0 nor 3, so a 16 bit
+image arrives as masked RGB rather than as plain RGB555.
+
+**The palette and the masks sit after the 14 byte file header, not at
+`fileimg + biSize`.** Both walks start from `lea eax, [esi+ebp+0Eh]` — `esi` is
+`biSize` and `ebp` is `fileimg`, so it is `fileimg + 14 + biSize`. Reading it as
+`fileimg + biSize` shifts a palettised image's whole table by three and a half
+entries and nothing else notices, because every index still finds *an* entry.
+
+The palette entries are stored `| 0xFF000000`, which forces the alpha opaque —
+a 3 byte BGR entry has no fourth byte, and the fourth is read from whatever
+follows it in the file. In the original, and for a 3 byte entry at the very end
+of the buffer that reads past it. Two entries and a two bit image get black and
+white installed first at `0x40D60F`, and the walk then overwrites them if the
+file carries any.
+
+The channel masks are the fiddliest part, and it is worth stating plainly what
+the six globals hold. `sub_40D560` keeps three **bit counts** and three
+**masks** in consecutive globals, and the conversion at `0x40D73F` is what turns
+counts into masks:
+
+```
+shift = 24 - count - shift        r        mask = (-1 << (24 - count)) & 0xFF0000
+shift = 16 - count - shift        g        mask = (-1 << (16 - count)) & 0x00FF00
+shift =  8 - count - shift        b        mask = (-1 << ( 8 - count)) & 0x0000FF
+```
+
+`BI_BITFIELDS` overwrites both halves from the three mask dwords after the
+header, with the bit count read by the shift-and-count loop at `0x40D710`. A 16
+bit image starts at count 5 / shift 10, 5, 0 and a 32 bit one at count 8 /
+shift 16, 8, 0 — so **16 bit BMP is RGB565 read without any scaling**: each
+channel is its 5 bits `v << 3`, R and B top out at `0xF8` and G, five bits at
+position 6, at `0x78`, and the alpha byte comes from the borrow out of the
+`- 0x1000000`. Same truncation as the Targa A1R5G5B5 and for the same reason.
+
+Rows are padded to four bytes — `((width * bpp + 31) >> 3) & ~3` at `0x40D7CA`. A
+positive height is bottom up and the original handles that by stepping the
+*source* pointer backwards from the last row (`0x40D7EC`) while the destination
+steps forwards; a negative height is the top-down flag and flips it
+(`0x40D7E4`). Either way the destination comes out the right way up.
+
+**A top-down BMP cannot be read at all, and that is not in this decoder.**
+`sub_409260` returns the height field raw — `mov ecx, [esi+16h]` / `mov [edx],
+ecx`, with no negation — so a top-down file gives a negative height, and
+`main()` then computes `4 * width * height` as a `size_t` and hands a huge value
+to `malloc`, which fails: *"Out of memory"*. The top-down branch above is
+faithful to the listing and unreachable through `main()`.
+
+`tools\decodetest.py --bmp` and `--bmp-roundtrip` check six cases, both header
+shapes and 8, 16, 24 and 32 bits.
+
 ### Still to do inside DecodeImage
 
 The chunk walk, the bit reader and its pump, the three Huffman helpers, the
@@ -1875,10 +1936,10 @@ verified pixel for pixel. What is left:
 * `sub_40A630`, the Adam7 path. Interlaced input is refused rather than guessed
   at, because the pass table it reads is not a partition of the image and so
   could not be checked against anything - see **The Adam7 tables** above.
-* The other three decoders — JPEG, GIF, BMP and DDS — the baseline JPEG decoder
-  in `sub_40B180` (3 492 lines, by far the largest), and re-declaring the 22 MB
-  of `.bss` they use. Five of the eight input formats are transcribed: PNG, the
-  8bpp palettised one, PCX, Targa, and JPEG is the next biggest win.
+* The other three decoders — JPEG, GIF and DDS — the baseline JPEG decoder in
+  `sub_40B180` (3 492 lines, by far the largest), and re-declaring the 22 MB of
+  `.bss` they use. Six of the eight input formats are transcribed now: PNG, the
+  8bpp palettised one, PCX, Targa and BMP, with JPEG the next biggest win.
 
 ## Verification so far
 
@@ -1902,6 +1963,8 @@ python tools\decodetest.py --pcx         three plane PCX, 4 cases
 python tools\decodetest.py --pcx-roundtrip   the same four through pngout.exe
 python tools\decodetest.py --targa      Targa, 12 cases
 python tools\decodetest.py --targa-roundtrip  the same twelve through pngout.exe
+python tools\decodetest.py --bmp        BMP, 6 cases
+python tools\decodetest.py --bmp-roundtrip   the same six through pngout.exe
 ```
 
 The probe has to put stdout in binary mode (`_setmode(1, O_BINARY)`, as `main()`

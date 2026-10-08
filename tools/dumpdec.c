@@ -64,7 +64,8 @@ int main(int argc, char **argv)
     fmt = GetImageSize(fileimg, (int)size, &iw, &ih);
     w = (unsigned)iw;
     h = (unsigned)ih;
-    if (fmt != FMT_PNG && fmt != FMT_PAL8 && fmt != FMT_PCX && fmt != FMT_TGA) {
+    if (fmt != FMT_PNG && fmt != FMT_PAL8 && fmt != FMT_PCX && fmt != FMT_TGA &&
+        fmt != FMT_BMP) {
         fprintf(stderr, "dumpdec: format %d is not reconstructed yet\n", fmt);
         return 1;
     }
