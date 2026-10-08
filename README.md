@@ -2173,6 +2173,17 @@ So the corpus is ready and the entropy body can be transcribed against it. What
 is still missing is a **progressive** file to pin the `0xC2` behaviour down; that
 needs a second scan encoder, which `jpeglib` does not have.
 
+#### Restart intervals verified bit-exact (`JpegRestart`, RSTn cycling)
+
+The resync runs between MCUs when the interval countdown hits zero: drop
+buffered bits, expect `FF Dn` cycling `D0..D7` from `D0`, advance past it,
+reset all four DC predictors and reload the countdown. Verified 0/18 blocks
+on a restart=2 file against the independent decode. The refill stops *before*
+a marker (`FF` followed by nonzero) instead of consuming it as PNGOUT's
+`++v102` unconditionally would appear to - because consuming `RSTn` as data
+desynchronises everything past it, and the resync expects the marker still in
+the stream. A mid-MCU marker sets a flag rather than decoding garbage.
+
 #### The sequential entropy path is verified to coefficients (`JpegDecodeSeq`)
 
 The bit reader, Huffman (10-bit fast with `sub_40C700` fallback), table

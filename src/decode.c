@@ -2651,16 +2651,29 @@ typedef struct JpegBit {
     const unsigned char *end;
     unsigned reg;                   /* v83: buffered bits, MSB first */
     int nbits;                      /* v81: bits still in reg */
+    int marker_hit;                 /* refill stopped at FF+nonzero */
 } JpegBit;
 
 static void JpegRefill(JpegBit *b, int want)
 {
-    /* "however many bytes it takes to have `want` bits", 0x40BFxx */
+    /* "however many bytes it takes to have `want` bits", 0x40BFxx.
+     * Stops BEFORE a marker (FF followed by nonzero): consuming RSTn/EOI
+     * as data desynchronises everything past it, and the resync logic
+     * expects the marker still in the stream.  A mid-MCU marker sets the
+     * flag so the caller fails cleanly instead of decoding garbage. */
     while (b->nbits < want && b->p < b->end) {
-        unsigned c = *b->p++;
+        unsigned c = *b->p;
 
-        if (c == 0xFF && b->p < b->end && *b->p == 0x00)
+        if (c == 0xFF) {
+            if (b->p + 1 >= b->end || b->p[1] != 0x00) {
+                b->marker_hit = 1;
+                break;
+            }
+            b->p += 2;
+            c = 0xFF;
+        } else {
             b->p++;
+        }
         b->reg = (b->reg << 8) | c;
         b->nbits += 8;
     }
@@ -2830,6 +2843,9 @@ static int JpegDecodeSeq(const unsigned char *scan, const unsigned char *end,
     int pred[4] = {0, 0, 0, 0};
     unsigned hmax = 1, vmax = 1, ci;
     unsigned mcux, mcuy, mx, my;
+    unsigned rst_left = JpegRestart;
+    unsigned rst_expect = 0xD0;
+    int need_restart = 0;
     int ok = 1;
 #ifndef JPEGDEBUG
     (void)unused_dump;
@@ -2848,9 +2864,26 @@ static int JpegDecodeSeq(const unsigned char *scan, const unsigned char *end,
     bit.end = end;
     bit.reg = 0;
     bit.nbits = 0;
+    bit.marker_hit = 0;
 
     for (my = 0; my < mcuy && ok; my++) {
         for (mx = 0; mx < mcux && ok; mx++) {
+            if (need_restart) {
+                /* byte-align, expect RSTn cycling D0..D7, reset predictors */
+                bit.nbits = 0;
+                bit.reg = 0;
+                if (bit.p + 2 > bit.end || bit.p[0] != 0xFF ||
+                    bit.p[1] != (unsigned char)rst_expect) {
+                    ok = 0;
+                    break;
+                }
+                bit.p += 2;
+                pred[0] = pred[1] = pred[2] = pred[3] = 0;
+                if (++rst_expect >= 0xD8)
+                    rst_expect = 0xD0;
+                rst_left = JpegRestart;
+                need_restart = 0;
+            }
             for (ci = 0; ci < JpegNComp && ok; ci++) {
                 unsigned hs = JpegComps[ci].hsamp;
                 unsigned vs = JpegComps[ci].vsamp;
@@ -2882,7 +2915,7 @@ static int JpegDecodeSeq(const unsigned char *scan, const unsigned char *end,
                                     k += 16;
                                     continue;
                                 }
-                                break;      /* EOB */
+                                break;
                             }
                             k += run;
                             if (k >= 64) {
@@ -2905,10 +2938,13 @@ static int JpegDecodeSeq(const unsigned char *scan, const unsigned char *end,
                     }
                 }
             }
+            if (JpegRestart && --rst_left == 0)
+                need_restart = 1;
         }
     }
     return ok ? 0 : -1;
 }
+
 static int DecodeJpeg(const unsigned char *data, int size,
                       unsigned char *pixels, int pitch,
                       unsigned int width, unsigned int height,
@@ -2978,7 +3014,7 @@ static int DecodeJpeg(const unsigned char *data, int size,
                  * coefficients for verification (dumps under JPEGDEBUG),
                  * then still return -1 - no pixels yet.  Anything else
                  * (progressive, restart, subset scan) waits for its path. */
-                if (ss == 0 && se == 63 && ahal == 0 && JpegRestart == 0) {
+                if (ss == 0 && se == 63 && ahal == 0) {
                     JpegDecodeSeq(scan, end, JpegWidth, JpegHeight,
 #ifdef JPEGDEBUG
                                   1
