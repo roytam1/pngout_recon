@@ -2492,6 +2492,44 @@ addresses), and not in `reference/data.lst` either - so it fills through a
 register-held pointer somewhere, and tracing that pointer is the remaining job.
 Everything else about the decoder is known, standard, and has its values.
 
+#### Narrowing the `.bss` writer: three clean bills and what is left
+
+The two interleaved arrays the colour conversion reads were chased through
+every cheap place they could hide, and all came back clean. Recording this so
+it is not done again:
+
+* **`sub_40C580` is not the writer.** Its listing range (`0x40C580` to
+  `sub_40C700`) holds exactly ten distinct store targets -
+  `byte_18DEDF1[eax]`, `dword_18CBF70[eax]`, `dword_18CBF74[eax]`,
+  `dword_18D4358[eax]`, `dword_18D435C[eax]`, `dword_18DB758[ecx*4]`,
+  `dword_18DC4D8[eax]`, `dword_18DF780[edi*4]`, `dword_18DF888[eax*4]`,
+  `dword_18E90A0[eax]` - and every one is in its decompilation (zigzag,
+  inverse zigzag, the four IDCT basis arrays, the magnitudes, the two result
+  tables). Nothing else is stored there.
+* **`sub_408D80` is not the writer either.** Twenty distinct store targets in
+  `0x408D80..0x409251`, and all are stack locals or the register-held pixel
+  pointers (`[ebx]`, `[ebx-4]`, `[edi]`). No `.bss` store at all.
+* **The dispatch is clean.** `sub_409560`'s decompilation never mentions
+  `18CDF`, `18D63`, `18E90A0`, `18DC4D8` or `18DF888`.
+* **No instruction loads those bases.** Fifty-one instructions in the whole
+  listing load a `0x18xxxxxx` address into a register, and exactly three touch
+  the `0x18C8`/`0x18D6` neighbourhood - `lea ebx, dword_18CBF68` (unfilter),
+  `lea ecx, unk_18CFF81` (DHT table base, known), `push offset dword_18CBF08`
+  (dispatch). None targets `0x18CDF70` or `0x18D6358`.
+* **The full listing agrees.** `pngout.exe.lst` (924 MB, the complete IDA
+  output) has six hits for those two addresses in its first two million
+  lines, and all six are the known reads at `0x408F1A`..`0x409166`.
+* **The function map is complete.** `reference/fn_index.txt` accounts for
+  every byte from `0x401000` to `0x40E429` with no gaps large enough to hide
+  a table builder; `sub_408D80` itself spans `0x408D80..0x409251`, which is
+  why `bss_refs.txt` filing those reads under `sub_408690` is a stale label.
+
+So the fill goes through a pointer computed by arithmetic from another base,
+or IDA put these symbols on the wrong segment. Either way it needs a full
+data-flow trace through the listing, not another grep - which is a dedicated
+session with `pngout.exe.lst`, and is now the only thing standing between here
+and the JPEG transcription.
+
 ### `sub_40DD80`, DDS (format code 7)
 
 Transcribed as `DecodeDds()`, 1158 listing lines, and verified pixel-exact
