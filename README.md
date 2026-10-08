@@ -2228,6 +2228,26 @@ next piece, with the bit-reader/Huffman/extend helpers already drafted
 (`JpegBit`, `JpegHuffSym`, `JpegExtend`) awaiting the block decoder that
 calls them.
 
+#### Fitted table biases at chroma index 0: `-2^23, -2^23, -2^22, -2^22`, worst 2
+
+Brute-forced `(A0,B0,C0,D0)` over flat greys `L=0..255` through the replicated
+equation with unsigned 32-bit wrap and logical `>>22` (which is what makes
+negative sums land in `896..1023` instead of faulting - no OOB ever, since any
+32-bit `>>22` is `0..1023`). Best is `A0=B0=-8388608 (-2^23)`,
+`C0=D0=-4194304 (-2^22)`, worst 2 levels across nine greys with zero tables
+elsewhere; all-powers-of-two, and the all-`-2^23` alternative is strictly
+worse (worst 4). The residual 2 is systematic (-2 uniform, endpoints exact),
+consistent with one quant step in `Y` (analytic DC vs true decoded DC) rather
+than wrong biases - to be settled by feeding exact `Y` from C IDCT dumps
+instead of analytic `Y`. Endpoints `L=0` and `L=255` are exact under the fit,
+middles within 2.
+
+So the four entries grey touches are (provisionally) those four integers.
+Colour needs slopes (indices vary with chroma), which is the same fit with
+colour flats probing distinct indices. Neither is committed as code yet -
+these are fitted values awaiting the `sub_408D80` transcription that consumes
+them, at which point C pixels vs ImageMagick decides exactness definitively.
+
 #### Zero tables work for black and mid-grey, fail for white - and one constant cannot fix it
 
 Flat greys through the replicated equation with zero address tables: `L=0`
