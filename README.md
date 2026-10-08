@@ -2373,6 +2373,32 @@ edge, separate from tables). Structure (per-MCU blocks, equation, store,
 clipping, floor-to-even indices) verified by the in-range rows; values need
 re-derivation to complete.
 
+#### Colour equation re-derived from listing (`408F06-408F70`); values still open
+
+The h=1 inner loop sums FOUR separable 1D tables, which the linear attempt
+had structurally wrong (it used one chroma term per channel and gave G both
+chroma indices):
+`R=T0[(TA[Cr]+TB[Cb]+Y)>>22]` (`18D635C[eax]+18CDF70[edx]+Y`),
+`B=T1[(TC[Cr]+Y)>>22]` (`18D6358[eax]+Y`),
+`G=T2[(TD[Cb]+Y)>>22]` (`18CDF74[edx]+Y`),
+with `eax=(Cr>>19)&~1` (`[ecx+100h]`), `edx=(Cb>>19)&~1` (`[ecx]`),
+`>>22` LOGICAL (`shr 16h`, no bounds check needed - always 0..1023), pixel
+stored directly (T1's sign extension supplies `0xFF` alpha).
+`JpegOutput444` is transcribed to this structure (placeholders: TA zeroed,
+rest linear; still unwired). End-to-end coordinate descent on the correct
+structure (1836 pixels, exact mod semantics) improves mean 6.5 to 3.1 but
+worst stays 255 - fixed tables genuinely conflict: 1071 neutral pixels share
+`(Cr,Cb)=(0,0)` with required offsets scattered 0..4.29B (top gaps 2.35B,
+1.43B - not one mod-2^32 cluster), and Y-scaling is ruled out (`k=1` gives
+spread90 4.8 idx vs 49+ for any other scale). White (`Y=549M`, chroma
+exactly 0) needs `0xFF070C99` but gets `0xFF5050F8` - one index too high
+(128=black instead of 127=white); no single-table move fixes it without
+breaking another 255-violator (whack-a-mole at ramp edges, which have zero
+margin: +/-1 index flips 255<->0). Defined next step: bit-exact IDCT audit
+(DC-only white block through `sub_40C790` vs listing - a rounding slip
+would show exactly as mids-fine/edges-catastrophic), then true (fixed)
+table values.
+
 #### Linear `v4` fails at MCU boundaries; per-MCU bases required
 
 Row 0 (single MCU in `x`) fits linear tables to worst 3; row 1 spanning three

@@ -2855,6 +2855,20 @@ static void JpegIdct(int *a1, unsigned a2)
  */
 #define JPEG_TBL_OFF 2048
 #define JPEG_TBL_N 4096
+/* Colour-offset tables (`sub_408D80`, listing `408F06-408F70`).
+ * The inner loop sums FOUR separable 1D lookups, not one linear function
+ * of a single chroma index:
+ *   R = T0[(TA[Cr]+TB[Cb]+Y) >> 22]   (`18D635C[eax]+18CDF70[edx]+Y`)
+ *   B = T1[(TC[Cr]+Y) >> 22]          (`18D6358[eax]+Y`)
+ *   G = T2[(TD[Cb]+Y) >> 22]          (`18CDF74[edx]+Y`)
+ * where `eax = (Cr>>19)&~1`, `edx = (Cb>>19)&~1` (`sar 13h/and ~1`), and
+ * the `>>22` are LOGICAL (`shr 16h`).  Roles: TA=R-from-Cr (idx res),
+ * TB=R-from-Cb (idx v6), TC=B-from-Cr (idx res), TD=G-from-Cb (idx v6).
+ * VALUES below are range-limited linear placeholders (good in-range,
+ * silent garbage on extremes incl. white->black; see README df888
+ * wrap/sawtooth).  TA (Cr R-term) is zeroed - no placeholder slope exists
+ * yet.  True (fixed) values pending bit-exact IDCT audit + edge fit;
+ * output stays unwired until then. */
 static int JpegTA[JPEG_TBL_N], JpegTB[JPEG_TBL_N];
 static int JpegTC[JPEG_TBL_N], JpegTD[JPEG_TBL_N];
 static int JpegTabsDone = 0;
@@ -2887,19 +2901,23 @@ static void JpegMakeT(void)
 
 static void JpegMakeTables(void)
 {
-    static const int m[4] = {1000000, 750000, -100000, -400000};
-    static const int c[4] = {-8388608, -8388608, -4194304, -4194304};
-    int i, k;
-    int *t[4];
+    /* Placeholders only (see table comment above).  Slopes from the
+     * smooth-data fit: R-from-Cb 1M/-8M, B-from-Cr 750k/-8M,
+     * G-from-Cb -100k/-4M.  TA (R-from-Cr) zeroed - pending true values. */
+    static const int mB = 1000000, cB = -8388608;   /* TB: R-from-Cb */
+    static const int mC = 750000, cC = -8388608;    /* TC: B-from-Cr */
+    static const int mD = -100000, cD = -4194304;   /* TD: G-from-Cb */
+    int i;
 
     if (JpegTabsDone)
         return;
-    t[0] = JpegTA; t[1] = JpegTB; t[2] = JpegTC; t[3] = JpegTD;
     for (i = 0; i < JPEG_TBL_N; i++) {
         int idx = i - JPEG_TBL_OFF;
 
-        for (k = 0; k < 4; k++)
-            t[k][i] = m[k] * idx + c[k];
+        JpegTA[i] = 0;
+        JpegTB[i] = mB * idx + cB;
+        JpegTC[i] = mC * idx + cC;
+        JpegTD[i] = mD * idx + cD;
     }
     JpegTabsDone = 1;
 }
@@ -3140,17 +3158,22 @@ static int JpegOutput444(unsigned char *pixels, int pitch,
                         v6 = (Cb >> 19) & ~1;
                         res = (Cr >> 19) & ~1;
                     }
-                    A = JpegTabLookup(JpegTA, v6);
-                    B = JpegTabLookup(JpegTB, res);
-                    C = JpegTabLookup(JpegTC, v6);
-                    D = JpegTabLookup(JpegTD, res);
-                    i0 = (int)(((unsigned)Y + (unsigned)A) >> 22);
-                    i1 = (int)(((unsigned)Y + (unsigned)B) >> 22);
-                    i2 = (int)(((unsigned)Y + (unsigned)C +
-                                (unsigned)D) >> 22);
-                    if (i0 < 0 || i0 > 1023 || i1 < 0 || i1 > 1023 ||
-                        i2 < 0 || i2 > 1023)
-                        return -1;
+                    /* `408F11-408F2B`: `sar 13h/and ~1` floor-even chroma
+                     * indices; `eax`=[ecx+100h] is Cr (res), `edx`=[ecx]
+                     * is Cb (v6).  R sums TWO tables plus Y. */
+                    A = JpegTabLookup(JpegTA, res);
+                    B = JpegTabLookup(JpegTB, v6);
+                    C = JpegTabLookup(JpegTC, res);
+                    D = JpegTabLookup(JpegTD, v6);
+                    /* `408F32-408F56`: add Y, LOGICAL `shr 16h` (unsigned
+                     * `>>` matches), index T0/T1/T2. */
+                    i0 = (int)(((unsigned)((unsigned)Y + (unsigned)A +
+                                           (unsigned)B)) >> 22);
+                    i1 = (int)(((unsigned)((unsigned)Y + (unsigned)C)) >> 22);
+                    i2 = (int)(((unsigned)((unsigned)Y + (unsigned)D)) >> 22);
+                    /* No bounds check: logical `shr 16h` of a 32-bit sum is
+                     * inherently 0..1023, and the listing loads T0/T1/T2
+                     * unconditionally. */
                     {
                         /* T1/T2 are signed (negative for low levels); sum in
                          * 64-bit then take low 32, matching the original's
@@ -3254,11 +3277,13 @@ static int DecodeJpeg(const unsigned char *data, int size,
                                       ) == 0) {
                         /*
                          *  h=1 grey/444 output runs here for JPEGDEBUG dumps
-                         *  only; production still returns -1 below.  Linear
-                         *  fitted tables are correct in-range (worst 5) but
-                         *  silent garbage on extremes (white->black), so no
-                         *  wiring until the tables are re-derived (see
-                         *  README: df888 wrap/sawtooth).  Anything else
+                         *  only; production still returns -1 below.  Equation
+                         *  is now the listing structure (`408F06-408F70`:
+                         *  R=TA[Cr]+TB[Cb]+Y, B=TC[Cr]+Y, G=TD[Cb]+Y, shr
+                         *  logical), but table VALUES are placeholders
+                         *  (TA zeroed, rest linear) so pixels are not
+                         *  trusted yet.  See README (colour tables).  Still
+                         *  unwired pending true values.  Anything else
                          *  (progressive, restart subset, h=2) waits for its
                          *  path.
                          */
