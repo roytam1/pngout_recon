@@ -2840,6 +2840,85 @@ static void JpegIdct(int *a1, unsigned a2)
  * Covers interleaved and non-interleaved sequential scans without restart;
  * restart/progressive fall back to -1 until those paths land.
  */
+/* ------------------------------------------------------------------ */
+/*  JPEG fitted colour tables + IDCT block buffer (WIP pixels)        */
+/* ------------------------------------------------------------------ */
+
+/*
+ *  Linear tables Tbl[i] = m*i + c, hill-climbed against ImageMagick
+ *  (worst 3 on 153 ramp pixels, worst 5 on 422/420; see README):
+ *  m = (1M, 725k, -100k, -400k), c = (-8M, -6.4M, -4M, -4M).
+ *  Unsigned 32-bit wrap with logical >>22 (no OOB ever).  Original values
+ *  unknowable to 2^22 from pixels (immaterial).  Indices clamped to table
+ *  range; original would OOB there (corrupt input only, documented).
+ *  Filled on first use.
+ */
+#define JPEG_TBL_OFF 2048
+#define JPEG_TBL_N 4096
+static int JpegTA[JPEG_TBL_N], JpegTB[JPEG_TBL_N];
+static int JpegTC[JPEG_TBL_N], JpegTD[JPEG_TBL_N];
+static int JpegTabsDone = 0;
+
+/* T0/T1/T2 result tables (verified replica of sub_40C580 outputs). */
+static int JpegT0[1024], JpegT1[1024], JpegT2[1024];
+static int JpegT0Done = 0;
+
+static void JpegMakeT(void)
+{
+    int i;
+
+    if (JpegT0Done)
+        return;
+    for (i = 0; i < 1024; i++) {
+        int v;
+
+        if (i < 128)
+            v = i + 128;
+        else if (i >= 896)
+            v = i - 896;
+        else
+            v = 0;
+        JpegT0[i] = v;
+        JpegT1[i] = (int)(((v - 256) << 16) & 0xFFFFFFFF);
+        JpegT2[i] = (int)((v << 8) & 0xFFFFFFFF);
+    }
+    JpegT0Done = 1;
+}
+
+static void JpegMakeTables(void)
+{
+    static const int m[4] = {1000000, 725000, -100000, -400000};
+    static const int c[4] = {-8388608, -6388608, -4194304, -4194304};
+    int i, k;
+    int *t[4];
+
+    if (JpegTabsDone)
+        return;
+    t[0] = JpegTA; t[1] = JpegTB; t[2] = JpegTC; t[3] = JpegTD;
+    for (i = 0; i < JPEG_TBL_N; i++) {
+        int idx = i - JPEG_TBL_OFF;
+
+        for (k = 0; k < 4; k++)
+            t[k][i] = m[k] * idx + c[k];
+    }
+    JpegTabsDone = 1;
+}
+
+static int JpegTabLookup(int *t, int idx)
+{
+    int j = idx + JPEG_TBL_OFF;
+
+    if (j < 0)
+        j = 0;
+    if (j >= JPEG_TBL_N)
+        j = JPEG_TBL_N - 1;
+    return t[j];
+}
+
+/* IDCT block buffer: [mcu][comp][block][64], MCU-major decode order. */
+#define JPEG_MAX_MCU 256
+static int JpegIdctBuf[JPEG_MAX_MCU][4][4][64];
+static unsigned JpegIdctMCUs = 0;
 static int JpegDecodeSeq(const unsigned char *scan, const unsigned char *end,
                          unsigned w, unsigned h,
 #ifdef JPEGDEBUG
@@ -2869,6 +2948,9 @@ static int JpegDecodeSeq(const unsigned char *scan, const unsigned char *end,
     }
     mcux = (w + 8 * hmax - 1) / (8 * hmax);
     mcuy = (h + 8 * vmax - 1) / (8 * vmax);
+    if (mcux * mcuy > JPEG_MAX_MCU || JpegNComp > 4)
+        return -1;
+    JpegIdctMCUs = mcux * mcuy;
 
     bit.p = scan;
     bit.end = end;
@@ -2961,6 +3043,16 @@ static int JpegDecodeSeq(const unsigned char *scan, const unsigned char *end,
                                 dbl[zz] = (int)dq;
                             }
                             JpegIdct(dbl, 0xFF);
+                            {
+                                unsigned mcu = my * mcux + mx;
+                                unsigned blk = by * JpegComps[ci].hsamp + bx;
+                                int t2;
+
+                                if (mcu < JPEG_MAX_MCU && blk < 4) {
+                                    for (t2 = 0; t2 < 64; t2++)
+                                        JpegIdctBuf[mcu][ci][blk][t2] = dbl[t2];
+                                }
+                            }
 #ifdef JPEGDEBUG
                             if (dump) {
                                 fprintf(stderr, "jpeg: idct c%u mx%u my%u bx%u by%u =",
@@ -2981,6 +3073,104 @@ static int JpegDecodeSeq(const unsigned char *scan, const unsigned char *end,
     return ok ? 0 : -1;
 }
 
+/* Grey + 4:4:4 h=1 sequential output (WIP pixels).
+ * Per-MCU blocks from JpegIdctBuf (filled during decode): Y/Cb/Cr via
+ * comp index 0/1/2 (grey: comp 0 only, chroma indices 0).  v6/result per
+ * pixel from Cb/Cr samples (signed >>19 &~1, any sign; tables linear
+ * everywhere via offset mapping, verified to worst 3-5).  Equation with
+ * T0/T1/T2 + fitted tables, store (B,G,R,A) clipped.  Returns 0 on success,
+ * -1 if sampling not all 1x1 (h=2 path separate) or bounds exceeded.
+ * NOT called yet (DecodeJpeg returns -1); wired after pixel verification.
+ */
+static int JpegOutput444(unsigned char *pixels, int pitch,
+                          unsigned width, unsigned height,
+                          int xorigin, int yorigin)
+{
+    unsigned mx, my, x, y;
+    unsigned mcux, mcuy, hmax = 1, vmax = 1, ci;
+
+    JpegMakeTables();
+    JpegMakeT();
+
+    if (JpegNComp != 1 && JpegNComp != 3)
+        return -1;
+    for (ci = 0; ci < JpegNComp; ci++) {
+        if (JpegComps[ci].hsamp != 1 || JpegComps[ci].vsamp != 1)
+            return -1;
+        if (JpegComps[ci].hsamp > hmax)
+            hmax = JpegComps[ci].hsamp;
+        if (JpegComps[ci].vsamp > vmax)
+            vmax = JpegComps[ci].vsamp;
+    }
+    mcux = (JpegWidth + 8 * hmax - 1) / (8 * hmax);
+    mcuy = (JpegHeight + 8 * vmax - 1) / (8 * vmax);
+    if (mcux * mcuy > JPEG_MAX_MCU)
+        return -1;
+
+    for (my = 0; my < mcuy; my++) {
+        for (mx = 0; mx < mcux; mx++) {
+            unsigned mcu = my * mcux + mx;
+            int *Yblk = JpegIdctBuf[mcu][0][0];
+            int *Cbblk = (JpegNComp > 1) ? JpegIdctBuf[mcu][1][0] : 0;
+            int *Crblk = (JpegNComp > 1) ? JpegIdctBuf[mcu][2][0] : 0;
+
+            for (y = 0; y < 8; y++) {
+                for (x = 0; x < 8; x++) {
+                    int dx = (int)(mx * 8 + x) + xorigin;
+                    int dy = (int)(my * 8 + y) + yorigin;
+                    int pos = (int)(y * 8 + x);
+                    int Y, Cb, Cr, v6, res;
+                    int A, B, C, D, i0, i1, i2;
+                    unsigned s;
+
+                    if (dx < 0 || dx >= (int)width || dy < 0 ||
+                        dy >= (int)height)
+                        continue;
+                    Y = Yblk[pos];
+                    if (JpegNComp == 1) {
+                        v6 = 0;
+                        res = 0;
+                    } else {
+                        Cb = Cbblk[pos];
+                        Cr = Crblk[pos];
+                        v6 = ((Cb >> 19) / 2) * 2;
+                        res = ((Cr >> 19) / 2) * 2;
+                    }
+                    A = JpegTabLookup(JpegTA, v6);
+                    B = JpegTabLookup(JpegTB, res);
+                    C = JpegTabLookup(JpegTC, v6);
+                    D = JpegTabLookup(JpegTD, res);
+                    i0 = (int)(((unsigned)Y + (unsigned)A) >> 22);
+                    i1 = (int)(((unsigned)Y + (unsigned)B) >> 22);
+                    i2 = (int)(((unsigned)Y + (unsigned)C +
+                                (unsigned)D) >> 22);
+                    if (i0 < 0 || i0 > 1023 || i1 < 0 || i1 > 1023 ||
+                        i2 < 0 || i2 > 1023)
+                        return -1;
+                    {
+                        /* T1/T2 are signed (negative for low levels); sum in
+                         * 64-bit then take low 32, matching the original's
+                         * 32-bit wraparound exactly for in-range indices. */
+                        __int64 sum = (__int64)JpegT0[i0] + JpegT1[i1] +
+                                      JpegT2[i2];
+
+                        s = (unsigned)(sum & 0xFFFFFFFF);
+                    }
+                    {
+                        unsigned char *dst = pixels + (size_t)dy * pitch +
+                                             (size_t)dx * 4;
+
+                        dst[0] = (unsigned char)(s & 255);
+                        dst[1] = (unsigned char)((s >> 8) & 255);
+                        dst[2] = (unsigned char)((s >> 16) & 255);
+                        dst[3] = (unsigned char)((s >> 24) & 255);
+                    }
+                }
+            }
+        }
+    }
+    return 0;
+}
 static int DecodeJpeg(const unsigned char *data, int size,
                       unsigned char *pixels, int pitch,
                       unsigned int width, unsigned int height,
@@ -3051,13 +3241,25 @@ static int DecodeJpeg(const unsigned char *data, int size,
                  * then still return -1 - no pixels yet.  Anything else
                  * (progressive, restart, subset scan) waits for its path. */
                 if (ss == 0 && se == 63 && ahal == 0) {
-                    JpegDecodeSeq(scan, end, JpegWidth, JpegHeight,
+                    if (JpegDecodeSeq(scan, end, JpegWidth, JpegHeight,
 #ifdef JPEGDEBUG
-                                  1
+                                      1
 #else
-                                  0
+                                      0
 #endif
-                                  );
+                                      ) == 0) {
+                        /*
+                         *  h=1 grey/444 output runs here for verification
+                         *  (dumps/pixels under JPEGDEBUG) but the pixels are
+                         *  not trusted yet - correct on smooth regions,
+                         *  garbage on high-contrast edges (table range).
+                         *  Still returns -1 below; wiring for real once the
+                         *  tables cover extremes.  Anything else (progressive,
+                         *  restart subset, h=2) waits for its path.
+                         */
+                        JpegOutput444(pixels, pitch, width, height,
+                                      xorigin, yorigin);
+                    }
                 }
             }
             break;

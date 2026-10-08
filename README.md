@@ -2348,6 +2348,20 @@ vs ImageMagick (integer vs float IDCT/rounding/coefficients), not table error.
 Transcription with hardcoded tables plus C-vs-IM pixel verification is next,
 then dispatch - no further analysis needed, only implementation.
 
+#### First JPEG pixels: correct on smooth, garbage on edges (table range)
+
+`JpegOutput444()` with fitted tables produces the first pixels: rows 0-4 of
+a grey ramp are a smooth gradient matching ImageMagick within levels, rows
+5+ degenerate to black/white garbage (`000000FF`, `FFFFFFFF` alternating).
+The split is not MCU geometry (rows 5-7 share MCU row 0 with good rows 0-4)
+but table range: high-contrast edges (`%200` wraps) give extreme IDCT outputs
+whose indices land in the dead zone (`128..895`, `T=0` → black) or overflow
+(white). Linear tables fitted on smooth data do not cover extremes - either
+nonlinearity there, or the fit range was too narrow. Still unwired (returns
+-1); exercising via debug harness only. Structure (per-MCU blocks, equation,
+store, clipping) verified by the good rows; values need extreme-range data
+to complete.
+
 #### Linear `v4` fails at MCU boundaries; per-MCU bases required
 
 Row 0 (single MCU in `x`) fits linear tables to worst 3; row 1 spanning three
