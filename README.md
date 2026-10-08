@@ -2228,6 +2228,22 @@ next piece, with the bit-reader/Huffman/extend helpers already drafted
 (`JpegBit`, `JpegHuffSym`, `JpegExtend`) awaiting the block decoder that
 calls them.
 
+#### Global store search: nothing writes those neighbourhoods, anywhere
+
+Seventy-six distinct store destinations in `0x18CC`-`0x18DF`, and **none** in
+`0x18CC000-0x18CEFFF` or `0x18D6000-0x18D7FFF` - the two tables plus generous
+neighbours on both sides. Every hit is another known table (Huffman, DQT, SOF,
+SOS setup, IDCT basis, zigzag, magnitudes). So no instruction in the binary
+stores to those addresses directly, under any symbol name. Combined with no
+base loads, no `rep` fills, clean bills for every JPEG function, and a
+complete function map, static analysis is exhausted: the fill uses a computed
+pointer with no literal (needs execution trace, debugger, or binary - none
+available), or IDA's bases are off by more than 8KB (no evidence for or
+against). The tables stay zero-initialised `.data` as far as the listing
+shows, yet colour JPEGs demonstrably decode in the original - so the fill
+exists and is invisible statically. That is the definitive blocker statement;
+further greps will not move it.
+
 #### Index advance is per-pixel for 1:1, paired for 2:1 (`sar edi,1`)
 
 The listing at `0x408FF0` shows the index computation directly, correcting
