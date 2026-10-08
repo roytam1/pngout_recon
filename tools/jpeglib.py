@@ -356,11 +356,17 @@ def write_jpeg(path, w, h, rgb, comps="444", restart=0, precision=8):
     bits = Bits()
     pred = [0] * len(samp)
     since_restart = 0
+    rstseq = 0                        # which RSTn is next: D0, D1, ... D7, D0
     for my in range(mcuy):
         for mx in range(mcux):
             if restart and since_restart == restart:
                 bits.flush()
-                bits.out.extend(b"\xFF\xD0")
+                # The marker has to *count*: RST0, RST1, ... RST7 and round
+                # again, one per interval.  Emitting RST0 every time looks
+                # plausible and is wrong - libjpeg says "found marker 0xd0
+                # instead of RST1" and resynchronises at the wrong place.
+                bits.out.extend(bytes([0xFF, 0xD0 + (rstseq & 7)]))
+                rstseq += 1
                 bits.acc = 0
                 bits.n = 0
                 for k in range(len(pred)):
@@ -412,7 +418,11 @@ def write_jpeg(path, w, h, rgb, comps="444", restart=0, precision=8):
             body = bytes([(1 << 4) | i])
             body += b"".join(struct.pack(">H", q[k]) for k in range(64))
         out += _segment(0xDB, body)
-    sof = bytes([precision]) + struct.pack(">HH", h, w) + bytes([len(samp)])
+    # the frame header's sample precision is always 8 - baseline JPEG has no
+    # other, and libjpeg rejects "Unsupported JPEG data precision 16".  It is
+    # NOT the same field as the quantisation table's precision byte, which is
+    # what `precision` selects here.
+    sof = bytes([8]) + struct.pack(">HH", h, w) + bytes([len(samp)])
     for cid, hs, vs, dq, dc, ac in samp:
         sof += bytes([cid, (hs << 4) | vs, dq])
     out += _segment(0xC0, sof)
