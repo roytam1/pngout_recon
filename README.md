@@ -1807,6 +1807,65 @@ runs to `height + yorigin` in rows and lets the store clip.
 including one whose `bytesPerLine` is wider than the image, which is what
 exercises that comparison.
 
+### `sub_40D250`, Targa (format code 8)
+
+Transcribed as `DecodeTarga()`, 733 bytes of listing. There is no magic, so the
+format is guessed from the header being self consistent — the test at `0x409627`
+and at `0x40D25D` inside the decoder are the same eight conditions
+`GetImageSize()` applies: at least 19 bytes, colour map type 0 or 1, image type
+below 12 with one of bits 1, 2, 3, 11 or 15 of `1 << type` set, a pixel depth
+that is a multiple of 8, non-zero and no more than 32, and a descriptor whose top
+two bits are clear.
+
+The depth picks the colour type (`0x40D32C`): 8 bits greyscale, 16 and 24 bits
+RGB, 32 bits RGBA. The 8 bit case also fills `dword_190A420` with the greyscale
+ramp, and the two halves of that loop sit 4 bytes apart in the listing for a
+reason worth stating: the read is at `dword_190A41C`, which is `dword_190A420`
+one dword lower, so it is an ordinary sequential build — `Pal[i] = Pal[i-1] +
+0x010101` from an opaque black at entry 0 — and the alpha byte rides along as
+`0xFF`. Read as `Pal[i] = Pal[i] + 0x010101` it installs a ramp whose alpha is
+zero everywhere but entry 0, which shows up at once as a picture that claims to
+be transparent.
+
+The four pixel widths are four different things:
+
+| bytes | conversion |
+|---|---|
+| 1 | `dword_190A420[byte]` — the ramp or the palette |
+| 2 | A1R5G5B5, expanded as `v << 3` |
+| 3 | `dword \| 0xFF000000` — B, G, R, opaque |
+| 4 | the dword as it stands — B, G, R, A |
+
+The 16 bit case masks *in place* (bits 10-14 R, 5-9 G, 0-4 B) and then computes
+`((B + (G + R * 8 - 0x40000) * 8) << 3)`, which lands the three channels in
+bytes 0, 1, 2 as B, G, R with `v << 3` each — so the five bit channels are
+**truncated, not scaled**: 31 comes out `0xF8`, not `0xFF`. Bit 15, the alpha
+bit, is ignored; the top byte is `0xFF` whatever it says, because it comes from
+the borrow out of the `- 0x40000`.
+
+A colour mapped file has its *index* turned into a pointer into the map first
+(`0x40D45E`, `0x40D477`), and the source pointer still steps by the entry size so
+the two walks stay in step. At one byte a pixel the entry fetched is itself just a
+byte, and **that byte** is what indexes `dword_190A420` — so a colour mapped
+8 bit Targa decodes through the greyscale ramp the header switch installed a few
+instructions earlier, and the file's colour map is read but never used. In the
+original.
+
+The run length reader is a state machine in `edi`, seeded at `0x40D403` by
+`sbb edi, edi` then `dec edi`: −1 for an RLE type, −2 for a raw one. Below `0x80`
+it is a raw packet count, and `& 0x7F == 0x7F` means the count is in the *next*
+byte instead — Targa 2.0's repeater packet. At or above `0x80` it is a run and no
+pixel is read at all: the previous one is stored again. The decrement at
+`0x40D4DD` is `test edi, edi` / `jl` / `dec`, so a raw packet of n stores **n + 1**
+pixels — one too many, harmless because the store is clipped, and in the
+original.
+
+Both origin bits are handled: bit 5 set walks rows from the bottom and bit 4 set
+walks columns from the right, the destination stepping by `-pitch` and `-1`
+respectively. `tools\decodetest.py --targa` and `--targa-roundtrip` check twelve
+cases, covering all four origin corners, all three depths, RLE and raw, and long
+runs so the run packets are actually used.
+
 ### Still to do inside DecodeImage
 
 The chunk walk, the bit reader and its pump, the three Huffman helpers, the
@@ -1816,9 +1875,10 @@ verified pixel for pixel. What is left:
 * `sub_40A630`, the Adam7 path. Interlaced input is refused rather than guessed
   at, because the pass table it reads is not a partition of the image and so
   could not be checked against anything - see **The Adam7 tables** above.
-* The other four decoders (JPEG, GIF, BMP, DDS, Targa), the baseline JPEG
-  decoder in `sub_40B180` (3 492
-  lines, by far the largest), and re-declaring the 22 MB of `.bss` they use.
+* The other three decoders — JPEG, GIF, BMP and DDS — the baseline JPEG decoder
+  in `sub_40B180` (3 492 lines, by far the largest), and re-declaring the 22 MB
+  of `.bss` they use. Five of the eight input formats are transcribed: PNG, the
+  8bpp palettised one, PCX, Targa, and JPEG is the next biggest win.
 
 ## Verification so far
 
@@ -1840,6 +1900,8 @@ python tools\decodetest.py --pal8        the 8bpp format, 3 cases
 python tools\decodetest.py --pal8-roundtrip   the same three through pngout.exe
 python tools\decodetest.py --pcx         three plane PCX, 4 cases
 python tools\decodetest.py --pcx-roundtrip   the same four through pngout.exe
+python tools\decodetest.py --targa      Targa, 12 cases
+python tools\decodetest.py --targa-roundtrip  the same twelve through pngout.exe
 ```
 
 The probe has to put stdout in binary mode (`_setmode(1, O_BINARY)`, as `main()`

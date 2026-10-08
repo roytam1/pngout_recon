@@ -559,6 +559,182 @@ def write_pal8(path, w, h, indices, palette):
     return path
 
 
+def tga_pack(px, depth):
+    """One Targa pixel, in the file's own byte order: B, G, R, A."""
+    r, g, b, a = px
+    if depth == 32:
+        return bytes([b, g, r, a])
+    if depth == 16:
+        word = ((0x8000 if a >= 128 else 0) | ((r >> 3) << 10) |
+                ((g >> 3) << 5) | (b >> 3))
+        return struct.pack("<H", word)
+    if depth == 24:
+        return bytes([b, g, r])
+    return bytes([r])
+
+
+def tga_rle(seq, depth):
+    """RLE packets, the way sub_40D250 reads them: run first, then raw."""
+    out = bytearray()
+    i, n = 0, len(seq)
+    while i < n:
+        v = seq[i]
+        j = i
+        while j < n and seq[j] == v and j - i < 128:
+            j += 1
+        if j - i >= 2:
+            out.append(0x80 | (j - i - 1))
+            out += tga_pack(v, depth)
+            i = j
+        else:
+            raw = []
+            while i < n and len(raw) < 128:
+                if i + 1 < n and seq[i] == seq[i + 1]:
+                    break
+                raw.append(seq[i])
+                i += 1
+            out.append(len(raw) - 1)
+            for c in raw:
+                out += tga_pack(c, depth)
+    return bytes(out)
+
+
+def write_targa(path, w, h, pixels, depth=24, imgtype=2, desc=0x20,
+                palette=None):
+    """
+    Write a Targa, format code 8.
+
+    There is no magic, so the header has to be self consistent for
+    GetImageSize() - and therefore DecodeImage() - to accept it: colour map type
+    0 or 1 at +1, an image type below 12 at +2 with one of bits 1, 2, 3, 11, 15
+    of `1 << type` set, a pixel depth that is a multiple of 8 and no more than 32
+    at +10, and a descriptor at +11 whose top two bits are clear.
+
+    Bits 4 and 5 of the descriptor are the origin and both are allowed, so the
+    writer has to emit rows and columns in the order the decoder will walk them:
+    bit 5 set means the origin is at the bottom, bit 4 set at the right.
+    """
+    hdr = bytearray(18)
+    hdr[1] = 1 if palette else 0
+    hdr[2] = imgtype
+    if palette:
+        struct.pack_into("<HHB", hdr, 3, 0, len(palette), depth)
+    struct.pack_into("<HHHH", hdr, 8, 0, 0, w, h)
+    hdr[16] = depth
+    hdr[17] = desc
+
+    body = bytearray()
+    if palette:
+        for r, g, b, _a in palette:
+            body += bytes([b, g, r])
+
+    ys = range(h - 1, -1, -1) if (desc & 0x20) else range(h)
+    xs = range(w - 1, -1, -1) if (desc & 0x10) else range(w)
+    if imgtype >= 8:
+        for y in ys:
+            body += tga_rle([pixels[y][x] for x in xs], depth)
+    else:
+        for y in ys:
+            for x in xs:
+                body += tga_pack(pixels[y][x], depth)
+
+    with open(path, "wb") as fh:
+        fh.write(bytes(hdr) + bytes(body))
+    return path
+
+
+def tga_expected(px, depth):
+    """
+    What sub_40D250 makes of one pixel, as an internal 0xAARRGGBB dword read
+    B, G, R, A from the bottom up.
+
+    Sixteen bits is the interesting one.  The listing masks *in place* - bits
+    10-14 for R, 5-9 for G, 0-4 for B - and the three multiplies and the `shl`
+    then bring them down to bytes 2, 1, 0 as `v << 3`.  So the channels are
+    truncated rather than scaled: 31 comes out as 0xF8, not 0xFF.  Bit 15, the
+    alpha bit, is ignored, because the top byte comes from the borrow out of
+    `- 0x40000` and is 0xFF whatever bit 15 says.
+    """
+    r, g, b, a = px
+    if depth == 32:
+        return (b, g, r, a)
+    if depth == 24:
+        return (b, g, r, 255)
+    if depth == 16:
+        word = ((0x8000 if a >= 128 else 0) | ((r >> 3) << 10) |
+                ((g >> 3) << 5) | (b >> 3))
+        v = ((word & 0x001F) +
+             ((word & 0x03E0) + (word & 0x7C00) * 8 - 0x40000) * 8) << 3
+        v &= 0xFFFFFFFF
+        return (v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF, (v >> 24) & 0xFF)
+    return (r, r, r, 255)          # the ramp 0x40D340 builds in place
+
+
+def run_targa(case):
+    """The same comparison as run(), for Targa."""
+    name, w, h, pixels, depth, imgtype, desc, palette = case
+    src = os.path.join(BUILD, "dt_%s.tga" % name)
+    write_targa(src, w, h, pixels, depth, imgtype, desc, palette)
+    try:
+        gw, gh, got = dump(src)
+    except Exception as exc:                       # noqa: BLE001
+        return "%-14s %s" % (name, exc)
+    if (gw, gh) != (w, h):
+        return "%-14s wrong size %dx%d" % (name, gw, gh)
+    bad = 0
+    first = None
+    for y in range(h):
+        for x in range(w):
+            px = tga_expected(pixels[y][x], depth)
+            if got[y][x] != px:
+                bad += 1
+                if first is None:
+                    first = "x=%d y=%d got %s want %s" % (x, y, got[y][x], px)
+    if bad:
+        return "%-14s %d/%d pixels differ, first %s" % (name, bad, w * h, first)
+    return "%-14s  ok  (%dx%d tga d%d)" % (name, w, h, depth)
+
+
+def roundtrip_targa(case):
+    """The same file through pngout.exe and back out of the PNG it writes."""
+    name, w, h, pixels, depth, imgtype, desc, palette = case
+    src = os.path.join(BUILD, "dt_%s.tga" % name)
+    dst = os.path.join(BUILD, "dt_%s.tga.out.png" % name)
+    write_targa(src, w, h, pixels, depth, imgtype, desc, palette)
+    if os.path.exists(dst):
+        os.remove(dst)
+    r = subprocess.run([PNGOUT, "/force", src, dst], stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE)
+    if not os.path.exists(dst):
+        out = (r.stdout + r.stderr).decode("latin1")
+        return "%-14s no output: %s" % (name, out.strip()[-70:])
+    try:
+        got = read_pixels(dst)
+    except Exception as exc:                       # noqa: BLE001
+        return "%-14s output unreadable: %s" % (name, exc)
+    if (got["width"], got["height"]) != (w, h):
+        return "%-14s wrong size %dx%d" % (name, got["width"], got["height"])
+    bad = 0
+    first = None
+    for y in range(h):
+        for x in range(w):
+            r_, g_, b_, a_ = pixels[y][x]
+            if depth == 8:
+                # the decoder publishes it as greyscale, so what comes back is
+                # the one channel in all three, not the RGB triple I wrote
+                px = (r_, r_, r_, 255)
+            else:
+                px = (r_, g_, b_, a_ if depth == 32 else 255)
+            if tuple(got["rows"][y][x]) != px:
+                bad += 1
+                if first is None:
+                    first = "x=%d y=%d got %s want %s" % (
+                        x, y, got["rows"][y][x], px)
+    if bad:
+        return "%-14s %d/%d pixels differ, first %s" % (name, bad, w * h, first)
+    return "%-14s  ok  (%dx%d tga d%d round trip)" % (name, w, h, depth)
+
+
 def rle_pcx(seq):
     """PCX run length encoding: a byte >= 0xC0 is `count = b & 0x3F` repeats."""
     out = bytearray()
@@ -894,8 +1070,45 @@ def pcx_cases():
     return out
 
 
+def targa_cases():
+    """Targa: every depth, both origins, RLE and raw, and a colour map."""
+    w, h = 11, 6
+    p24 = [[((x * 23 + y * 5) & 0xFF, (x * 13 + y * 29) & 0xFF,
+             (x * 7 + y * 41) & 0xFF, 255) for x in range(w)] for y in range(h)]
+    p32 = [[((x * 7) & 0xFF, (y * 11) & 0xFF, ((x + y) * 5) & 0xFF,
+             (x * 16 + 8) & 0xFF) for x in range(w)] for y in range(h)]
+    # 5 bit channels, so the `v << 3` truncation is visible
+    p16 = [[((x * 24) & 0xF8, ((x * 13 + y * 7) & 0xF8), ((y * 41) & 0xF8), 255)
+            for x in range(w)] for y in range(h)]
+    flat = [[(9, 9, 9, 255)] * w for _y in range(h)]
+    p8 = [[(x + y * 3, 0, 0, 255) for x in range(w)] for y in range(h)]
+    out = [
+        ("t-rgb24-bl", w, h, p24, 24, 2, 0x20, None),
+        ("t-rgb24-tl", w, h, p24, 24, 2, 0x00, None),
+        ("t-rgb24-br", w, h, p24, 24, 2, 0x30, None),
+        ("t-rgb24-tr", w, h, p24, 24, 2, 0x10, None),
+        ("t-rgba32", w, h, p32, 32, 2, 0x20, None),
+        ("t-rgba32-tl", w, h, p32, 32, 2, 0x00, None),
+        ("t-a1r5g5b5", w, h, p16, 16, 2, 0x20, None),
+        ("t-gray8", w, h, p8, 8, 1, 0x20, None),
+        ("t-gray8-rle", w, h, p8, 8, 9, 0x20, None),
+        ("t-rle24", w, h, p24, 24, 10, 0x20, None),
+        ("t-rle24-flat", w, h, flat, 24, 10, 0x00, None),
+        ("t-rle32", w, h, p32, 32, 10, 0x20, None),
+    ]
+    return out
+
+
 def main():
-    if "--pal8" in sys.argv:
+    if "--targa" in sys.argv:
+        cases = targa_cases()
+        mode = run_targa
+        argv = [a for a in sys.argv[1:] if not a.startswith("--")]
+    elif "--targa-roundtrip" in sys.argv:
+        cases = targa_cases()
+        mode = roundtrip_targa
+        argv = [a for a in sys.argv[1:] if not a.startswith("--")]
+    elif "--pal8" in sys.argv:
         cases = pal8_cases()
         mode = run_pal8
         argv = [a for a in sys.argv[1:] if not a.startswith("--")]

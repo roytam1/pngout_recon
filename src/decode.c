@@ -1263,6 +1263,239 @@ done:
     return 0;
 }
 
+/*
+ *  One Targa pixel, 0x40D44D through 0x40D4DB.
+ *
+ *  Four widths, and they are not the same thing as four conversions:
+ *
+ *      1 byte   dword_190A420[byte]                    the ramp or the palette
+ *      2 bytes  A1R5G5B5, `shl eax, 3` and the top byte from the borrow
+ *      3 bytes  dword | 0xFF000000                     B, G, R, opaque
+ *      4 bytes  the dword as it stands                  B, G, R, A
+ *
+ *  The 16 bit case is worth spelling out.  R is bits 10-14 and G is bits 5-9,
+ *  and the expression is
+ *
+ *      ((B5 + (G5 + R5 * 8 - 0x40000) * 8) << 3)
+ *
+ *  which expands to `(B5*8) + (G5*8 << 8) + (R5*8 << 16) - 0x1000000`: the three
+ *  channels land in bytes 0, 1, 2 in B, G, R order, and the borrow out of the top
+ *  leaves 0xFF there.  The five bit channels are `v << 3`, so 31 comes out as
+ *  0xF8, not 0xFF - a truncation, and it is the original's.  Bit 15, the alpha
+ *  bit, is ignored: the top byte is 0xFF whatever it says.
+ *
+ *  For a colour mapped file the *index* is turned into a pointer into the
+ *  colour map first, and `*sourcep` still advances by the entry size, so the two
+ *  walks stay in step.  At one byte a pixel the entry fetched is itself just a
+ *  byte, and it is that byte which indexes dword_190A420 - so a colour mapped
+ *  8 bit Targa decodes through the greyscale ramp the header switch installed a
+ *  few instructions earlier and the file's colour map is read but not used.
+ *  Also the original's.
+ */
+static unsigned int ReadTargaPixel(const unsigned char **sourcep, int bpp,
+                                   const unsigned char *cmapbase, int cmapped)
+{
+    const unsigned char *s = *sourcep;
+    const unsigned char *at = s;
+    unsigned int v;
+
+    if (cmapped) {
+        if (bpp == 1)
+            at = cmapbase + *s;
+        else if (bpp == 2)
+            at = cmapbase + *(const unsigned short *)s;
+        s += bpp;
+    }
+
+    switch (bpp) {
+    case 1:
+        v = (unsigned int)Pal[*at];
+        if (!cmapped)
+            s += 1;
+        break;
+
+    case 2: {
+        unsigned int word = *(const unsigned short *)at;
+        unsigned int r5 = word & 0x7C00u;
+        unsigned int g5 = word & 0x03E0u;
+        unsigned int b5 = word & 0x001Fu;
+
+        v = ((b5 + (g5 + r5 * 8u - 0x40000u) * 8u) << 3);
+        if (!cmapped)
+            s += 2;
+        break;
+    }
+
+    case 3:
+        v = *(const unsigned int *)at | 0xFF000000u;
+        if (!cmapped)
+            s += 3;
+        break;
+
+    default:
+        v = *(const unsigned int *)at;
+        if (!cmapped)
+            s += 4;
+        break;
+    }
+
+    *sourcep = s;
+    return v;
+}
+
+/*
+ *  sub_40D250: Targa, format code 8.  There is no magic, so this - and
+ *  GetImageSize() - guess the format from the header being self consistent: at
+ *  least 19 bytes, colour map type 0 or 1, an image type below 12 with one of
+ *  bits 1, 2, 3, 11 or 15 of `1 << type` set, a pixel depth that is a multiple of
+ *  8 and no more than 32, and a descriptor whose top two bits are clear.  Bits 4
+ *  and 5 of the descriptor are the origin, and both are allowed, so the decoder
+ *  has to handle all four corners.
+ *
+ *  The depth decides the colour type (0x40D32C): 8 bits greyscale, 16 and 24
+ *  bits RGB, 32 bits RGBA.  The 8 bit case also fills dword_190A420 with the
+ *  greyscale ramp, in place - entry 0 is `0xFF000000` and every other entry is
+ *  the one before it plus `0x010101`.
+ *
+ *  A colour map is skipped rather than applied, in the sense that its *offset*
+ *  arithmetic is all that survives: `0x40D2F3` builds a base of
+ *  `dataStart - firstEntry * entrySize` so that `base + index * entrySize` lands
+ *  on the entry, and `0x40D31A` steps the source pointer past it.
+ *
+ *  The run length reader is a state machine in `edi`, seeded at 0x40D403:
+ *  `sbb edi, edi` then `dec edi` makes it -1 for an RLE type and -2 for a raw
+ *  one.  Below 0x80 it is a raw packet count, and `& 0x7F == 0x7F` means the
+ *  count is in the next byte instead (Targa 2.0's repeater packet).  At or above
+ *  0x80 it is a run and no pixel is read at all - the previous one is stored
+ *  again.  The decrement at 0x40D4DD is `test edi, edi` / `jl` / `dec`, so a raw
+ *  packet of n stores n + 1 pixels: one too many, harmless because the store is
+ *  clipped, and in the original.
+ *
+ *  The store clips against the width and height it was passed, and the row
+ *  loop walks the destination by `+pitch` or `-pitch` according to the origin
+ *  bit, with the column index stepping `+1` or `-1`.
+ */
+static int DecodeTarga(const unsigned char *data, int size, unsigned char *pixels,
+                       int pitch, unsigned int width, unsigned int height,
+                       int xorigin, int yorigin)
+{
+    const unsigned char *src, *cmapbase = NULL;
+    int w, h, depth, bpp, imgtype, cmapped, entrysize;
+    int colstart, rowstart, colstep, rowistep, rowbytes;
+    int colend, rowlimit, col, row, coloff, state;
+    unsigned int px = 0;
+    int i;
+
+    /* ---- the header test, the same one GetImageSize() makes ---- */
+
+    if (size < 0x13)
+        return -1;
+    if (data[1] & 0xFE)
+        return -1;
+    if (data[2] >= 0x0C)
+        return -1;
+    if (((1 << data[2]) & 0xE0E) == 0)
+        return -1;
+    depth = data[0x10];
+    if ((depth & 7) != 0 || depth == 0 || depth > 0x20)
+        return -1;
+    if (data[0x11] & 0xC0)
+        return -1;
+
+    w = *(const unsigned short *)(data + 0x0C);
+    if (w <= 0)
+        return -1;
+    h = *(const unsigned short *)(data + 0x0E);
+    if (h <= 0)
+        return -1;
+
+    imgtype  = data[2];
+    cmapped  = (data[1] == 1);
+    bpp      = (depth + 7) >> 3;
+    src      = data + 0x12 + data[0];         /* 0x40D2BA: past the id field */
+
+    if (cmapped) {
+        entrysize = (data[7] + 7) >> 3;
+        cmapbase  = src - *(const unsigned short *)(data + 3) *
+                        (unsigned)entrysize;
+        src += *(const unsigned short *)(data + 5) * (unsigned)entrysize;
+    }
+
+    /* ---- 0x40D32C: the colour type, and the ramp for one byte a pixel ---- */
+
+    switch (bpp) {
+case 1:
+        OutColType = 0;
+        OutBitDepth = 8;
+        /*
+         *  0x40D340: entry 0 is opaque black, and every entry after it is the
+         *  one *before* it plus 0x010101.  The read is at dword_190A41C, which
+         *  is dword_190A420 one dword lower - so this is an ordinary sequential
+         *  ramp, and the alpha byte rides along from entry 0 as 0xFF.
+         */
+        Pal[0] = 0xFF000000u;
+        for (i = 1; i < 256; i++)
+            Pal[i] = Pal[i - 1] + 0x010101u;
+        break;
+
+    case 2:
+    case 3:
+        OutColType = 2;
+        break;
+
+    default:
+        OutColType = 6;
+        break;
+    }
+
+    /* ---- 0x40D382: the origin bits ---- */
+
+    i = data[0x11];
+    colstart = (i & 0x10) ? w - 1 : 0;
+    rowstart = (i & 0x20) ? h - 1 : 0;
+    colstep  = (i & 0x10) ? -1 : 1;
+    rowistep = (i & 0x20) ? -1 : 1;
+    rowbytes = (i & 0x20) ? -pitch : pitch;
+    colend   = (i & 0x10) ? -1 : w;
+    rowlimit = (i & 0x20) ? -1 : h;
+
+    col    = colstart + xorigin;
+    row    = rowstart + yorigin;
+    coloff = col;
+    colend += xorigin;
+    rowlimit += yorigin;
+
+    state = (imgtype < 8) ? -2 : -1;          /* 0x40D403 */
+
+    for (;;) {
+        if (coloff == colend) {              /* 0x40D425: this row is done */
+            row += rowistep;
+            if (row == rowlimit)
+                break;
+            coloff = col;
+            continue;
+        }
+
+        if (state < 0x80) {
+            if ((state & 0x7F) == 0x7F)     /* 0x40D441: the count is the next
+                                             * byte, not the low seven bits */
+                state = *src++;
+            px = ReadTargaPixel(&src, bpp, cmapbase, cmapped);
+        }
+
+        if (state >= 0)
+            state--;
+
+        if ((unsigned)coloff < width && (unsigned)row < height)
+            *(int *)(pixels + (size_t)pitch * (row - yorigin) +
+                    (size_t)(coloff - xorigin) * 4) = (int)px;
+
+        coloff += colstep;                   /* 0x40D4FB */
+    }
+
+    return 0;
+}
+
 int DecodeImage(unsigned char *fileimg, int filesize, unsigned char *pixels,
                 int pitch, unsigned int width, unsigned int height,
                 int unused7, int unused8)
@@ -1287,6 +1520,21 @@ int DecodeImage(unsigned char *fileimg, int filesize, unsigned char *pixels,
         if (*(const unsigned int *)fileimg == 0x0801050Au)
             return DecodePcx(fileimg, filesize, pixels, pitch, width, height,
                              unused7, unused8);
+
+        /*
+         *  0x409627: no magic, so Targa is guessed from the header being self
+         *  consistent.  The test is the same one GetImageSize() makes, so a file
+         *  it would size is a file this will decode.
+         */
+        if (filesize >= 19 &&
+            (fileimg[1] & 0xFE) == 0 &&
+            fileimg[2] < 12 &&
+            ((1 << fileimg[2]) & 0xE0E) != 0 &&
+            (fileimg[16] & 7) == 0 &&
+            fileimg[16] != 0 && fileimg[16] <= 32 &&
+            (fileimg[17] & 0xC0) == 0)
+            return DecodeTarga(fileimg, filesize, pixels, pitch, width, height,
+                               unused7, unused8);
     }
 
     printf("\n*** That input format has not been reconstructed yet.\n"
