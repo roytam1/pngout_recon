@@ -2446,15 +2446,29 @@ int dword_411080[19] = { 16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 
 are all known from there. Nineteen dwords is not a guess: `0x4110CC - 0x411080`
 is `0x4C`, exactly 19, so IDA read the array up to the next symbol it recognised.
 
-**The eight-entry table DQT indexes is one of the gaps.** `0x4110D8` + 8 * 4 is
-`0x4110F8`, which is precisely where `off_4110F8 = &sub_408D80` sits - so
-`0x4110D8..0x4110F7` is eight dwords and then the function pointer, and those
-eight dwords are the scaling table `*(&off_4110D8 + v49)` reads. `_globals.c`
-types the symbol `void *off_4110D8 = &unk_16A09E6`, and that initialiser cannot be
-right: `0x16A09E6` is in neither `.text` (`0x401000..0x40E600`) nor `.rdata`
-(`0x40F0E8..`). IDA read the dword and formed an address out of it. The code
-indexes the symbol as an `int` array, so it is one, and its eight values are the
-one thing needed to finish the DQT's scaling.
+**The eight-entry table DQT indexes is found, in `reference/data.lst`.**
+`0x4110D8` + 8 * 4 is `0x4110F8`, precisely where `off_4110F8 = &sub_408D80`
+sits - so `0x4110D8..0x4110F7` is eight dwords and then the function pointer.
+`reference/rdata.lst` has none of it (strings only, from `0x40F0F0` on), but
+`reference/data.lst` lists all eight as dwords IDA misread as offsets. Divided
+by 2^24, which is what the DQT's `>> 24` does to them:
+
+| dword | / 2^24 |
+|---|---|
+| `0x16A09E6` | 1.41421354 |
+| `0x163150B` | 1.38703984 |
+| `0x14E7AE9` | 1.30656296 |
+| `0x12D062F` | 1.17587560 |
+| `0x1000000` | 1.00000000 |
+| `0x0C9234E` | 0.78569496 |
+| `0x08A8BD4` | 0.54119611 |
+| `0x046A157` | 0.27589935 |
+
+1.41421354 is sqrt(2) to eight digits with 1.0 sitting exactly where the DC
+band belongs, so these are the per-band DCT scalings and `off_4110D8` is
+`int[8]`, not a pointer - `_globals.c`'s `&unk_16A09E6` is IDA forming an
+address out of the first dword, which is in neither `.text` nor `.rdata` and
+cannot be right. One gap closed, from the reference material, nothing invented.
 
 **The four tables are two arrays, not four.** The listing's
 `dword_18CDF70[ecx*4]` is `dword_18CDF70[ecx]` - IDA renders `arr[eax*4]` when it
@@ -2471,14 +2485,12 @@ all of them under `sub_408690` - `PutByte()` in the current tree - because
 function, while the decompilation clearly puts them in `sub_408D80`. Trust the
 addresses in that file; do not trust its function names without checking.
 
-So finishing JPEG needs two things, and neither is analysis any more:
-
-1. the eight dwords at `0x4110D8`, which needs the `.rdata` dump extended over
-   the numeric tables rather than just the strings;
-2. whoever writes the two interleaved arrays at `0x18CDF70` and `0x18D6358`.
-   Since it is not in the listing it is most likely a table IDA placed in the
-   wrong segment, so the same extended dump may answer it - which is why 1 and 2
-   are really one job.
+So finishing JPEG needs one thing, and it is not analysis any more:
+whoever writes the two interleaved arrays at `0x18CDF70` and `0x18D6358`. It is
+not in the listing, not in the dispatch (`sub_409560` never touches those
+addresses), and not in `reference/data.lst` either - so it fills through a
+register-held pointer somewhere, and tracing that pointer is the remaining job.
+Everything else about the decoder is known, standard, and has its values.
 
 ### `sub_40DD80`, DDS (format code 7)
 
