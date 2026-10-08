@@ -2301,6 +2301,20 @@ with hardcoded tables, pixels verify vs ImageMagick. All prior steps (front
 end, entropy, IDCT, dequant, equation form, unsigned wrap, grey biases) are
 committed and green; this mapping is the only missing link.
 
+#### Shared-index contradiction proves plane/component in the index
+
+`B[1020]` would need `[+746M,+751M)` for red but `[-113M,-109M)` for blue -
+disjoint, so one table entry cannot serve both. Hence `result` (and `v6`)
+encode plane/component as well as chroma value; red's `1020` and blue's
+`1020` are different entries (different bases, or offsets folded in), not one
+shared slot. Solving tables from chroma values alone is therefore impossible
+- the per-position base+offset (`esi` in `[esi+ecx*4]` / `[esi+ecx*4+100h]`,
+from the `v4` walk with `bpm`/shifts plus per-component selection) must be
+simulated via layout first, and only then do indices become solvable. That
+simulation, not more fitting, is the defined next step; everything it needs
+(`bpm=1` confirmed, shifts, interleave order, index advance mechanics) is
+already recorded above.
+
 #### Red solved to ranges; green contradicts chroma-plane indexing
 
 Red flat (`Y=-218103808`, want `(254,1,0)`) with `v6=result=Cr` index 1020
