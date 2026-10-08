@@ -391,6 +391,10 @@ def make_cases():
         add("f%d-ct0" % ft, w, h, 0, 8, grad(w, h, 1), filters=ft)
         add("f%d-ct4" % ft, w, h, 4, 8, grad(w, h, 2), filters=ft)
         add("f%d-ct6" % ft, w, h, 6, 8, grad(w, h, 4), filters=ft)
+    # type 4 with a real varying alpha, which is what pins the internal
+    # layout: grey in bytes 0..2 and alpha in byte 3
+    add("alpha-ct4", 24, 24, 4, 8, alpha_ramp(24, 24, 2))
+    add("grey-ct4", 20, 20, 4, 8, grey_few(20, 20))
     # filters rotating row by row, which is what the "mixed" filter produces
     for ct, chans in ((0, 1), (2, 3), (4, 2), (6, 4)):
         add("rot-ct%d" % ct, w, h, ct, 8, grad(w, h, chans),
@@ -538,6 +542,10 @@ def alpha_ramp(w, h, chans):
         for y in range(h):
             if y % 3 == 1:
                 rows[y] = [px[:3] + (0x80,) for px in rows[y]]
+    elif chans == 2:
+        for y in range(h):
+            if y % 3 == 1:
+                rows[y] = [px[:1] + (0x80,) for px in rows[y]]
     return rows
 
 
@@ -553,6 +561,18 @@ def clear_bg(w, h, chans):
                 row.append(rows[y][x])
         rows[y] = row
     return rows
+
+
+def grey_few(w, h):
+    """Few distinct greys with a varying alpha: type 4, but paletteable.
+
+    SuggestColType() sends flags 1 (alpha wanted, <= 256 colours) to a palette
+    and only flags 1|4 to type 4, so this is the shape of type 4 input that
+    survives a round trip. See README.md: sub_407B00 emits bytes 0 and 1, which
+    are both the grey, so type 4 *output* from PNGOUT drops the alpha.
+    """
+    return [[(((x + y) % 4) * 60, 0xFF if (x + y) % 2 else 0x40)
+             for x in range(w)] for y in range(h)]
 
 
 def roundtrip_cases():
@@ -571,6 +591,7 @@ def roundtrip_cases():
     for name, maker in (("alpha", alpha_ramp), ("clear", clear_bg)):
         out.append(("e-%s-ct6" % name, 24, 24, 6, 8, maker(24, 24, 4)))
         out.append(("e-%s-ct2" % name, 24, 24, 2, 8, maker(24, 24, 3)))
+    out.append(("e-grey-ct4", 20, 20, 4, 8, grey_few(20, 20)))
     return out
 
 

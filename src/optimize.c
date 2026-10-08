@@ -1465,8 +1465,18 @@ int PlanBlocks(int start, int end)
     double score, best;
     int i, n, pass, twice, cut, bestblock;
 
-    /* the byte buffer keeps its base pointer one dword below the data */
-    unsigned char *data = LinBufData;
+    /*
+     *  dword_18CBEF4, the buffer PutByte() filled, and *not* dword_18CBEE4.
+     *  All four `call sub_408390` sites in the original - 0x408071, 0x408142,
+     *  0x40822A and 0x40827F - read the base out of dword_18CBEF4, the same
+     *  global sub_408690 appends to.  Using LinBufData here reads past that
+     *  buffer: it is only 8 * LinBufBytes + 8 bytes, while the splitter walks
+     *  up to SplitEnd of them, and for a 24x24 RGB picture that is 1752 bytes
+     *  out of 592.  It reads whatever the heap has, which is why the block
+     *  boundaries came out different every run and why a noisy image could
+     *  walk off the end of the heap entirely.
+     */
+    unsigned char *data = SplitBuf;
 
     *BlockStart(0) = start;
     *BlockEnd(0) = end;

@@ -1312,15 +1312,42 @@ out   = grey | bswap32( up[v26 - 1] );            /* the byte lands in byte 3 */
 PNG's order, grey then alpha, is preserved on the way in, and the internal pixel
 comes out as `0xAARRGGBB` with R = G = B = the ramp entry.
 
-Which of the two bytes the *encoder* puts in which slot is a separate question
-and `sub_407B00` argues against the obvious answer: every one of its five cases
-takes bytes 0 and 1 of the internal DWORD, low byte first, which is what
-`FilterSample(pixel, 2)` already does. Under the layout above those two bytes
-are B and G, both the grey, so the alpha in byte 3 would never be emitted.
-Either PNGOUT really does lose the alpha re-encoding grey+alpha, or
-`sub_407B00` is not the route type 4 takes. There is no reference binary in the
-tree to settle it, so it stays open; what is settled is that the decoder puts
-alpha in byte 3.
+Which of the two bytes the *encoder* puts in which slot is a separate question,
+and it is settled: **PNGOUT loses the alpha when it re-encodes grey+alpha as
+colour type 4.** `sub_407B00` is the only two-byte filter, case 0 through case
+4 all take bytes 0 and 1 of the internal DWORD low byte first
+(`mov ecx, ebx` / `and ecx, 0FFh`, then `mov dl, bh`), which is what
+`FilterSample(pixel, 2)` does. Under the layout above those two bytes are B and
+G, both the grey, so byte 3 is never emitted.
+
+This is visible end to end. A 30x30 type 4 input with more than 256 distinct
+greys and a varying alpha comes back from `pngout.exe` as colour type 4 with no
+`tRNS`, and its samples are the grey repeated:
+
+```
+$ python tools\decodetest.py --roundtrip   # ct4-many
+ct4-many   896/900 pixels differ, first x=0 y=0 got (0, 0, 0, 0) want (0, 0, 0, 32)
+```
+
+while the *decode* of the same input is pixel exact:
+
+```
+$ python tools\decodetest.py                # ct4-many
+ct4-many   ok  (30x30 ct4 d8)
+```
+
+So the loss is on the emit side, and the same input with few enough colours
+round trips exactly, because `SuggestColType()` sends flags 1 to a palette
+(`case 1: case 2: case 3: return 3;`) and only flags 1|4 to type 4
+(`case 5: return 4;`):
+
+```
+ct4-few    ok  (20x20 ct4 d8)    # decode
+ct4-few    ok  (20x20 ct4 d8)    # round trip, via a palette
+```
+
+`FilterSample()` is therefore right as transcribed; the encoder is faithful and
+type 4 output from PNGOUT is simply lossy.
 
 ### The Huffman helpers, and how they were checked
 
@@ -1595,27 +1622,69 @@ is written explicitly just after it** as `dword_18DC380 = 0` and
 
 ### The Adam7 tables in `sub_40A630`
 
-`sub_40A630` starts at pass `dword_18DB268` (= interlace * 7) and walks **down**
-to pass 2, stopping at the first pass whose tile is non-empty, so interlaced
-images simply skip their empty trailing passes. The tables are nibble constants
-shifted by `4 * pass`:
+`dword_18DB268` is set from IHDR byte 12 at `0x409772` by `imul eax, 7`, so it
+starts at 0 or 7. `sub_40A630` then walks it **down**, stopping at the first pass
+whose tile is non-empty, so interlaced images skip their empty trailing passes.
+The tables are nibble constants shifted by `4 * pass`:
 
-| constant | shift | per-pass value |
+| constant | shift | per-pass value, pass 7 down to pass 0 |
 |---|---|---|
-| `0x04020100` | `xstart = (c >> 4p) & 0xF` | 0 0 1 0 2 0 4 |
-| `loc_402010` (the *address*, not a constant) | `ystart = (addr >> 4p) & 0xF` | 0 1 0 2 0 4 0 |
-| `0x33221100` | `1 << log2step` → `dword_18D9F90` | 1 1 2 2 4 4 8 |
-| `0x33322110` | `1 << log2step` → `dword_18DA234` | 1 2 2 4 4 8 8 |
+| `0x04020100` | `xstart = (c >> 4p) & 0xF` | 0 0 0 4 0 2 0 1 0 |
+| `loc_402010` (the *address*, not a constant) | `ystart = (addr >> 4p) & 0xF` | 0 0 0 1 0 2 0 1 0 |
+| `0x33221100` | `1 << log2step` → `dword_18D9F90` | 8 8 8 4 4 2 2 1 |
+| `0x33322110` | `1 << log2step` → `dword_18DA234` | 8 8 8 8 4 4 2 1 |
+
+That is, for pass 7 to pass 0:
+
+| pass | xstart | ystart | xstep | ystep |
+|---|---|---|---|---|
+| 7 | 0 | 0 | 8 | 8 |
+| 6 | 0 | 1 | 8 | 8 |
+| 5 | 4 | 0 | 4 | 8 |
+| 4 | 0 | 2 | 4 | 4 |
+| 3 | 2 | 0 | 2 | 4 |
+| 2 | 0 | 4 | 2 | 2 |
+| 1 | 0 | 1 | 1 | 2 |
+| 0 | 0 | 0 | 1 | 1 |
 
 The X start is an immediate constant while the Y start is a shift of the
 instruction's own operand address, which is why only the first shows up as a
 literal in a hex dump.
 
-Those starts are **not** the spec's Adam7 grid (`0 4 0 2 0 1 0` by `0 0 4 0 2
-0 1`); they are its transpose, and the two step tables disagree with a plain
-transpose as well. Before any of this is transcribed it has to be checked
-against the encoder's Adam7 emission, because a mismatch would only show up as
-corrupted interlaced output. Recorded here as measured, not as understood.
+`ebx` is the width and `edi` the height (`dword_18DA238 = be32(ihdr)` at
+`0x409702`, `dword_18DA25C = be32(ihdr + 4)` at `0x40971B`), which makes the two
+emptiness tests `cmp xstart, width` and `cmp ystart, height` at `0x40A66D` and
+`0x40A672` correct, and the pass width
+`(xstep - xstart + width - 1) >> log2xstep` at `0x40A6C9` the right count for
+the tile's columns.
+
+**The table is not a partition of the image, so PNGOUT cannot reconstruct a
+specification Adam7 file.** Compare column 0 of a 16x16 image: pass 7 covers row
+0, pass 6 row 1, pass 4 rows 2, 6, 10 and 14, pass 2 rows 4, 6, 8, 10, 12 and
+14, and pass 1 rows 1, 3, 5, 7, 9, 11, 13 and 15. Rows 6, 10 and 14 are written
+twice and rows 8 and 12 only once, by pass 2; nothing at all is written for
+rows 2 and 4 by any pass with a step that reaches them. The spec's grid, for
+comparison, is `0 4 0 2 0 1 0` by `0 0 4 0 2 0 4` with steps `8 8 4 4 2 2 1`;
+PNGOUT's is neither that nor its transpose.
+
+Two things follow, and they are why the code refuses interlaced input instead of
+guessing:
+
+* There is no arrangement of the pass data in a valid PNG that this table
+  consumes correctly, so a transcription could not be verified against anything -
+  there is no reference binary in the tree, and a self-built "PNGOUT grid" PNG is
+  not well-formed because the tiles overlap and leave holes.
+* Pass 0 is the whole image at step 1, which the spec has no equivalent of, and
+  `sub_40A630` is reached from the IDAT setup (`0x409BB5`) for **every** PNG
+  including non-interlaced ones. That is not a bug: for interlace 0 the pass
+  index is 0 and the table gives exactly the whole-image geometry, which is why
+  `src/decode.c` inlines it.
+
+What is settled: the walk order, the emptiness test, the pass width, and that the
+table itself is the original's and not a misreading of it - the two start tables
+are transposed relative to the spec, which is the shape of a hand-transcribed
+grid, and pass 0's whole-image row is consistent with the walk being written for
+`interlace * 7` rather than the spec's seven passes.
 
 ### The unidentified 8bpp format (`0x40D150`)
 
@@ -1638,10 +1707,8 @@ inflate body, the unfilter and the row expansion are all transcribed and
 verified pixel for pixel. What is left:
 
 * `sub_40A630`, the Adam7 path. Interlaced input is refused rather than guessed
-  at - see **The Adam7 tables** above for the table question that has to be
-  settled first.
-* Which of a type 4 sample's two bytes the encoder emits. See **The pixel
-  expansion**.
+  at, because the pass table it reads is not a partition of the image and so
+  could not be checked against anything - see **The Adam7 tables** above.
 * The other six decoders, the baseline JPEG decoder in `sub_40B180` (3 492
   lines, by far the largest), and re-declaring the 22 MB of `.bss` they use.
 
@@ -1658,9 +1725,9 @@ decodes them through that probe and compares the buffer against what went in.
 
 ```
 tools\dumpdec.cmd                        build the probe
-python tools\decodetest.py               all 120 cases
+python tools\decodetest.py               all 122 cases
 python tools\decodetest.py 37,41         two of them
-python tools\decodetest.py --roundtrip   20 of them through pngout.exe
+python tools\decodetest.py --roundtrip   21 of them through pngout.exe
 ```
 
 The probe has to put stdout in binary mode (`_setmode(1, O_BINARY)`, as `main()`
@@ -1668,6 +1735,14 @@ does for the "-" case): left in text mode the CRT turns every 0x0A sample into
 CR LF, which shifts the rest of the dump by a byte - and since one of the values
 in a smooth gradient usually *is* 0x0A, that looks exactly like a decoding fault.
 Worth knowing before spending an afternoon on it.
+
+The 122 cases cover all four colour types at depth 8 with three picture shapes,
+every filter on every row for each of them, filters rotating row by row, depths
+1, 2 and 4 with all six filters, `tRNS` on types 0 and 2, and the two alpha
+shapes that matter for the internal layout: `alpha_ramp` gives one see-through
+row in the middle of an opaque picture, and `grey_few` is greyscale plus alpha
+with few enough colours that `SuggestColType()` answers with a palette, which is
+the only way a type 4 image survives a round trip (see **The pixel expansion**).
 
 ### tools\pngcheck.cmd - round-trip verification
 
@@ -1772,6 +1847,20 @@ the wrong offset - in four different places.
   not close at all: the stream came out one symbol long and zlib reported
   *"incomplete or truncated stream"*.
 
+* **Fixed - `PlanBlocks()` read the wrong buffer.** All four `call sub_408390`
+  sites - `0x408071`, `0x408142`, `0x40822A` and `0x40827F` - take their base out
+  of `dword_18CBEF4`, the same global `sub_408690` (`PutByte`) appends to, so
+  `BestSplit()` walks the filtered bytes the collecting pass laid down. The
+  reconstruction used `dword_18CBEE4` (`LinBufData`) instead, which is a
+  different allocation: only `8 * LinBufBytes + 8` bytes, against a `SplitEnd` of
+  `height * (3 * width + 1)`. For a 24x24 RGB picture that is 1752 bytes read out
+  of 592. The block boundaries came from whatever the heap happened to hold, which
+  is why they changed from run to run, and on a noisy image the walk ran off the
+  end of the heap and `pngout.exe` died with an access violation in `BestSplit()`
+  - `tools\decodetest.py --roundtrip` reported it as *"e-noise-ct2 no output"*.
+  `dword_18CBEE4` is the right base in `FilterSample()` (`0x4063F6`), where it is
+  read; the two are not interchangeable.
+
 Two more things the round trip turned up that are not defects but are worth
 knowing, because a test image can trip over them:
 
@@ -1799,18 +1888,19 @@ cleanly and whose symbol count it reports exactly. (Note that `zlib` writes
 `78 da` for its own streams where PNGOUT writes `78 5e` - both are valid headers,
 and which one you get is just the compression level.)
 
-Colour type 4 is the one type the round trip cannot cover. The decoder side is
-settled now — see **The pixel expansion** for what a type 4 sample means
-internally — but `sub_407B00`, the 2 byte filter, emits bytes 0 and 1 of the
-internal DWORD, and under that layout both of those are the grey. So either the
-encoder really does drop the alpha re-encoding grey+alpha, or type 4 does not
-reach `sub_407B00` at all; there is no reference binary here to say which, and
-guessing would put a wrong byte order into the encoder. Every other colour type
-round trips: 0, 2, 3 and 6 are all in `tools\pngcheck.c`.
+Colour type 4 is the one type that does not survive the round trip, and now
+that the question is settled it is settled *as the original's behaviour*, not as
+a gap in the reconstruction. `sub_407B00`, the 2 byte filter, emits bytes 0 and
+1 of the internal DWORD and under that layout both of those are the grey, so
+PNGOUT drops the alpha whenever it re-encodes grey+alpha as type 4 - confirmed
+by running it: a 30x30 type 4 input with a varying alpha comes back with the grey
+in both bytes of every sample and no `tRNS`. `FilterSample()` reproduces that
+byte for byte. Every other colour type round trips: 0, 2, 3 and 6 are all in
+`tools\pngcheck.c`.
 
 ### tools\selftest.cmd
 
-525 checks over the recovered code: `Swap16`, `GetImageSize` for all
+240 checks over the recovered code: `Swap16`, `GetImageSize` for all
 eight format codes, the `/k` list handling in `ScanChunks`, `FilterPredict()`,
 `CpuFeatures()`, the optimiser primitives (CRC table, Huffman heap, colour
 hash, `PutBits()`/`EmitBytes()`, `RankValues()`, `FlushRow()`, `WritePngHeader()`, `EstimateEntropy()`, `BestSplit()`, `PlanBlocks()` with its block-end sort, `FilterByte()` with `Adler32Update()`, `AdvanceRow()`, `LzCode()`, and `WriteStored()`), and `Optimize()` end to end.
