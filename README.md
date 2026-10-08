@@ -2248,6 +2248,27 @@ with hardcoded tables, pixels verify vs ImageMagick. All prior steps (front
 end, entropy, IDCT, dequant, equation form, unsigned wrap, grey biases) are
 committed and green; this mapping is the only missing link.
 
+#### Red solved to ranges; green contradicts chroma-plane indexing
+
+Red flat (`Y=-218103808`, want `(254,1,0)`) with `v6=result=Cr` index 1020
+(both from `Cr` plane, flat so equal): `A1020 in [-318767104,-314572801]`,
+`B1020 in [746586112,750780415]`, `(C+D) in [-314572800,-310378497]` -
+midpoints give `(0,1,254,255)` as bytes `(B,G,R,A)`, i.e. exact red. So table
+values at index 1020 are large biases (not slopes from zero), and `C` vs `D`
+split needs `v6 != result` (gradient) data. Functionally exact; original
+values unknowable to 2^22 granularity from pixels, which is fine since any
+value in range gives identical output.
+
+But green flat breaks chroma-plane indexing: its `Cb/Cr` IDCT (`-40`, `-50`
+quantized) give indices `-680`/`-850`, both below-base (zeros), yet green
+output IS green (not grey). So `v6`/`result` cannot come from `Cb`/`Cr` planes
+there - at least one must come from `Y` (index 176, in-table) or another
+in-table source. Hence `v15`/`v15[64]` plane assignment varies (by position,
+component being output, or buffer layout) and must be traced per-pixel via
+layout simulation, not assumed per-file. That mapping read is now the single
+concrete step before table values solve generally; red and grey solve
+specifically because their flats make `v6==result` (single index, sums only).
+
 #### Fitted table biases at chroma index 0: `-2^23, -2^23, -2^22, -2^22`, worst 2
 
 Brute-forced `(A0,B0,C0,D0)` over flat greys `L=0..255` through the replicated
