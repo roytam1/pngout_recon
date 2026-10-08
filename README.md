@@ -1955,18 +1955,58 @@ The front end is straightforward and mostly confirmed:
   `((green - 256) << 8 + blue) << 8 + red`, which is the identity on RGB and
   leaves the top byte at `0xFF` by the borrow. Unfilled entries are
   `0xFF000000` (`rep stosd` at `0x40CBE6`).
+**Settled, and it is a bug in the original.** The Hex-Rays decompilation has it
+as `if ( v16 < 0 )` — a **signed** test on the image descriptor's flags byte — so
+the block that computes a local table size, `1 << ((v16 & 7) + 1)`, publishes it
+to `dword_190A820` and steps the pointer over `3 * size` bytes of palette is
+guarded by **bit 7, the interlace flag**, not by bit 6, the local colour table
+flag. Bit 6 is tested separately at `0x40CB3D` and only parks its result in
+`var_55`/`var_48`. So as written:
 
-**One thing that looks wrong and is not yet settled.** `0x40CB3D` tests
-`cl & 0x40` — the local colour table flag — and stores it in `var_55`, but the
-block that then computes a local table size, `1 << ((cl & 7) + 1)`, and skips
-`3 * size` bytes of palette is guarded by `test cl, cl` / `jns` at `0x40CB66`,
-which tests **bit 7, the interlace flag**. So as far as can be read here, a GIF
-with a local colour table and no interlacing would not have the table skipped,
-and an interlaced GIF without one would skip palette bytes that are not there.
-`var_48` and `var_55` are both consumed later in the LZW minimum-code-size
-switch at `0x40D06F`, so it is possible the pair is doing something the reading
-above misses. That needs a GIF with a local colour table and a real LZW stream
-to settle, which is why nothing has been transcribed from it yet.
+* a GIF with a local colour table and no interlacing does **not** have the table
+  skipped, and the LZW stream is read from the palette bytes;
+* an interlaced GIF with no local colour table skips palette bytes that are not
+  there.
+
+Neither is recoverable from the file, and a GIF with a local colour table is
+extremely common. That is the original's behaviour and a transcription has to
+reproduce it.
+
+#### The rest of the function, so the next pass starts from facts
+
+The LZW is a conventional one, over three globals: `dword_18D0030` (768 bytes of
+input buffer), `dword_18D0330` (4100 code slots) and `byte_18D8F87` /
+`byte_18D8F88` (the same slot's code and its length) with `byte_18DD9D8` as the
+output string stack.
+
+* The minimum code size byte gives `clear = 1 << n` and `end = clear + 1`; slots
+  `0 .. clear - 1` are seeded with themselves (`dword_18D0330[i] = i`,
+  `byte_18D8F88[i] = i`, the loop at `0x40CE92`).
+* Codes arrive LSB-first out of `dword_18D0030`, and when the reader gets within
+  three bytes of the end of the buffer it shifts the tail down (`0x40CF19`,
+  `mov si, word ptr dword_18D0030[ecx]`) and appends the next sub-block; the
+  `v48 = v59 - v47` shift at `0x40CF15` is the shift-and-refill.
+* The code size grows when the next free slot would reach `1 << codesize`, and is
+  capped at 12 (`cmp v63, 0Ch` / `jnz` at `0x40CFB1`).
+* A code is expanded by walking the chain back to a literal, filling
+  `byte_18DD9D8` and then emitting it **backwards** — the emit loop at `0x40D025`
+  walks `v73` down from the string length, which is why the expansion builds the
+  string in reverse.
+* The interlacing is four passes with strides 8, 8, 4 and 2, driven by `var_55`
+  and the switch at `0x40D068`: a stride of 1 or 2 means done and returns 0, 4
+  starts the pass at `yorigin + 1`, and 8 alternates between `yorigin + 2` and
+  `yorigin + 4` on `var_55`. The strides are GIF's (rows 0, 8, 16 … then 4, 12
+  … then 2, 6 … then 1, 3, 5 …) but the pass offsets are built from a
+  *stride* variable, so it is worth checking against a real interlaced GIF.
+
+The frame placement is the least clear part of the function and the part most
+likely to be mis-transcribed: `0x40CCAE` onwards computes four clamped bounds and
+then runs four `rep stosd` passes to fill the background, and the clamps mix the
+image's left with its *height* (`v78 = v28 + v18 + v57 <= 0 ? 0 : ...`, where
+`v18` is the left offset, `v57` the image width and `v28` the x origin). There is
+a fast path at `0x40CC1D` for the common case — the image at 0,0 exactly filling
+the screen — which skips the fill entirely, and that is the case a test suite
+would hit first, so a transcription needs cases that deliberately miss it.
 
 ### `sub_40DD80`, DDS (format code 7) — analysed, not transcribed
 
