@@ -202,7 +202,7 @@ int main(int argc, char **argv, char **envp)
     int   keeplistarg = -1, outnamearg = -1;
     int   optbitdepth = -1, useblocks = 0;
     int   i, insize = 0, trnscoltype = -1, coltype;
-    int   fmt, delta;
+    int   fmt, delta, wrote = 0;
     FILE *in;
     FILETIME lastaccesstime;
     HANDLE h;
@@ -211,20 +211,20 @@ int main(int argc, char **argv, char **envp)
      *  The option defaults the SETTINGS layout documents.  Without these the
      *  three "automatic" fields are whatever was on the stack, and
      *  Optimize() reads s.coltype straight into the output colour type - so
-     *  a run with no /c on the command line picks an arbitrary one.
+     *  a run with no /c on the command line picks an arbitrary one.  The
+     *  memset has to come *before* them, not after: a second one further down
+     *  quietly puts all three back to zero, which reads as "greyscale, no
+     *  filter, depth 0" rather than as "decide for me".
      */
     memset(&s, 0, sizeof s);
     s.filter     = -1;                 /* automatic */
     s.coltype    = -1;                 /* automatic */
     s.bitdepth   = -1;                 /* automatic */
     s.blocksplit = 256.0;
+    s.msg        = Msg;
+    s.checkesc   = CheckEsc;
 
     (void)envp;
-
-    memset(&s, 0, sizeof(s));
-    s.blocksplit = 256.0;
-    s.msg         = Msg;
-    s.checkesc    = CheckEsc;
 
     Stream = stderr;                     /* &iob[2] in the original */
 
@@ -427,8 +427,15 @@ int main(int argc, char **argv, char **envp)
             strcpy(outfilename, argv[outarg]);
             n = (int)strlen(outfilename);
 
-            if (n < 4 || !stricmp(outfilename + n - 4, ".PNG")
-                     || n + 4 >= MAX_PATH)
+            /*
+             *  0x4019FD: append unless the name already ends in .PNG.  The
+             *  original's test is "len < 4 || (stricmp(tail, ".PNG")
+             *  && len + 4 < MAX_PATH)", so a name that already carries the
+             *  extension is left alone and one that is too long for it to be
+             *  added is left alone too.
+             */
+            if (n < 4 || (stricmp(outfilename + n - 4, ".PNG")
+                          && n + 4 < MAX_PATH))
                 AppendPngExt(outfilename);
         }
     } else if (instdin) {
@@ -740,15 +747,15 @@ int main(int argc, char **argv, char **envp)
                 Msg("ERROR: Unable to open %s for writing!\n", outfilename);
             }
             Msg("Unable to compress further: copying original file\n");
-            delta = 2;
+            wrote = 2;
             goto done;
         }
-        delta = 3;
+        wrote = 3;
         goto done;
     }
 
     if (delta == 0x7FFFFFFF) {
-        delta = 3;
+        wrote = 3;
         goto done;
     }
 
@@ -757,34 +764,40 @@ writeit:
         delta >= insize && outnamearg < 0 &&
         !stricmp(infilename, outfilename) && !force) {
         Msg("Unable to compress further\n");
-        delta = 2;
+        wrote = 2;
         goto done;
     }
 
-    /* stdout only when the input was "-"; otherwise the named output file. */
+    /*
+     *  `delta` is the optimised size and is what the Chg line reports; the
+     *  status - 0 written, 1 the write failed, 2 nothing smaller to write, 3 the
+     *  optimiser bailed - is a separate variable (`v58` in the original) and is
+     *  what main() returns.  Clearing delta on success, as this used to, made
+     *  every run report "-<original> bytes, 0% of original".
+     */
     if (instdin) {
         if (fwrite(s.outbuf, 1, (size_t)delta, stdout) == (size_t)delta) {
-            delta = 0;
+            wrote = 0;
             if (KeepFileTime)
                 KeepFileTime = 2;
         } else {
             Msg("ERROR writing to file!\n");
-            delta = 1;
+            wrote = 1;
         }
         fflush(stdout);
     } else if ((in = fopen(outfilename, "wb")) != NULL) {
         if (fwrite(s.outbuf, 1, (size_t)delta, in) == (size_t)delta) {
-            delta = 0;
+            wrote = 0;
             if (KeepFileTime)
                 KeepFileTime = 2;
         } else {
             Msg("ERROR writing to file!\n");
-            delta = 1;
+            wrote = 1;
         }
         fclose(in);
     } else {
         Msg("ERROR: Unable to open %s for writing!\n", outfilename);
-        delta = 1;
+        wrote = 1;
     }
 
     if (insize) {
@@ -826,5 +839,5 @@ done:
             free(fileimg);
     }
 
-    return delta;
+    return wrote;
 }

@@ -77,8 +77,6 @@ int EmitBlock(unsigned width, unsigned height, int coltype, int bitdepth,
     /* one row's worth of filtered samples, and the work buffer is 8 bytes
        per output byte */
     LinBufBytes = (int)(bitdepth * width + 7) >> 3;
-    fprintf(stderr, "[blk] coltype=%d depth=%d width=%d LinBufBytes=%d\n",
-            coltype, bitdepth, (int)width, LinBufBytes);
     LinBufUsed = 0;
     BitBufPos = 0;
 

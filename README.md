@@ -21,6 +21,7 @@ The target: PE32, image base `0x400000`, `.text` `0x401000` (54 712 bytes),
 tools\build.cmd            # compile + link  ->  build\pngout.exe
 tools\build.cmd clean
 tools\selftest.cmd         # unit tests for the recovered support code
+tools\dumpdec.cmd          # build\dumpdec.exe, the standalone decoder probe
 tools\regen.cmd            # rebuild reference\ from the two IDA exports
 tools\run.cmd <command>    # run a tool inside the repo (maps the UNC share)
 ```
@@ -175,9 +176,19 @@ flag bits that decide the colour type:
 
 | bit | meaning | set when |
 |---|---|---|
-| 1 | needs alpha | a non-opaque pixel whose RGB triple also appears opaque |
+| 1 | needs alpha | some pixel is not opaque, and is not the darkest pixel - see `0x402D42` and `0x402D5C` below |
 | 2 | not grayscale | some pixel has `R != G != B` |
 | 4 | too many colours | a 257th distinct colour turned up |
+
+Bit 1 has two ways to be raised, and both are unsigned comparisons, which matters
+because a non-opaque pixel is *negative* as a signed int. The darkest pixel
+(`MinSample`, `dword_185BEC0`) is taken with `jnb` at `0x402BF7` and tested
+against `0x01000000` with `jnb` at `0x402D09`; if it is at least that, alpha is
+needed. Otherwise the image is searched for a pixel that is either the same RGB
+with a non-zero alpha or - at `0x402D5C` - simply not opaque and not equal to
+`MinSample`. The second test is the one that carries a picture with a fully
+transparent background: without it the background's own RGB is the only candidate
+and the other see-through colours never get a look in.
 
 and the palette in `dword_180B578`, the number of distinct colours, and
 `MinSample` (`dword_185BEC0`), the darkest pixel - which is what decides whether
@@ -1411,81 +1422,168 @@ three Huffman helpers, the inflate body, the unfilter and the row expansion, for
 colour types 0, 2, 3, 4 and 6 at depths 1, 2, 4 and 8. Interlaced input is
 refused rather than guessed at.
 
-**How far it is verified, precisely.** The inflate half is verified byte for byte
-against `zlib` on all 31 corpus streams and 16 generated ones. The decoder runs
-end to end through `main()`: `pngout.exe /c6 /force png_0.png out.png` reports
-`In: png_0.png /c2 /f5` - the right colour type, depth and PNGOUT's own filter -
-and writes a 32x24 file. **The pixels do not match yet**: comparing the output
-against the source shows all 768 differing, so the expansion's byte placement is
-wrong. The jump table at `0x40A97A` dispatches on `coltype - 2`, so
-`coltype 2` is the block at `0x40ADB0` and `coltype 4` the one at `0x40AD5A`;
-the `coltype 6` block is the one that has not been read yet, and the `coltype 2`
-byte sources need checking against it. The unfilter itself is exercised and
-produces rows of the right length, so the defect is in the expansion, not
-upstream.
+**How far it is verified, precisely.** `tools\decodetest.py` drives
+`tools\dumpdec.exe` - which links the same sources and calls the real
+`DecodeImage()` - over 120 generated PNGs whose pixels are known by
+construction, and compares the raw buffer the decoder hands to `Optimize()`
+against what went in. All 120 match. Between them the cases cover every colour
+type and bit depth the reconstruction accepts, every filter byte on every row,
+stored, fixed and dynamic deflate blocks, all four zlib strategies, deflate
+streams split across two, three and five IDAT chunks, sub-byte greyscale and
+palettes, an RGB `tRNS`, `bKGD`, other ancillary chunks, images from one pixel
+to 36000, and rows that straddle the 16 KB window hand-over.
+`python tools\decodetest.py --roundtrip` then runs 20 of the same images
+through `pngout.exe` itself and compares the file it writes.
 
-**Where it stands, precisely.** A 6x6 RGB image with filter bytes 0,1,2,3,4,0 on
-successive rows round-trips with **row 0 (filter 0) exact and every non-zero
-filter row wrong**. So the inflate, the expansion and the encoder are all sound;
-the defect is confined to the unfilter's filter 1-4 branches. Symptoms: a Sub
-row gives the same pixel repeated from x=1 onward, so the left-neighbour
-reference is not advancing, and an Up row comes out at exactly half the expected
-value. The prime suspect is the `Ring[]` / `CurChannel` sample-offset rotation
-and the `RowA` / `RowC` history arrays behind it: `RowA[ch]` is refreshed in the
-Average and Paeth branches but not in Sub or Up, which is precisely the pattern
-that would leave Sub and Up reconstructing against stale state. A greyscale
-8x4 image with all filter bytes zero comes back pixel-exact with no non-opaque
-alpha, which is consistent.
+The inflate half was also verified byte for byte against `zlib` on all 31
+corpus streams and 16 generated ones, by dumping the window and diffing it
+against Python's `zlib.decompress` output.
 
-Two hypotheses have been tested and **ruled out**, so do not re-try them: it is
-not the destination pointer (a running `dword_18CBF00` versus `base + pitch *
-row`, both now consistent with the listing), and it is not the `Ring[]` /
-`CurChannel` rotation - correcting the ring so it enumerates a full cycle per
-pixel changed nothing observable. What is left is the Sub branch itself: it
-reads `RowA[ch]`, writes `Up[RowLeft--]`, and advances `CurChannel` and `i` by
-hand, and the symptom - every byte from the second onwards decoding to the same
-value - looks like `i` or `RowA[ch]` failing to advance. Note also that the
-Sub-style branches mix a pre-decrement of `RowLeft` into the same expression as
-a read of `Up[RowLeft + 1]`, which is unsequenced in C and worth rewriting as
-two statements once the branch is otherwise correct.
+**Where it stands.** Every one of those cases matches. What follows is what was
+wrong on the way, because each item is a trap the listing sets and the shape of
+the code does not.
 
-**Five defects found by testing pixels, all fixed:**
+### The unfilter's addressing
 
-* **`Unfilter()` cached the filter type before resolving it.** It did
-  `f = CurFilter`, and only when `f < 0` did it call `StartFilterByte(buf[0])` -
-  which sets `CurFilter`, not the local. The switch then ran on a stale `-1`,
-  matched nothing, and the whole inflate produced no pixels at all. This was the
-  root cause: every decode silently wrote nothing, and the destination stayed
-  uninitialised heap, which is what `ScanImage()` was reporting as
-  "requires full alpha".
-* The type-2 and type-6 expansions read `Up[v+1]` and `Up[v+2]` - *ascending* -
-  not descending (`0x40ADB0`, `0x40AD20`). Against the back-to-front staging row
-  that yields the file's B, G, R, landing the pixel as `0xFFBBGGRR`. Type 4
-  reads `Up[v]` and `Up[v-1]` and is right as first written.
-* Colour types 0 and 3 were never expanded. `def_40ABE8` only advances the
-  destination pointer, because the original inflates those two straight into the
-  destination. Staging the row separately means the cases must be written out.
-* Sub-byte depths indexed `Up[v >> 3]` against a downward bit index, which cannot
-  work against the reversed row. `PackedSample()` maps back to an ascending row
-  position first.
-* The destination is a running pointer (`dword_18CBF00`, stepped at
-  `loc_40AE2D`), not `base + pitch * row`. It must also be initialised **once** -
-  putting it in the per-row `ResetPass()` made `DestRow += DestPitch` a no-op.
+The staging row is **mirrored and anchored at 0x18FA1C0**: row byte *k* lives at
+`0x18FA1C0 + RowBytes - k`, so index 0 is unused and the row runs downwards
+from `RowBytes` to 1 (`dec eax` *then* `mov [eax+18FA1C1h], bl` at 0x40A990,
+which is `0x18FA1C0 + RowBytes - k` once the +1 and the pre-decrement cancel).
+That fixes the three neighbours unambiguously:
 
-**Two `main()` defects, both fixed.**
+| PNG's name | address | who holds it |
+|---|---|---|
+| `a`, the pixel-aligned left | `0x18FA1C0 + RowBytes - k + samples` | `RowA[ch]`, written as the byte is produced |
+| `b`, the row above | `0x18FA1C0 + RowBytes - k` | the slot itself - Up, Average and Paeth all read and write the same address in place |
+| `c`, up and to the left | written by the previous *pixel* | `RowC[ch]`, written as `b` was read |
 
-* `SETTINGS s;` was never initialised, so `s.coltype`, `s.filter` and `s.bitdepth`
-  were whatever was on the stack - and `Optimize()` reads `s.coltype` straight
-  into the output colour type, so a run with no `/c` picked an arbitrary one.
-  They now get the "automatic" defaults the layout documents, plus
-  `blocksplit = 256.0`.
-* The write path tested `haveout` to decide stdout versus a file, but `haveout`
-  means *an output filename was given*. So naming an output file sent the PNG to
-  stdout instead. The test is `instdin`, which is what actually means "the
-  stream is stdout".
+`RowA[ch]` and `RowC[ch]` are indexed by `dword_18DC38C`, which walks
+`dword_18DB85C[]` once per *byte*. That is exactly PNG's `bpp`: the value in
+`RowA[ch]` was last written `samples` bytes ago, so it is the pixel-aligned left,
+not the adjacent byte. The ring starts at 0 (`0x40A777`), and for colour type 2
+it is 1, 2, 0 - a three cycle - which lines up with `bpp = 3`. The starting
+value does not matter for the value either way; what matters is that the ring is
+a cycle of length `samples`.
 
-Both were invisible until now because `DecodeImage` aborted before either could
-run.
+### The channel ring and the Paeth byte
+
+The ring is set at IDAT setup (`0x409A96`), not at IHDR: `dword_18DB85C[0] = 1`
+for any type with an alpha slot, `dword_18DB860 = 2` for type 2, `dword_18DB864 =
+3` and `dword_18DB868 = 0` for type 6, and the whole array zero for types 0 and
+3 - so it is a one slot ring there.
+
+`dword_4110CC` starts at `0xFFFFFFFE` and is set to 4 by the format-4 decoder, so
+**filter byte 4 is decoded as PNGOUT's own predictor, not PNG's Paeth**. Both
+branches 4 and 5 are that predictor, and they are the same function: `sub_40AF40`
+measures `|a + b - 2c|`, `|b - c|` and `|a - c|`, and the copy inlined at
+`loc_40AAE0` reaches the same three numbers through `T[c-a]`, `T[2c-a-b]` and
+`T[c-b]` off one indexed base - `lea edx, [18DAA60h + (c-a-b)*4]` with the
+symbols added back at `[edx+ebx*4]`, `[edx+ecx*4]` and `[edx+eax*4]`. So filter
+bytes 4 and 5 reconstruct identically, and a foreign PNG row that uses real
+Paeth comes out wrong - which is PNGOUT's behaviour, and the test corpus has to
+apply PNGOUT's predictor for byte 4 or it measures the difference instead of the
+decoder.
+
+**Two hypotheses that were ruled out**, so do not re-try them: the destination is
+not misaddressed (`dword_18CBF00` really is a running pointer stepped by the
+pitch, and it is stepped only when the row was expanded), and the channel
+rotation is not the problem (a ring that enumerates a full cycle per pixel
+changes nothing, because any starting value gives the same distance).
+
+**The row buffer is not cleared between rows.** `ResetPass()` zeroes `RowA`,
+`RowC` and `RowLeft` and nothing else - the `rep stosd` that clears `RowBytes + 1`
+bytes of the row buffer is at `0x40A72B`, which runs once a pass. Clearing it per
+row makes every row behave like the first one, and Up, Average and Paeth all
+reconstruct against an empty row above: exactly the "flat or halved row"
+symptom.
+
+### Defects found by testing pixels, all fixed
+
+* **The up-neighbour was read one byte too high.** With the row mirrored, Up,
+  Average and Paeth all read and write `0x18FA1C0 + RowLeft` - the *same*
+  address, in place. Reading `Up[RowLeft + 1]` instead takes the byte to the
+  left of the one being written, so Up rows come out as the sum of two
+  horizontally adjacent bytes. `Up` is now `RowUp` and the expansion indexes it
+  with the original's own offsets.
+* **The row record recorded the resolved filter, not the byte.** `Block[]`
+  keeps what the file carried: `dword_18E909C` is set first, then `dword_4110CC`
+  redirects 4 to 5 (`0x40A91B`, `0x40AED7`).
+* **The packed cases stepped `v` by `8 / depth`.** `v` counts *bits*, so the
+  step is `depth`: `dec ebx`, `sub ebx, 2`, `sub ebx, 4` at `0x40ABEF`,
+  `0x40AC34` and `0x40AC7A`. Stepping by `8 / depth` ran the loop off the end of
+  the pixel buffer.
+* **The 256 entry widening ran at IHDR, where a palette is not known yet.**
+  `0x409AF1` does it at IDAT setup, after the PLTE and the tRNS have both been
+  read; at IHDR the table is still empty for colour type 3, so the widening
+  spreads zeros over every index above the real entries.
+* **`PackedSample()` invented a mapping the original does not have.** The three
+  cases read one byte and shift it, with no mask at all - the mask is the
+  pre-widened palette: `Up[v >> 3] >> (v & (8 - depth))` indexes a 256 entry
+  table that is already periodic, so an unmasked byte is a legal index.
+* **Colour type 3 at depth 8 skipped the table.** `loc_40ACC5` is the byte loop
+  and it does go through `dword_190A420`, like the packed cases.
+* **`BuildDecodeTables()` never advanced the canonical code.** It filled
+  `MaskTable[maxbits - len] + 1` slots per symbol starting from `code = 0` every
+  time, which happens to look right for a table where one length holds
+  everything - the fixed table - and is wrong for anything else. `esi` in
+  `sub_40A4A0` is the running canonical code and steps on by
+  `2^(maxbits - len)` per symbol. This is what broke every dynamic block with
+  more than one code length, which is most of them.
+* **The pump read the anchor in bits where the listing uses bytes.** `[esi+8]`,
+  `[esi+0Ch]` and `[esi+10h]` at `0x40A35D` are byte offsets; `WordAt()` takes a
+  *bit* offset and divides by eight, so `+8` landed one byte along the data, the
+  staged length came out as noise, and the next anchor pointed into the heap.
+  A `DwordAt()` for bytes is the fix.
+* **`NextHdr` was one chunk too far along.** `lea ecx, [esi+eax+0Ch]` has no
+  `+8`: the anchor for the chunk after next is its *last* four data bytes, the
+  same role this chunk's anchor has, which is what lets the backwards walk
+  continue across the boundary. Adding the 8 puts the anchor inside the
+  following chunk's data and every byte after the first IDAT is wrong.
+* **The window hand-over was only checked where a literal is stored.** The
+  check at `0x40A09C` is at the top of the *symbol* loop, and the match copy at
+  `0x40A268` writes straight into the window without passing it. A
+  compressible stream is mostly matches, so the boundary is missed entirely and
+  the tail flush then reads tens of thousands of bytes past a 32 KB array.
+* **The hand-over unfliltered "write index minus start" instead of 0x4000.**
+  `push 4000h` at `0x40A0B4` and `0x409D09`. The index overshoots the boundary
+  by whatever the last match's length was, and those bytes belong to the *next*
+  hand-over; unflitering them twice corrupts the row they are in and every row
+  after it. The same run also reset `WinWrite` to `start + 0x4000`, which threw
+  the overshoot away.
+* **The tail flush's first length was `0x4000 - (start & 0x7FFF)`.** The
+  original is `(-start) & 0x7FFF` at `0x40A2CF`, and the two agree only while
+  `start` is 0x4000; at 0x8000 the original's first call gets length zero.
+* **`StartFilterByte()`'s Paeth redirect changed what the row record holds**
+  (above), and `CurChannel` is set once a pass at `0x40A777`, not per row.
+
+**Five `main()` and optimiser defects, all fixed.**
+
+* `SETTINGS s;` was memset **twice**, the second time after the three
+  "automatic" defaults had been written, so `s.coltype`, `s.filter` and
+  `s.bitdepth` were all zero: a run with no `/c` went to greyscale rather than
+  deciding for itself.
+* The write path cleared `delta` on success and then printed it, so the `Chg`
+  line always said "-<original> bytes, 0% of original". The result belongs in its
+  own variable, `v58` in the original.
+* Naming an output file that already ends in `.png` appended a *second*
+  extension. `0x4019FD` is `len < 4 || (stricmp(tail, ".PNG") && len + 4 <
+  MAX_PATH)` - the reconstruction had both the comparison and the room test
+  inverted.
+* `main()` returned the optimised size rather than the status. `delta` is what
+  the `Chg` line reports; the exit status is `v58` - 0 written, 1 the write
+  failed, 2 nothing smaller to write, 3 the optimiser bailed - and the write
+  result has to go there.
+* **`RowProgress()` computed a 32x32 -> 64 multiply in 32 bits.** `a * b >> 32`
+  overflows the product first, so every run printed a percentage in the
+  hundreds of millions. `unsigned __int64` spells out what `sub_403AF4` does.
+* **`ScanImage()` left the flag unset for the common transparent case.** At
+  `0x402D5C` the search for a see-through pixel sets bit 1 when it finds *any*
+  pixel that is not opaque and is not the darkest one; the reconstruction only
+  left the loop, so an image whose darkest pixel is the transparent background
+  and whose other pixels are half transparent was written as RGB with the alpha
+  silently dropped. `minsample >= 0x01000000` is also an **unsigned** compare at
+  `0x402D09` (`jnb`), which matters because a non-opaque pixel is negative as a
+  signed int.
 
 Also worth recording: `dword_18DBA98` and `unk_18DC2A0` are the same array seen
 through two symbols. `0x18DC2A0 - 0x18DBA98 == 0x808 == 257 * 8`, and the inflate
@@ -1535,18 +1633,13 @@ named `FMT_PAL8`.
 
 ### Still to do inside DecodeImage
 
-The chunk walk, the unfilter and three of the four Huffman helpers are worked
-through and the helpers are verified against zlib. What is left:
+The chunk walk, the bit reader and its pump, the three Huffman helpers, the
+inflate body, the unfilter and the row expansion are all transcribed and
+verified pixel for pixel. What is left:
 
-* Transcribing the inflate body into C. The model is verified byte for byte
-  against `zlib` on all 31 corpus streams and 16 generated ones, so this is
-  mechanical rather than open-ended; see **The Huffman helpers** for the pinned
-  conventions.
-* Transcribing any of the above. Nothing has been written to `src\` for
-  `DecodeImage` yet, so a build still reports it unimplemented rather than
-  guessing at the inflate path.
-* `sub_40A630`, the Adam7 path, once the encoder side settles the table
-  question above.
+* `sub_40A630`, the Adam7 path. Interlaced input is refused rather than guessed
+  at - see **The Adam7 tables** above for the table question that has to be
+  settled first.
 * Which of a type 4 sample's two bytes the encoder emits. See **The pixel
   expansion**.
 * The other six decoders, the baseline JPEG decoder in `sub_40B180` (3 492
@@ -1554,7 +1647,27 @@ through and the helpers are verified against zlib. What is left:
 
 ## Verification so far
 
-Two independent checks, both runnable.
+Three independent checks, all runnable.
+
+### tools\decodetest.py - decoder verification
+
+`tools\dumpdec.cmd` builds `build\dumpdec.exe`, a probe that links the same
+sources, calls the real `DecodeImage()` and writes the pixel buffer out raw.
+`tools\decodetest.py` generates PNGs whose pixels are known by construction,
+decodes them through that probe and compares the buffer against what went in.
+
+```
+tools\dumpdec.cmd                        build the probe
+python tools\decodetest.py               all 120 cases
+python tools\decodetest.py 37,41         two of them
+python tools\decodetest.py --roundtrip   20 of them through pngout.exe
+```
+
+The probe has to put stdout in binary mode (`_setmode(1, O_BINARY)`, as `main()`
+does for the "-" case): left in text mode the CRT turns every 0x0A sample into
+CR LF, which shifts the rest of the dump by a byte - and since one of the values
+in a smooth gradient usually *is* 0x0A, that looks exactly like a decoding fault.
+Worth knowing before spending an afternoon on it.
 
 ### tools\pngcheck.cmd - round-trip verification
 
@@ -1917,9 +2030,14 @@ src/optimize.c    CRC table, Huffman heap, colour hash, bit/byte output,
 src/lz.c          the LZ coder (sub_4065A0) and its byte sink (sub_406530)
 src/trials.c      Optimize() (sub_402AD0): the colour type / bit depth decision,
                   the size estimate, the /s4 shortcut and the trial loop
+src/decode.c      DecodeImage(): the PNG chunk walk, the bit reader and its
+                  pump, the three Huffman helpers, the inflate body, the
+                  unfilter and the row expansion
 src/predict.c     FilterPredict
 src/cpuid.c       CpuFeatures
 src/stubs.c       the one unrecovered entry point, plus the math error handler
-tools/            extraction scripts, build.cmd, run.cmd, selftest.cmd, regen.cmd
+tools/            extraction scripts, build.cmd, run.cmd, selftest.cmd, regen.cmd,
+                  pngcheck (the encoder's round trip), dumpdec + decodetest
+                  (the decoder's)
 reference/        extracted listing/decompilation/strings (generated, gitignored)
 ```

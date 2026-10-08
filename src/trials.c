@@ -192,12 +192,30 @@ static void ScanImage(unsigned int *flags, int *ncolors)
      *  force alpha on its own.
      */
     if ((unsigned int)minsample < 0xFF000000u) {
-        if (minsample >= 0x01000000) {
+        /*
+         *  Both comparisons are *unsigned*, as they are at 0x402B94 and inside
+         *  the search loop below.  A pixel is 0xAARRGGBB, so any pixel that is
+         *  not opaque has a top byte below 0xFF and is negative as a signed
+         *  int: read signed, `minsample >= 0x01000000` is false for every one
+         *  of them, the image is decided not to need alpha, and a picture full
+         *  of half-transparent pixels is written as RGB with the alpha
+         *  silently dropped.
+         */
+        if ((unsigned int)minsample >= 0x01000000u) {
             f |= 1;
         } else {
             int r2, c2;
             unsigned char *p2 = base;
 
+            /*
+             *  0x402D42.  The darkest pixel's own RGB with a non-zero alpha is
+             *  one way to want alpha; the other, at 0x402D5C, is *any* pixel
+             *  that is not opaque and is not that pixel.  Both set bit 1 and
+             *  both leave the loop, so an image whose darkest pixel is the
+             *  fully transparent background still gets alpha when some other
+             *  colour is see-through.  Leaving the loop without the flag is
+             *  what silently drops the transparency.
+             */
             for (r2 = 0; r2 < Image->height; r2++) {
                 if (CheckEscHook(1))
                     return;
@@ -210,8 +228,12 @@ static void ScanImage(unsigned int *flags, int *ncolors)
                         r2 = Image->height;
                         break;
                     }
-                    if ((int)v < 0xFF000000 && (int)v != minsample)
-                        c2 = Image->width;
+                    if ((unsigned int)v < 0xFF000000u &&
+                        (int)v != minsample) {
+                        f |= 1;
+                        r2 = Image->height;
+                        break;
+                    }
                 }
                 p2 += Image->stride;
             }
@@ -745,11 +767,16 @@ static void SeedBlockTables(int block)
  *  row before anything is filtered.  The percentage is a fixed point multiply of
  *  the row counter by the scale sub_4086B0 worked out, kept in Image->percent so
  *  it only prints when it moves.
+ *
+ *  The multiply is 32x32 -> 64 and the result is shifted back down by 32, which
+ *  in C has to be spelled out: a plain `a * b >> 32` overflows the 32 bit
+ *  product first, and every run prints a percentage in the hundreds of millions.
  */
 static int RowProgress(int rowacc)
 {
-    unsigned int pct =
-        (unsigned int)(((unsigned int)(rowacc + PercentBias) * PercentScale) >> 32);
+    unsigned int pct = (unsigned int)
+        (((unsigned __int64)(unsigned int)(rowacc + PercentBias)
+          * PercentScale) >> 32);
 
     if ((int)pct > Image->percent) {
         Image->percent = (int)pct;

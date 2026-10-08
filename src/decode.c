@@ -75,6 +75,17 @@ static unsigned WordAt(int pos)
     return *(const unsigned *)(Anchor + (pos >> 3));
 }
 
+/*
+ *  The pump indexes the anchor in *bytes* ([esi+8], [esi+0Ch], [esi+10h]) while
+ *  the bit reader's WordAt() takes a bit offset and divides by eight.  Mixing
+ *  the two up is silent: +8 lands one byte along the data, so the staged length
+ *  comes out as noise and the next anchor points into the heap.
+ */
+static unsigned DwordAt(int off)
+{
+    return *(const unsigned *)(Anchor + off);
+}
+
 static void Pump(void)              /* sub_40A340 */
 {
     if (NextHdr) {
@@ -85,19 +96,21 @@ static void Pump(void)              /* sub_40A340 */
     }
 
     /*
-     *  Stage the next chunk.  Relative to the current anchor, +8 is the
-     *  length of the *following* chunk, +0xC its tag and +0x10 its first
-     *  four data bytes.  The two staging dwords sit next to each other on
-     *  purpose: a read crossing the boundary simply walks from one to the
-     *  other.  PendingLen is read once and never refreshed, so every IDAT
-     *  after the first is walked with the first one's length - that is in
-     *  the original.
+     *  Stage the next chunk.  Relative to the current anchor, +8 is the length
+     *  of the *following* chunk, +0xC its tag and +0x10 its first four data
+     *  bytes.  `lea ecx, [esi+eax+0Ch]` is the anchor for the chunk after that
+     *  one - its *last* four data bytes, the same role this chunk's anchor has,
+     *  which is what lets the walk continue backwards across the boundary.
+     *  The two staging dwords sit next to each other on purpose: a read
+     *  crossing the boundary simply walks from one to the other.  PendingLen is
+     *  read once and never refreshed, so every IDAT after the first is walked
+     *  with the first one's length - that is in the original.
      */
-    PendingLen = (int)Swap32(WordAt(8));
-    NextHdr = Anchor + 8 + PendingLen + 12;
-    Stage[0] = WordAt(0);
-    if (WordAt(12) == 0x54414449u)          /* "IDAT" */
-        Stage[1] = WordAt(16);
+    PendingLen = (int)Swap32(DwordAt(8));
+    NextHdr = Anchor + PendingLen + 12;
+    Stage[0] = DwordAt(0);
+    if (DwordAt(12) == 0x54414449u)          /* "IDAT" */
+        Stage[1] = DwordAt(16);
     Anchor = (const unsigned char *)&Stage[1];
     BitPos -= 32;
 }
@@ -180,34 +193,38 @@ static int ReverseBits(int v, int nbits)
     return r;
 }
 
+/*
+ *  sub_40A4A0.  The table is keyed by the *bit reversed* canonical code, so
+ *  `code` has to walk the canonical codes in order - 2^(maxbits - len) slots
+ *  for every symbol of that length - and each slot is filled with the reversal
+ *  of the code it sits at.  Leaving `code` at zero fills the same slots over
+ *  and over, which happens to look right for a table where one length holds
+ *  everything and is completely wrong for anything else.
+ */
 static void BuildDecodeTables(const int *offs, const int *symbols,
                               int *table, int *codes, int maxbits)
 {
-    int code = 0, len = 1, p = 1, arg = maxbits - 1;
+    int code = 0, len, i;
 
-    while (len <= maxbits) {
-        int i = offs[p - 1];
+    for (len = 1; len <= maxbits; len++) {
+        int slots = MaskTable[maxbits - len] + 1;
 
-        while (i < offs[p]) {
-            unsigned end = MaskTable[arg] + (unsigned)code, j;
+        for (i = offs[len - 1]; i < offs[len]; i++) {
+            int j;
 
-            for (j = (unsigned)code; j <= end; j++) {
-                int t = ReverseBits((int)j, maxbits);
+            for (j = 0; j < slots; j++) {
+                int t = ReverseBits(code + j, maxbits);
 
                 table[t] = symbols[i];
                 codes[t] = len;
             }
-            i++;
+            code += slots;
         }
-        len++;
-        p++;
-        arg--;
     }
-    {   /* whatever is left over is an invalid code */
-        unsigned end = MaskTable[maxbits], j;
 
-        for (j = (unsigned)code; j <= end; j++)
-            codes[ReverseBits((int)j, maxbits)] = 0;
+    {   /* whatever is left over is an invalid code */
+        for (; code <= MaskTable[maxbits]; code++)
+            codes[ReverseBits(code, maxbits)] = 0;
     }
 }
 
@@ -269,7 +286,7 @@ static int   RowBytes;              /* dword_18DB26C */
 static int   RowLeft;               /* dword_18D9FA4, bytes left in the row */
 static int   CurChannel;            /* dword_18DC38C */
 static int   Ring[4];               /* dword_18DB85C[4] */
-static unsigned char RowUp[0x9000]; /* dword_18FA1C0; Up is RowUp + 1 */
+static unsigned char RowUp[0x9000]; /* dword_18FA1C0 */
 
 /*
  *  dword_18CBF00: a running destination pointer, not an indexed base.  The
@@ -288,7 +305,7 @@ static int   ImageWidth;            /* dword_18D9FA8 */
 static int   Samples;               /* samples per pixel */
 static int   ExpStart, ExpEnd;      /* dword_18DB270, dword_18DB274 */
 
-static int AbsTab(int v)            /* 0x18D6A40, for the inlined predictor */
+static int AbsTab(int v)            /* 0x18DAA60, for the inlined predictor */
 {
     return v < 0 ? -v : v;
 }
@@ -299,37 +316,43 @@ static void NoteRowFilter(int f)
         Block[RowBase] = (unsigned char)f;
 }
 
+/*
+ *  0x40A91B and 0x40AED7.  The row record keeps the byte the file actually
+ *  carried; only the running filter turns the Paeth byte into PNGOUT's own.
+ */
 static void StartFilterByte(int f)
 {
-    if (f == PaethByte)
-        f = 5;                       /* the Paeth byte means PNGOUT's own */
     CurFilter = f;
     NoteRowFilter(f);
+    if (f == PaethByte)
+        CurFilter = 5;
 }
 
-static void ResetPass(void)
+/*
+ *  Start a pass.  0x40A72B clears RowBytes + 1 bytes of the row buffer, but
+ *  only here: the row itself is what the Up, Average and Paeth branches read as
+ *  "the row above", so clearing it between rows would make every row the first
+ *  one.
+ */
+static void ResetPass(void)          /* 0x40AE33 */
 {
     RowLeft = RowBytes;
     RowA[0] = RowA[1] = RowA[2] = RowA[3] = 0;
     RowC[0] = RowC[1] = RowC[2] = RowC[3] = 0;
-    CurChannel = Ring[0];
-    memset(RowUp, 0, (size_t)RowBytes + 2);
 }
 
 /*
- *  Sample out of a packed (depth < 8) row.
+ *  Sample out of a packed (depth < 8) row, 0x40ABEF / 0x40AC34 / 0x40AC7A.
  *
- *  The staging row holds its filter byte at Up[RowBytes] and the row's bytes
- *  back to front below it, so Up[j] is row byte (RowBytes - j).  v counts bit
- *  positions downward from the first sample, so it has to be mapped back to an
- *  ascending row position before indexing.
+ *  The staging row is mirrored: file byte 0 sits at Up[RowBytes] and file byte
+ *  RowBytes-1 at Up[1], so index 0 goes unused.  The three packed cases all
+ *  read one byte and shift it, the shift being v & (8 - depth), and none of
+ *  them masks the result: the palette is pre-widened to 256 entries with
+ *  pal[j] = pal[j & mask] so an unmasked byte is a legal index.
  */
 static int PackedSample(int v, int depth)
 {
-    int rowbit = RowBytes - 1 - v;
-    int byte = RowUp[1 + RowBytes - 1 - (rowbit >> 3)];
-
-    return (byte >> (8 - depth - (rowbit & 7))) & ((1 << depth) - 1);
+    return Up[v >> 3] >> (v & (8 - depth));
 }
 
 static void ExpandRow(void)
@@ -337,37 +360,39 @@ static void ExpandRow(void)
     unsigned char *d = DestRow;
     int v = ExpStart;
 
+    if (ExpStart <= ExpEnd)
+        return;
+
     switch (OutColType) {
     case 2:
         /*
-         *  The three samples come out of the reversed row *ascending*, at
-         *  loc_40ADB0: Up[v], Up[v+1], Up[v+2].  With the row stored back to
-         *  front that is the file's B, G, R, so the DWORD lands as
-         *  0xFFBBGGRR.
+         *  loc_40ADB0.  One unaligned DWORD at Up[v - 2] with its top byte
+         *  replaced, so the pixel is the row's B, G and R low to high and the
+         *  internal DWORD is 0xFFBBGGRR.  v steps down three a pixel.
          */
         while (v > ExpEnd) {
-            int p = Up[v] | (Up[v + 1] << 8) | (Up[v + 2] << 16);
+            unsigned p = (unsigned)Up[v] | ((unsigned)Up[v + 1] << 8)
+                       | ((unsigned)Up[v + 2] << 16);
 
-            if (TrnsRgb && (p | 0xFF000000) == (unsigned)TrnsRgb)
-                p &= 0x00FFFFFF;
-            *(unsigned int *)d = (unsigned int)p | 0xFF000000u;
+            if (TrnsRgb && (p | 0xFF000000u) == (unsigned)TrnsRgb)
+                p &= 0x00FFFFFFu;
+            *(unsigned int *)d = p | 0xFF000000u;
             d += 4;
             v -= 3;
         }
         break;
 
-    case 4:                          /* grey then alpha: grey in RGB */
+    case 4:                          /* loc_40AD5A: grey then alpha */
         while (v > ExpEnd) {
-            int grey = Pal[Up[v]] & 0x00FFFFFF;
+            unsigned grey = (unsigned)(Pal[Up[v]] & 0x00FFFFFF);
 
-            *(unsigned int *)d = (unsigned int)(grey | (Up[v - 1] << 24));
+            *(unsigned int *)d = grey | ((unsigned)Up[v - 1] << 24);
             d += 4;
             v -= 2;
         }
         break;
 
-    case 6:
-        /* loc_40AD20: Up[v], Up[v+1], Up[v+2], then Up[v-1] for the alpha. */
+    case 6:                          /* loc_40AD20 */
         while (v > ExpEnd) {
             d[0] = Up[v];
             d[1] = Up[v + 1];
@@ -378,47 +403,25 @@ static void ExpandRow(void)
         }
         break;
 
-    case 0:                          /* greyscale, one byte per pixel */
-        while (v > ExpEnd) {
-            *(unsigned int *)d = (unsigned int)Pal[Up[v]];
-            d += 4;
-            v--;
-        }
-        break;
-
-    case 3:                          /* palette index, one byte per pixel */
-        while (v > ExpEnd) {
-            *(unsigned int *)d = (unsigned int)Up[v];
-            d += 4;
-            v--;
-        }
-        break;
-
-    default:                         /* sub-byte depths, through the table */
-        switch (OutBitDepth) {
-        case 1:
+    default:
+        /*
+         *  Colour types 0 and 3 both land in the depth switch at 0x40ABD7.
+         *  Depth 8 is the plain byte loop at loc_40ACC5; 1, 2 and 4 are the
+         *  three packed cases, and every one of them goes through the table.
+         */
+        if (OutBitDepth == 8) {
             while (v > ExpEnd) {
-                *(unsigned int *)d = (unsigned int)Pal[PackedSample(v, 1)];
+                *(unsigned int *)d = (unsigned int)Pal[Up[v]];
                 d += 4;
                 v--;
             }
-            break;
-        case 2:
+        } else {
             while (v > ExpEnd) {
-                *(unsigned int *)d = (unsigned int)Pal[PackedSample(v, 2)];
+                *(unsigned int *)d =
+                    (unsigned int)Pal[PackedSample(v, OutBitDepth)];
                 d += 4;
-                v -= 2;
+                v -= OutBitDepth;     /* v counts bits, one pixel per depth */
             }
-            break;
-        case 4:
-            while (v > ExpEnd) {
-                *(unsigned int *)d = (unsigned int)Pal[PackedSample(v, 4)];
-                d += 4;
-                v -= 4;
-            }
-            break;
-        default:
-            break;
         }
         break;
     }
@@ -429,10 +432,9 @@ static void Unfilter(unsigned char *buf, int len)      /* sub_40A8D0 */
     int i = 0;
     int f = CurFilter;
 
-    if (f < 0) {
+    if (f < 0) {                     /* 0x40A8E3: take the row's filter byte */
         if (len <= 0)
             return;
-        NoteRowFilter(buf[0]);
         StartFilterByte(buf[0]);
         f = CurFilter;               /* StartFilterByte just resolved it */
         i = 1;
@@ -445,68 +447,94 @@ static void Unfilter(unsigned char *buf, int len)      /* sub_40A8D0 */
             end = len;
 
         switch (f) {
-        case 0:
-            while (i < end)
-                Up[RowLeft--] = buf[i++];
+        case 0:                      /* loc_40A990 */
+            while (i < end) {
+                Up[RowLeft] = buf[i++];
+                RowLeft--;
+            }
             break;
 
-        case 1:
+        case 1:                      /* loc_40A9B4: Sub */
             while (i < end) {
                 int ch = CurChannel;
 
                 RowA[ch] = (unsigned char)(RowA[ch] + buf[i]);
-                Up[RowLeft--] = RowA[ch];
-                CurChannel = Ring[ch];
-                i++;
-            }
-            break;
-
-        case 2:
-            while (i < end)
-                Up[RowLeft--] = (unsigned char)(Up[RowLeft + 1] + buf[i++]);
-            break;
-
-        case 3:
-            while (i < end) {
-                int ch = CurChannel;
-
-                Up[RowLeft] = (unsigned char)
-                    (buf[i] + ((Up[RowLeft + 1] + RowA[ch]) >> 1));
-                RowA[ch] = Up[RowLeft];
+                Up[RowLeft] = RowA[ch];
                 CurChannel = Ring[ch];
                 RowLeft--;
                 i++;
             }
             break;
 
-        case 4:
+        case 2:                      /* loc_40A9E9: Up, in place */
+            while (i < end) {
+                Up[RowLeft] = (unsigned char)(Up[RowLeft] + buf[i]);
+                RowLeft--;
+                i++;
+            }
+            break;
+
+        case 3:                      /* loc_40AA0D: Average */
             while (i < end) {
                 int ch = CurChannel;
+                unsigned char v;
 
-                Up[RowLeft] = (unsigned char)
-                    (buf[i] + FilterPredict(RowA[ch], Up[RowLeft + 1],
-                                           Up[RowLeft]));
-                RowC[ch] = Up[RowLeft + 1];
-                RowA[ch] = Up[RowLeft];
+                v = (unsigned char)(buf[i]
+                        + ((Up[RowLeft] + RowA[ch]) >> 1));
+                Up[RowLeft] = v;
+                RowA[ch] = v;
                 CurChannel = Ring[ch];
                 RowLeft--;
                 i++;
             }
             break;
 
-        case 5:                      /* FilterPredict, inlined */
+        case 4:                      /* loc_40AA5B: FilterPredict */
             while (i < end) {
                 int ch = CurChannel;
-                int a = RowA[ch], b = Up[RowLeft + 1], c = Up[RowLeft];
-                int d1 = AbsTab(a + b - 2 * c), d2 = AbsTab(b - c);
-                int cc = c, p;
+                unsigned char up = Up[RowLeft];
+                unsigned char v;
 
-                if (d1 >= d2)
-                    cc = a;
-                p = ((d1 < d2 ? d1 : d2) < AbsTab(a - c)) ? cc : b;
-                RowC[ch] = Up[RowLeft + 1];
-                Up[RowLeft] = (unsigned char)(buf[i] + p);
-                RowA[ch] = Up[RowLeft];
+                v = (unsigned char)(buf[i]
+                        + FilterPredict(RowA[ch], up, RowC[ch]));
+                Up[RowLeft] = v;
+                RowA[ch] = v;
+                RowC[ch] = up;       /* the row above, kept for the next pixel */
+                CurChannel = Ring[ch];
+                RowLeft--;
+                i++;
+            }
+            break;
+
+        case 5:                      /* loc_40AAE0: FilterPredict, inlined */
+            while (i < end) {
+                int ch = CurChannel;
+                int a = RowA[ch], b = Up[RowLeft], c = RowC[ch];
+                /*
+                 *  loc_40AB04.  The table is indexed off one base, so the
+                 *  three distances only appear as differences:
+                 *
+                 *      esi = T[c - a]            edi = T[2c - a - b]
+                 *      third = T[c - b]
+                 *
+                 *  and edi is folded down first.  These are the same three as
+                 *  FilterPredict()'s - T[2c-a-b] is |a+b-2c| and T[c-a] and
+                 *  T[c-b] are its |a-c| and |b-c| - so the inlined copy and
+                 *  the function agree over the whole byte domain, which is what
+                 *  makes the Paeth byte interchangeable with this one.
+                 */
+                int d1 = AbsTab(c - a);
+                int d2 = AbsTab(2 * c - a - b);
+                int d3 = AbsTab(c - b);
+                int t = (d2 >= d1) ? b : c;
+                unsigned char up = (unsigned char)b;
+                unsigned char v;
+
+                v = (unsigned char)(buf[i]
+                        + ((d2 >= d1 ? d1 : d2) < d3 ? t : a));
+                Up[RowLeft] = v;
+                RowA[ch] = v;
+                RowC[ch] = up;
                 CurChannel = Ring[ch];
                 RowLeft--;
                 i++;
@@ -521,22 +549,23 @@ static void Unfilter(unsigned char *buf, int len)      /* sub_40A8D0 */
             return;                    /* the row is half built */
 
         /*
-         *  The jnb at 0x40AB9D skips only the expansion once the row index
-         *  has reached the height.  The advance always happens, and the
-         *  expansion falls straight into it.
+         *  The jnb at 0x40AB9D skips the expansion once the row index has
+         *  reached the height, and with it the destination step at 0x40AE1A.
+         *  The row advance below always happens.
          */
-        if (RowBase < RowEnd)
+        if (RowBase < RowEnd) {
             ExpandRow();
-
+            DestRow += DestPitch;
+        }
         RowBase += RowStride;
-        DestRow += DestPitch;
         ResetPass();
 
-        if (i >= len) {
+        if (i >= len) {               /* loc_40AEE6: no filter byte left */
             CurFilter = -1;
             return;
         }
         StartFilterByte(buf[i++]);
+        f = CurFilter;
     }
 }
 
@@ -549,22 +578,48 @@ static int WinWrite;
 static int WinFlush;                 /* the next 16 KB boundary to hand over */
 static int ImageDone;
 
+/*
+ *  Hand over the 16 KB the write index has just passed.  The length is the
+ *  literal 0x4000 (0x40A0B4, and 0x409D09 for the stored path), *not*
+ *  "write index minus start": a match is copied without passing the check, so
+ *  the index can be several bytes past the boundary and the bytes in between
+ *  are unflitered by the next hand-over.  Using the difference here unflilters
+ *  them twice, which corrupts the row they belong to and every row after it.
+ */
 static void FlushWindow(int start)
 {
-    Unfilter(&Window[start & 0x7FFF], WinWrite - start);
-    WinWrite = start + 0x4000;
+    Unfilter(&Window[start & 0x7FFF], 0x4000);
     WinFlush += 0x4000;
+}
+
+/*
+ *  Hand the window over whenever the write index has reached the next 16 KB
+ *  boundary.  Returns non-zero once the image is done, which is where both
+ *  call sites bail out.
+ *
+ *  The check has to sit at the top of the *symbol* loop, not only where a
+ *  literal is stored: a highly compressible stream is mostly matches, and the
+ *  match copy writes straight into the window without passing the literal
+ *  store.  Checking only on literals leaves the boundary unhandled and the
+ *  tail flush then reads tens of thousands of bytes past a 32 KB array.
+ *  0x40A09C is the check, and the match loop at 0x40A268 jumps back to it.
+ */
+static int FlushIfDue(void)
+{
+    if (WinWrite >= WinFlush) {
+        FlushWindow(WinFlush - 0x4000);
+        if (RowBase >= RowEnd) {
+            ImageDone = 1;            /* 0x40A300: out of rows */
+            return 1;
+        }
+    }
+    return 0;
 }
 
 static void EmitByte(int byte)
 {
-    if (WinWrite >= WinFlush) {
-        FlushWindow(WinWrite - 0x4000);
-        if (RowBase >= RowEnd) {
-            ImageDone = 1;            /* 0x40A300: out of rows */
-            return;
-        }
-    }
+    if (FlushIfDue())
+        return;
     Window[WinWrite++ & 0x7FFF] = (unsigned char)byte;
 }
 
@@ -658,6 +713,9 @@ static int InflateBlocks(void)
             for (;;) {
                 int peek, sym;
 
+                if (FlushIfDue())
+                    break;
+
                 if (lcod[peek = PeekBits(9)] == 0)
                     sym = DecodeSymbol(loffs, lsym);
                 else {
@@ -731,7 +789,7 @@ static int DecodePng(const unsigned char *data, int size, unsigned char *pixels,
     ImageWidth = (int)width;
     RowLimit = unk_190A1C4;
     Block = FilterChoice;
-    Up = RowUp + 1;
+    Up = RowUp;
     memset(Pal, 0, 256 * sizeof *Pal);
 
     while (p + 8 <= end) {
@@ -785,14 +843,13 @@ static int DecodePng(const unsigned char *data, int size, unsigned char *pixels,
                                    + (unsigned)i * 0x010101u * (255 / maxval));
             }
 
-            /* Sub-byte depths index by raw byte, so widen the table. */
-            switch (depth) {
-            case 1: for (i = 2; i < 256; i++) Pal[i] = Pal[i & 1]; break;
-            case 2: for (i = 4; i < 256; i++) Pal[i] = Pal[i & 3]; break;
-            case 4: for (i = 16; i < 256; i++) Pal[i] = Pal[i & 15]; break;
-            default: break;
-            }
-
+            /*
+             *  Sub-byte depths index the table by a raw byte, so the table is
+             *  widened to 256 entries at IDAT time rather than here: for colour
+             *  type 3 the real entries arrive with the PLTE and their alphas
+             *  with the tRNS, both of which come after IHDR.  See the IDAT
+             *  branch below.
+             */
             switch (coltype) {
             case 2: Samples = 3; break;
             case 4: Samples = 2; break;
@@ -887,6 +944,24 @@ static int DecodePng(const unsigned char *data, int size, unsigned char *pixels,
             }
         } else if (tag[0] == 'I' && tag[1] == 'D' && tag[2] == 'A'
                    && tag[3] == 'T') {
+            /* Type 4 has no palette; the ramp above is only its grey source. */
+            if (OutColType == 4)
+                PalCount = 0;
+
+            /*
+             *  0x409AF1.  The table has to be widened to 256 entries here, not
+             *  at IHDR: for colour type 3 the colours arrive with the PLTE and
+             *  their alphas with the tRNS, and both chunks come after IHDR, so
+             *  widening earlier would spread an empty table over the whole
+             *  index range.
+             */
+            switch (OutBitDepth) {
+            case 1: for (i = 2; i < 256; i++) Pal[i] = Pal[i & 1]; break;
+            case 2: for (i = 4; i < 256; i++) Pal[i] = Pal[i & 3]; break;
+            case 4: for (i = 16; i < 256; i++) Pal[i] = Pal[i & 15]; break;
+            default: break;
+            }
+
             Anchor = body + len - 4;
             BitPos = 32 - 8 * (int)len;
             NextHdr = 0;
@@ -899,7 +974,9 @@ static int DecodePng(const unsigned char *data, int size, unsigned char *pixels,
             RowStride = 1;
             RowBase = 0;
             CurFilter = -1;
+            CurChannel = 0;           /* 0x40A777, once a pass */
             ImageDone = 0;
+            memset(RowUp, 0, (size_t)RowBytes + 1);
             ResetPass();
 
             WinWrite = 0;
@@ -912,12 +989,18 @@ static int DecodePng(const unsigned char *data, int size, unsigned char *pixels,
             /* Flush whatever the loop did not hand over.  The wrap test is
              * `test ah,ah / js` at 0x40A2B1, so it is bit *15* of the XOR:
              * `start` is always a multiple of 0x4000 and contributes
-             * nothing there, leaving "has the write index passed 0x8000". */
+             * nothing there, leaving "has the write index passed 0x8000".
+             *
+             *  The first length is `(-start) & 0x7FFF` at 0x40A2CF, not
+             *  0x4000 - (start & 0x7FFF): the two agree only while start is
+             *  0x4000.  At 0x8000 the original's first call gets length zero
+             *  and only the second one runs, because the window is a 32 KB
+             *  ring and half of it is the part still being written. */
             {
                 int start = WinFlush - 0x4000;
 
                 if ((start ^ WinWrite) & 0x8000) {
-                    Unfilter(&Window[start & 0x7FFF], 0x4000 - (start & 0x7FFF));
+                    Unfilter(&Window[start & 0x7FFF], (-start) & 0x7FFF);
                     Unfilter(&Window[0], WinWrite & 0x7FFF);
                 } else {
                     Unfilter(&Window[start & 0x7FFF], WinWrite - start);
