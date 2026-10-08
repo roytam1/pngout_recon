@@ -75,7 +75,7 @@
 #define ROW_ROWBITS   (0x910 / 4)      /* 1 dword: bits the row needs      */
 #define ROW_DISTBITS  (0x990 / 4)      /* 30: bits a distance symbol costs*/
 /*
- *  dword_42F370[646 * row] is the position in the window at which this row's
+ *  dword_42F374[646 * row] is the position in the window at which this row's
  *  data stops.  In the original that address is *also* the `/b` block list's
  *  `end` field - row index and block index are the same counter (dword_6D5570
  *  is both NumBlockList and RowCount) - which is why the LZ coder closes a row
@@ -90,11 +90,12 @@
  *
  *  0x42F370 is *not* a field of the row record: it is 0xA18 dwords past the
  *  row record's base (0x42E958), i.e. exactly the next record's field 0 -
- *  which is where the /b block list's `end` field lives (BlockRecord is at
- *  0x42F364 and `end` is its fourth dword).  So the row limit *is* the block
- *  end, and reading it as an offset inside the row record reads a dword past
- *  the end of the record instead: `end <= cap` then never holds, no match is
- *  ever accepted, and every row is closed as soon as it is opened.
+ *  which is where the /b block list's `start` field lives (BlockRecord is at
+ *  0x42F36C).  Its *second* dword, `dword_42F374`, is the block list's `end`,
+ *  and that is the one the row limit means.  Reading it as an offset inside the
+ *  row record reads a dword past the end of the record instead: `end <= cap`
+ *  then never holds, no match is ever accepted, and every row is closed as soon
+ *  as it is opened.
  */
 #define ROW_LIMIT(n)  (*BlockEnd(n))
 #define ROW_SAMPLE_MAX 320             /* the samples really are this long */
@@ -494,11 +495,26 @@ extern int BlockRecord[MAX_BLOCKS * BLOCK_STRIDE];
 #define NumBlockList   RowCount
 extern unsigned char *LinBufData;      /* dword_18CBEE4, the buffer's data   */
 
-#define BlockSplit(n)   (&BlockRecord[(n) * BLOCK_STRIDE + 0])
-#define BlockStart(n)   (&BlockRecord[(n) * BLOCK_STRIDE + 1])
-#define BlockEnd(n)     (&BlockRecord[(n) * BLOCK_STRIDE + 2])
-#define BlockNext(n)    (&BlockRecord[(n) * BLOCK_STRIDE + 3])
-#define BlockScore(n)   ((double *)&BlockRecord[(n) * BLOCK_STRIDE + 4])
+/*
+ *  Field offsets within one block record.  sub_408000 names them out of the
+ *  addressing: `dword_42F36C[n*0xA18]` is `start`, `dword_42F370[...]` is
+ *  `end`, `dword_42F374[...]` is `next` and `lea eax, dword_42F378[eax]`
+ *  hands the *address* of field 3 to BestSplit() as its `double *score`.  So
+ *  the record is start +0, end +1, next +2, score +3 (two dwords) - which is
+ *  why the score has to be a double and not an int, and why `end` is the
+ *  second dword rather than the fourth.
+ *
+ *  `BlockSplit` is the one field the original does not have: sub_408000 just
+ *  calls BestSplit() again on the front half after shortening it and throws
+ *  the cut away.  Caching it costs nothing - it is the value BestSplit() just
+ *  returned for that exact range - and keeps the loop to two calls either way.
+ *  It sits after the score so it cannot collide.
+ */
+#define BlockStart(n)   (&BlockRecord[(n) * BLOCK_STRIDE + 0])
+#define BlockEnd(n)     (&BlockRecord[(n) * BLOCK_STRIDE + 1])
+#define BlockNext(n)    (&BlockRecord[(n) * BLOCK_STRIDE + 2])
+#define BlockScore(n)   ((double *)&BlockRecord[(n) * BLOCK_STRIDE + 3])
+#define BlockSplit(n)   (&BlockRecord[(n) * BLOCK_STRIDE + 5])
 
 int  PlanBlocks(int start, int end);
 void SortBlockEnds(int count);

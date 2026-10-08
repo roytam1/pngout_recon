@@ -312,9 +312,9 @@ what `Optimize()` is built on. Findings worth recording:
   imul edx, 0A18h
   mov  eax, dword_42F370[edx]
   ```
-  `0x42F370` is exactly 0xA18 dwords past the row record's base (`0x42E958`), so
-  it is the *next* record's field 0 - which is where the `/b` block list lives
-  (`BlockRecord` is at `0x42F364` and `end` is its fourth dword). Row index and
+`0x42F374` is exactly 0xA18 dwords past the row record's base (`0x42E958`), so
+it is the *next* record's field 1 - which is where the `/b` block list's `end`
+field lives (`BlockRecord` is at `0x42F36C`, `end` is its second dword). Row index and
   block index are the same counter (`dword_6D5570` is both `RowCount` and
   `NumBlockList`), so the position where a row's data stops is the position where
   its block ends. `sub_4058A0`'s last store, `dword_42E958[0xA18 * RowCount] =
@@ -612,10 +612,15 @@ bytes is cut at 32, four quarters of 16 different bytes are cut on a boundary,
 a solid byte has almost nothing to gain (0.106 against 5.6 and 5.7), and ESC
 is polled every 64K bytes and aborts with −1.
 
-### Still open
+### Settled since
 
 * The CRC table's single writer sits 4 bytes above all 18 readers
-  (`0x185BABC` vs `0x185BAB8`). Modelled at the readers' address.
+  (`0x185BABC` vs `0x185BAB8`). Not an off-by-one: `sub_404D70` writes
+  `dword_185BABC[edx*4]` for `edx` counting 255 down to 0 (`mov edx, 0FFh`,
+  `dec edx`, `mov [185BABC+edx*4], eax`, `jns`) and every reader uses
+  `dword_185BAB8[n*4]` over the same 0..255 range. It is one 256 entry table
+  that IDA has named from two different references, four bytes apart. Modelled
+  at the readers' address, which is what `CrcTable` is.
 
 `sub_405A60` (`BuildDistanceSlots()`) is described above and is done: it fills
 `dword_6D5578[]` with 30 slots from the length half and 29 from the distance
@@ -629,11 +634,18 @@ a length or a distance.
 
 `PlanBlocks(start, end)` turns one byte range into the list of deflate blocks
 the compressor will emit, calling `BestSplit()` on each block to decide whether
-cutting it pays. It reads the range out of `dword_18CBEE4` (the filtered image
-buffer, whose base pointer is the freed `dword_18CBEE0` one dword below the
-data) and keeps its list in the second 0xA18-strided record array at
-`0x42F364`: `split`, `start`, `end`, `next`, and a `double` score, five fields
-of the 0x18 bytes the function ever touches. `NumBlockList` is `dword_6D5570`.
+cutting it pays. It reads the range out of `dword_18CBEF4` — the buffer
+`sub_408690` (`PutByte`) filled on the collecting pass, allocated in
+`Optimize()` at `0x403694` as `(height * 4 + 1) * width` — and **not** out of
+`dword_18CBEE4` (`LinBufData`), which is a different and much smaller
+allocation used by `FilterSample()`. All four `call sub_408390` sites say so:
+`0x408071`, `0x408142`, `0x40822A` and `0x40827F`. The list lives in the second
+0xA18-strided record array at
+`0x42F36C`, and the addressing names the fields: `dword_42F36C[n*0xA18]` is
+`start`, `dword_42F370[...]` is `end`, `dword_42F374[...]` is `next`, and
+`lea eax, dword_42F378[eax]` hands the *address* of field 3 to `BestSplit()` as
+its `double *score` — so the score is a `double` and `end` is the record's second
+dword, not its fourth. `NumBlockList` is `dword_6D5570`.
 
 Both modes end with the same shell sort:
 

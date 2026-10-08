@@ -55,9 +55,6 @@ int NothingChanged(void)
  *  checksum at all: it is how PNGOUT marks a file as its own, and main()
  *  keys off exactly this value (`unk_190A828 == 24184`) to decide whether it
  *  can reuse the settings it found in the file.
- *
- *  Still to recover: sub_405B80 (the compressor), sub_4053D0 (writes the
- *  filtered rows out) and sub_4058A0 (deflate distance tables).
  */
 #define TAG_IDAT_   0x54414449u      /* "IDAT" read as a little endian DWORD */
 #define PNGOUT_MARK 0x5E78           /* the placeholder CRC, = 24184       */
@@ -1407,11 +1404,13 @@ void InitProgressScale(int height)
  *  The block list is another 0xA18-strided record array, five fields per
  *  block, and `PlanBlocks()` fills in three of the five the optimiser needs:
  *
- *      BlockSplit[b]   where the block was cut, absolute
  *      BlockStart[b]   first byte
  *      BlockEnd[b]     one past the last byte
  *      BlockNext[b]    the next block in the automatic mode's walk
  *      BlockScore[b]   the saving BestSplit() found there
+ *      BlockSplit[b]   where the cut landed, which the original recomputes and
+ *                      throws away; see the note on the field offsets in
+ *                      pngout.h
  *
  *  Two modes, chosen by `Image->maxblocks`:
  *
