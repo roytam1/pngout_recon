@@ -452,27 +452,18 @@ static void SortPaletteByUse(void)
 }
 
 /*
- *  loc_40321A: with /kp the palette the file arrived with is kept, and all that
- *  is left is to drop the entries nothing points at.  The loop walks *down* from
- *  the last entry, which is why it is a backwards walk and not a forward one:
- *  adding entry i can only make entry i-1 unreachable, never i+1.
+ *  loc_40321A / 0x403225 is *not* this.  It is the backwards search for the bKGD
+ *  colour: `mov edx, dword_180B578[eax*4]` / `xor edx, ecx` / `test edx,
+ *  offset unk_FFFFFF` / `dec eax`, i.e. it walks the palette down looking for an
+ *  entry whose low three bytes match, which is what PaletteBitDepth() below
+ *  wants to know.  The entry it lands on is not moved and the palette is not
+ *  compacted - there is no compaction pass in the original at all.
+ *
+ *  Nothing is ever *removed* from the palette.  An entry nothing points at just
+ *  keeps whatever count it was given: 1 if the scan below appended it, 0 if it
+ *  came in with the file and the image never used it.  `unk_180B978` therefore
+ *  only ever grows, and `SortPaletteByUse()` decides the order.
  */
-static void CompactKeptPalette(void)
-{
-    int i, keep = 0;
-
-    for (i = unk_180B978 - 1; i >= 0; i--) {
-        if (PaletteUse[i] == 0)
-            continue;
-        if (keep != i) {
-            unk_180B578[keep] = unk_180B578[i];
-            PaletteUse[keep] = PaletteUse[i];
-        }
-        keep++;
-    }
-
-    unk_180B978 = keep;
-}
 
 /*
  *  loc_403340: the bit depth a palette needs is the smallest power of two that
@@ -547,13 +538,22 @@ static void OpaqueToFront(void)
 }
 
 /*
- *  loc_40327E: count how often each colour is used and put the common ones
- *  first.  With /kp off and no palette to start from, the palette *and* the
- *  colour hash were already built by the first pass over the image - this one
- *  only has to ask FindColor() how many pixels each entry accounts for.  That is
- *  why it does not call InitColorHash() or AddColor(): re-seeding the hash here
- *  would make every pixel look like a new colour and append a second copy of the
- *  palette on top of the first.
+ *  loc_403102: count how often each colour is used and put the common ones
+ *  first.
+ *
+ *  The per-pixel test is the one at 0x403106, and it has two arms:
+ *
+ *      FindColor(pixel) >= 0   ->  PaletteUse[that]++
+ *      FindColor(pixel) <  0   ->  append it:  PaletteUse[palcount] = 1,
+ *                                 dword_180B578[palcount] = pixel,
+ *                                 AddColor(pixel, palcount), palcount++
+ *
+ *  (0x40311B-0x403142).  The second arm is what makes this the *only* pass that
+ *  can grow the palette, and it is why the hash is not re-seeded here: the
+ *  append is done through AddColor, so re-seeding first would make every pixel
+ *  look new and put a second copy of the palette on top of the first.  An
+ *  appended entry starts with a count of 1 - one pixel, the one that caused the
+ *  append - and nothing is ever removed again.
  *
  *  The counts and the colours are built in first-seen order and only sorted
  *  afterwards, so a colour's position here has nothing to do with the order the
@@ -572,8 +572,19 @@ static void CountPalette(void)
         if (CheckEscHook(1))
             return;
 
-        for (col = 0; col < Image->width; col++)
-            PaletteUse[FindColor(*(int *)(p + (size_t)col * 4))]++;
+        for (col = 0; col < Image->width; col++) {
+            int v = *(int *)(p + (size_t)col * 4);
+            int idx = FindColor(v);
+
+            if (idx >= 0) {
+                PaletteUse[idx]++;
+            } else if (unk_180B978 < MAX_COLORS) {
+                PaletteUse[unk_180B978] = 1;
+                unk_180B578[unk_180B978] = v;
+                AddColor(v, unk_180B978);
+                unk_180B978++;
+            }
+        }
     }
 
     SortPaletteByUse();
@@ -1034,11 +1045,6 @@ int Optimize(SETTINGS *s)
     Image->trial = 0;
     MinSample = -1;
 
-    /* ---- loc_402ED4: /f with no number means "pick per row" ---- */
-
-    if (TrialFilter < 0)
-        TrialFilter = (unk_185BED0 == 3) ? 0 : 5;
-
     /* ---- loc_402B94: work out what can represent this image ---- */
 
     if (unk_185BED0 != 6) {
@@ -1051,10 +1057,39 @@ int Optimize(SETTINGS *s)
             return Fail();
     }
 
-    /* ---- loc_402ED4: fill the palette for the chosen colour type ---- */
-
     if (unk_185BED0 < 0)
         unk_185BED0 = SuggestColType(flags, ncolors);
+
+    /* ---- loc_402ED4: /f with no number means "pick per row" ---- */
+
+    if (TrialFilter < 0)
+        TrialFilter = (unk_185BED0 == 3) ? 0 : 5;
+
+    /*
+     *  loc_402ED4 / 0x402EFA.  `rep movsd` of clamp(palflag, 0, 256) dwords
+     *  from the input ramp into dword_180B578 - the same clamp the original
+     *  spells out with `test eax, eax` / `setle cl` / `dec ecx` / `and ecx,
+     *  eax` and the `cmp eax, 100h` above it.
+     *
+     *  It runs here, *after* ScanImage has built the palette from the pixels
+     *  and *after* the colour type has been decided, and it overwrites it:
+     *  that is how a palette the input carried (a PLTE, or the 8bpp format's
+     *  256 entries) replaces the one ScanImage would have built.  With
+     *  palflag 0 - which is what main() leaves it for a PNG palette, since
+     *  `s.coltype == 3 && !s.keeppal` clears it - the count is zero and
+     *  ScanImage's palette stands.
+     */
+    {
+        int n = s->palflag;
+
+        if (n <= 0)
+            n = 0;
+        else if (n >= 256)
+            n = 256;
+        memcpy(unk_180B578, s->palette, (size_t)n * sizeof(int));
+    }
+
+    /* ---- loc_402F51: fill the palette for the chosen colour type ---- */
 
     if (unk_185BED0 == 0) {
         int levels, depth;
@@ -1108,29 +1143,19 @@ int Optimize(SETTINGS *s)
 
         BuildGrayPalette(unk_180A570);
     } else if (unk_185BED0 == 3) {
-        if (s->palflag != 0) {
-            /* /ks or a PNG that carried a PLTE: keep the palette we were given */
+        /*
+         *  0x403093 puts the palette the input carried into the colour hash
+         *  (last entry first, see HashPalette), and 0x4030A3 then asks whether
+         *  there was one at all.  Either way the image is scanned at 0x403102,
+         *  so with /kp off the given palette is only a starting point: colours
+         *  it lacks get appended by CountPalette.
+         */
+        if (s->palflag != 0)
             HashPalette(unk_180B978);
-            if (!s->keeppal) {
-                int row, col;
+        else if (s->keeppal)
+            ProgressMsg("\nIgnoring /kp (palette not found)");
 
-                memset(PaletteUse, 0, sizeof(PaletteUse));
-                for (row = 0; row < Image->height; row++) {
-                    unsigned char *p = (unsigned char *)Image->pixels +
-                                       (size_t)row * Image->stride;
-
-                    if (CheckEscHook(1))
-                        return Fail();
-                    for (col = 0; col < Image->width; col++)
-                        PaletteUse[FindColor(
-                            *(int *)(p + (size_t)col * 4))]++;
-                }
-                CompactKeptPalette();
-            }
-        } else {
-            if (s->keeppal)
-                ProgressMsg("\nIgnoring /kp (palette not found)");
-
+        if (!s->keeppal) {
             CountPalette();
             if (CheckEscHook(1))
                 return Fail();

@@ -668,7 +668,7 @@ int main(int argc, char **argv, char **envp)
         Msg("\r In: (Windows clipboard)\n");
     Msg("Out:                             %s", outfilename);
 
-    s.unk6    = dword_190A420[0];
+    s.palette  = dword_190A420;         /* the ramp itself, not its first entry */
     s.palflag = unk_190A820;
     if (s.coltype == 3 && !s.keeppal)
         s.palflag = 0;

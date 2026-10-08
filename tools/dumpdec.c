@@ -64,8 +64,8 @@ int main(int argc, char **argv)
     fmt = GetImageSize(fileimg, (int)size, &iw, &ih);
     w = (unsigned)iw;
     h = (unsigned)ih;
-    if (fmt != FMT_PNG) {
-        fprintf(stderr, "dumpdec: format %d is not PNG\n", fmt);
+    if (fmt != FMT_PNG && fmt != FMT_PAL8) {
+        fprintf(stderr, "dumpdec: format %d is not reconstructed yet\n", fmt);
         return 1;
     }
 
@@ -76,16 +76,24 @@ int main(int argc, char **argv)
         fprintf(stderr, "dumpdec: out of memory\n");
         return 1;
     }
+    memset(FilterChoice, 0, h ? (size_t)h : 1);
 
     if (DecodeImage(fileimg, (int)size, pixels, 4 * (int)w, w, h, 0, 0) < 0) {
         fprintf(stderr, "dumpdec: DecodeImage refused the file\n");
         return 1;
     }
 
-    fprintf(stderr, "%dx%d, input row filters:", w, h);
-    for (i = 0; i < (int)h; i++)
-        fprintf(stderr, " %d", FilterChoice[i]);
-    fprintf(stderr, "\n");
+    if (fmt == FMT_PNG) {
+        /* the decoder records each input row's filter byte here; the 8bpp
+           format has none, so this stays as the memset left it */
+        fprintf(stderr, "%dx%d, input row filters:", w, h);
+        for (i = 0; i < (int)h; i++)
+            fprintf(stderr, " %d", FilterChoice[i]);
+        fprintf(stderr, "\n");
+    } else {
+        fprintf(stderr, "%dx%d, %d colours, coltype %d depth %d\n", w, h,
+                unk_190A820, OutColType, OutBitDepth);
+    }
 
     /* width, height, then w*h pixels of 0xAARRGGBB - little endian, so a
        reader can unpack the buffer without knowing the internal layout */

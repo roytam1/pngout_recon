@@ -535,6 +535,118 @@ def run(case):
     return "%-14s  ok  (%dx%d ct%d d%d)" % (name, w, h, ct, depth)
 
 
+def write_pal8(path, w, h, indices, palette):
+    """
+    Write the 8bpp palettised format PNGOUT also reads, format code 4.
+
+    Header, from sub_409260 and loc_40D150: `19 91`, the width and height as
+    little endian words, byte +10 = 8 and byte +11 = 0, then a 256 entry RGB
+    palette at +0x20 and width*height index bytes after that.  The palette is
+    padded out to the full 256 entries because loc_40D150 always reads 256.
+    """
+    out = bytearray(b"\x19\x91")
+    out += struct.pack("<HH", w, h)
+    out += b"\x00" * (0x20 - len(out))
+    out[10] = 8
+    for (r, g, b) in palette:
+        out += bytes([r & 0xFF, g & 0xFF, b & 0xFF])
+    for i in range(len(palette), 256):
+        out += b"\x00\x00\x00"
+    assert len(out) == 0x20 + 768, len(out)
+    out += bytes(indices[:w * h])
+    with open(path, "wb") as fh:
+        fh.write(bytes(out))
+    return path
+
+
+def pal8_expected(palette):
+    """
+    What loc_40D150 makes of one palette entry, as an internal 0xAARRGGBB dword.
+
+    `sub edx, 40h` / `shl edx, 8` / `add edx, ebx` / `shl edx, 8` / `add edx, ebx`
+    / `shl edx, 2`, all in a signed 32 bit register, so a first channel below
+    64 borrows from the top byte - which is where the alpha ends up, and there
+    is no separate alpha to set.  Python ints are not 32 bit, so the wrap has to
+    be done here or the comparison is meaningless.
+    """
+    out = []
+    for (r, g, b) in palette:
+        v = (((((r - 0x40) << 8) + g) << 8) + b) << 2
+        v &= 0xFFFFFFFF
+        out.append((v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF, (v >> 24) & 0xFF))
+    return out
+
+
+def run_pal8(case):
+    """
+    The same comparison as run(), for the 8bpp palettised format.  Only the
+    decoder is involved: the pixels are compared against what the palette
+    transform says they should be, so a failure here is loc_40D150's.
+    """
+    name, w, h, indices, palette = case
+    src = os.path.join(BUILD, "dt_%s.pal8" % name)
+    write_pal8(src, w, h, indices, palette)
+    try:
+        gw, gh, got = dump(src)
+    except Exception as exc:                       # noqa: BLE001
+        return "%-14s %s" % (name, exc)
+    if (gw, gh) != (w, h):
+        return "%-14s wrong size %dx%d" % (name, gw, gh)
+    want = pal8_expected(palette)
+    bad = 0
+    first = None
+    for y in range(h):
+        for x in range(w):
+            px = want[indices[y * w + x]]
+            if got[y][x] != px:
+                bad += 1
+                if first is None:
+                    first = "x=%d y=%d got %s want %s" % (
+                        x, y, got[y][x], px)
+    if bad:
+        return "%-14s %d/%d pixels differ, first %s" % (name, bad, w * h,
+                                                        first)
+    return "%-14s  ok  (%dx%d pal8)" % (name, w, h)
+
+
+def roundtrip_pal8(case):
+    """The same file through pngout.exe and back out of the PNG it writes."""
+    name, w, h, indices, palette = case
+    src = os.path.join(BUILD, "dt_%s.pal8" % name)
+    dst = os.path.join(BUILD, "dt_%s.pal8.out.png" % name)
+    want = pal8_expected(palette)
+    if os.path.exists(dst):
+        os.remove(dst)
+    r = subprocess.run([PNGOUT, "/force", src, dst], stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE)
+    if not os.path.exists(dst):
+        out = (r.stdout + r.stderr).decode("latin1")
+        return "%-14s no output: %s" % (name, out.strip()[-70:])
+    try:
+        got = read_pixels(dst)
+    except Exception as exc:                       # noqa: BLE001
+        return "%-14s output unreadable: %s" % (name, exc)
+    if (got["width"], got["height"]) != (w, h):
+        return "%-14s wrong size %dx%d" % (name, got["width"], got["height"])
+    bad = 0
+    first = None
+    for y in range(h):
+        for x in range(w):
+            b, g, r, a = want[indices[y * w + x]]
+            # the internal pixel is one dword read B, G, R, A from the bottom up,
+            # so the RGB triple a PNG file carries is that order reversed
+            px = (r, g, b, a)
+            if tuple(got["rows"][y][x]) != px:
+                bad += 1
+                if first is None:
+                    first = "x=%d y=%d got %s want %s" % (
+                        x, y, got["rows"][y][x], px)
+    if bad:
+        return "%-14s %d/%d pixels differ, first %s" % (name, bad, w * h,
+                                                        first)
+    return "%-14s  ok  (%dx%d pal8 round trip)" % (name, w, h)
+
+
 def alpha_ramp(w, h, chans):
     """Opaque rows with one see-through row: needs colour type 6 or 4."""
     rows = dense(w, h, chans)
@@ -602,8 +714,53 @@ def dense(w, h, chans):
     return [list(base[y % 4]) for y in range(h)]
 
 
+def pal8_palette():
+    """
+    A palette that exercises the transform's edges.
+
+    loc_40D150 subtracts 64 from the first channel and scales the whole entry by
+    four, in a signed 32 bit register, with no clamp - so a first channel below
+    64 borrows out of the top byte and that byte is the alpha.  Entries 0, 2 and
+    3 here are exactly that case, and the *expected* values have to be computed
+    the same way (see pal8_expected) rather than as plain RGB.
+    """
+    named = [(0, 0, 0), (255, 0, 0), (0, 255, 0), (0, 0, 255), (10, 20, 30),
+             (200, 100, 50), (7, 7, 7), (250, 250, 250), (64, 128, 192),
+             (128, 64, 32), (1, 2, 3), (191, 223, 255)]
+    grey = [(i, i, i) for i in range(256 - len(named))]
+    return named + grey
+
+
+def pal8_cases():
+    """The 8bpp palettised format: the decode, and then the round trip."""
+    pal = pal8_palette()
+    n = len(pal)
+    out = []
+    w, h = 13, 9
+    # a smooth index pattern, so neighbouring pixels share entries and PNGOUT has
+    # something to compress
+    out.append(("p-ramp", w, h, [(x + y) % n for y in range(h) for x in range(w)],
+                pal))
+    # only the named entries, to keep the palette small and the image flat
+    few = pal[:12]
+    out.append(("p-named", 20, 20, [(x * 5 + y * 7) % 12
+                                    for y in range(20) for x in range(20)],
+                few))
+    # one entry everywhere: the degenerate but legal case
+    out.append(("p-flat", 9, 7, [3] * (9 * 7), few))
+    return out
+
+
 def main():
-    if "--roundtrip" in sys.argv:
+    if "--pal8" in sys.argv:
+        cases = pal8_cases()
+        mode = run_pal8
+        argv = [a for a in sys.argv[1:] if not a.startswith("--")]
+    elif "--pal8-roundtrip" in sys.argv:
+        cases = pal8_cases()
+        mode = roundtrip_pal8
+        argv = [a for a in sys.argv[1:] if not a.startswith("--")]
+    elif "--roundtrip" in sys.argv:
         cases = roundtrip_cases()
         mode = roundtrip
         argv = [a for a in sys.argv[1:] if not a.startswith("--")]

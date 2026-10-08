@@ -122,7 +122,17 @@
 /*                                                                     */
 /*  main() builds this on the stack at ebp-0x290 and hands the address  */
 /*  to sub_402AD0 (`lea eax,[esp+2DCh+var_290] ; call sub_402AD0`).    */
-/*  Offects below are dword indices into that 136-byte block.           */
+/*  Offsets below are dword indices into that 136-byte block.           */
+/*                                                                     */
+/*  `palette` is a *pointer*.  sub_402AD0 reads it at `mov esi,        */
+/*  [ebp+18h]` and then does `rep movsd` into dword_180B578 with it   */
+/*  as the source (0x402EFA), so main()'s `v84[6] = dword_190A420`   */
+/*  is the array decaying to an address.  Reading it as a value -     */
+/*  `dword_190A420[0]`, the first ramp entry - is exactly what         */
+/*  decompilation's "int dword_190A420[]" guess invites, and it costs  */
+/*  the whole palette path: the colour hash gets seeded from an       */
+/*  address inside the ramp instead of from the ramp, every lookup    */
+/*  misses, and FindColor's -1 reaches the filter as the byte 0xFF.   */
 /* ------------------------------------------------------------------ */
 
 typedef struct SettingsStruct {
@@ -135,7 +145,7 @@ typedef struct SettingsStruct {
     /* --- buffers owned by main() --- */
     unsigned char *outbuf;   /* +10 idx 4  filled in by Optimize()       */
     int           origsize;  /* +14 idx 5  size of the original file     */
-    int           unk6;      /* +18 idx 6  <- dword_190A420              */
+    int          *palette;   /* +18 idx 6  dword_190A420, the input ramp  */
     int           palflag;   /* +1C idx 7  <- dword_190A820, /ks         */
 
     /* --- user options --- */

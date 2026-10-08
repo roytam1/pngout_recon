@@ -1471,7 +1471,7 @@ stored, fixed and dynamic deflate blocks, all four zlib strategies, deflate
 streams split across two, three and five IDAT chunks, sub-byte greyscale and
 palettes, an RGB `tRNS`, `bKGD`, other ancillary chunks, images from one pixel
 to 36000, and rows that straddle the 16 KB window hand-over.
-`python tools\decodetest.py --roundtrip` then runs 20 of the same images
+`python tools\decodetest.py --roundtrip` then runs 21 of the same images
 through `pngout.exe` itself and compares the file it writes.
 
 The inflate half was also verified byte for byte against `zlib` on all 31
@@ -1712,6 +1712,49 @@ The `<< 2` at the end and the `- 64` on the first channel are both in the
 original. PNGOUT's own help text does not list this format either, so it stays
 named `FMT_PAL8`.
 
+**Transcribed** as `DecodePal8()` in `src/decode.c`, about sixty instructions
+from `0x40D150` to `0x40D243`, and `DecodeImage()`'s dispatch in `sub_409560`
+is now the original's: format code 1 PNG, 2 `FF D8` JPEG, 3 GIF, 4 this one, 5
+`'BM'`, 6 `0A 05 01 08`, 7 `'DDS '` with a 124 byte header, then a
+self-consistency test for Targa. Of those, 1 and 4 are implemented; the rest
+report that the format has not been reconstructed.
+
+The whole function is:
+
+```c
+byte_190A824 = 3;  byte_190A825 = 8;  dword_190A820 = 0x100;
+if (width  == 0) return -1;
+if (height == 0) return -1;
+for (i = 0; i < 256; i++, p += 3)
+    dword_190A420[i] = (((((p[0] - 0x40) << 8) + p[1]) << 8) + p[2]) << 2;
+for (row = roworigin; row < height; row++)
+    for (col = 0; col < width; col++)
+        dest[row][col] = dword_190A420[*p++];
+```
+
+Two details worth writing down:
+
+* The transform is done in a **signed 32 bit** register with no clamp, and the
+  result's top byte is the pixel's alpha - there is no separate alpha to set. So
+  the alpha of an entry is `(p[0] - 64) >> 6`, and a first channel below 64
+  borrows: `(0, 0, 0)` comes out `0xFF000000`, opaque black, while `(64, 128,
+  192)` comes out `0x003FC000` with a *transparent* alpha. Both are in the
+  original and both decide whether the image needs alpha downstream.
+* The pixel loop clips against the width and height it was passed rather than
+  trusting the header (`cmp ecx, arg_10` / `cmp edx, arg_14` at `0x403200`,
+  `0x403206`), and it is the *last* row and column that get clipped - the
+  `jge` guards are on the row and column ends.
+
+`tools\dumpdec.exe` decodes it and `tools\decodetest.py --pal8` /
+`--pal8-roundtrip` check three cases each way, including a palette built around
+the wrap above and a single-colour image. The expected values have to be
+computed with the same 32 bit wrap (`pal8_expected()` in the script), or the
+comparison is against Python's arbitrary-precision arithmetic and means nothing.
+
+Reaching a working round trip turned up three real defects in the *encoder*
+side, all in code that no previous test could reach, because until this format
+existed nothing ever left `palflag` non-zero - see **Known defects**.
+
 ### Still to do inside DecodeImage
 
 The chunk walk, the bit reader and its pump, the three Huffman helpers, the
@@ -1721,7 +1764,9 @@ verified pixel for pixel. What is left:
 * `sub_40A630`, the Adam7 path. Interlaced input is refused rather than guessed
   at, because the pass table it reads is not a partition of the image and so
   could not be checked against anything - see **The Adam7 tables** above.
-* The other six decoders, the baseline JPEG decoder in `sub_40B180` (3 492
+* The other five decoders (JPEG, GIF, BMP, PCX, DDS, Targa - six of the eight
+  formats; PNG and the 8bpp one are done), the baseline JPEG decoder in
+  `sub_40B180` (3 492
   lines, by far the largest), and re-declaring the 22 MB of `.bss` they use.
 
 ## Verification so far
@@ -1740,6 +1785,8 @@ tools\dumpdec.cmd                        build the probe
 python tools\decodetest.py               all 122 cases
 python tools\decodetest.py 37,41         two of them
 python tools\decodetest.py --roundtrip   21 of them through pngout.exe
+python tools\decodetest.py --pal8        the 8bpp format, 3 cases
+python tools\decodetest.py --pal8-roundtrip   the same three through pngout.exe
 ```
 
 The probe has to put stdout in binary mode (`_setmode(1, O_BINARY)`, as `main()`
@@ -1872,6 +1919,47 @@ the wrong offset - in four different places.
   - `tools\decodetest.py --roundtrip` reported it as *"e-noise-ct2 no output"*.
   `dword_18CBEE4` is the right base in `FilterSample()` (`0x4063F6`), where it is
   read; the two are not interchangeable.
+
+* **Fixed - the palette was seeded from an address inside itself.**
+  `SETTINGS+24` (`idx 6`) is a **pointer**: `sub_402AD0` reads it at
+  `mov esi, [ebp+18h]` and uses it as the source of a `rep movsd` into
+  `dword_180B578` at `0x402EFA`, so `main()`'s `v84[6] = dword_190A420` is the
+  array decaying to an address. Hex-Rays' "int `dword_190A420[]`" guess makes it
+  read as a value, and the reconstruction had `s.unk6 = dword_190A420[0]` - the
+  first ramp entry. Along with the missing `rep movsd` (below) every lookup in
+  the colour hash missed, `FindColor()` returned −1, and −1 shifted into a 4 bit
+  palette field is `0xF`: the 8bpp format came out with index 15 in a twelve
+  entry palette, which is not a legal PNG. `unk6` is now `palette`, an
+  `int *`.
+* **Fixed - the `rep movsd` that copies the input palette in was missing.**
+  `0x402ED4`-`0x402F02` clamps `Image->palflag` to 0..256 — the clamp is spelled
+  out with `test eax, eax` / `setle cl` / `dec ecx` / `and ecx, eax` and the
+  `cmp eax, 100h` above it — and copies that many dwords from the input ramp over
+  `dword_180B578`. It runs *after* `ScanImage()` has built the palette from the
+  pixels and *after* the colour type has been decided, which is how a palette
+  the file arrived with replaces the one `ScanImage()` would have built. With
+  `palflag` 0 — what `main()` leaves it for a PNG palette, since
+  `s.coltype == 3 && !s.keeppal` clears it — the count is zero and
+  `ScanImage()`'s palette stands, which is why every PNG test passed without it.
+* **Fixed - `CompactKeptPalette()` did not exist, and what replaced it
+  mirrored the palette.** It walked down from the last entry while `keep` counted
+  up, so with every entry still used — `keep != i` is true at every step, because
+  the two counters move in opposite directions — each step copied `pal[i]` to
+  `pal[keep]` *in place*: a twelve entry palette came out as its last six entries
+  mirrored over its first six, with two entries duplicated and six missing. Every
+  lookup then missed. `loc_40321A` is not this at all: it is the backwards
+  search for the bKGD colour (`xor edx, ecx` / `test edx, offset unk_FFFFFF` /
+  `dec eax`), and there is no compaction pass in the original — nothing is ever
+  removed. The palette only ever grows, through the append arm of the pixel scan
+  at `0x40311B` (`PaletteUse[palcount] = 1`, `dword_180B578[palcount] = pixel`,
+  `AddColor(pixel, palcount)`, `palcount++`), which is now part of
+  `CountPalette()`.
+
+  All three were dead code until now. `CompactKeptPalette()` was reachable only
+  when `palflag != 0`, and for every input PNGOUT could read before the 8bpp
+  format that meant a PNG palette with `/kp` — and `main()` clears `palflag` for
+  exactly that case. `/kp` and `/ks` both pass before and after, because they
+  never got there.
 
 Two more things the round trip turned up that are not defects but are worth
 knowing, because a test image can trip over them:

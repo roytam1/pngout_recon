@@ -1,5 +1,5 @@
 /*
- *  decode.c   -   0x409560 DecodeImage(), the PNG path
+ *  decode.c   -   0x409560 DecodeImage(), the PNG path and the 8bpp one
  *
  *  PNGOUT carries its own inflate, so this file holds the whole of the PNG
  *  decoder: the chunk walk, a bit reader with the input pump, the Huffman
@@ -24,8 +24,9 @@
  *  never the advance to the next row.
  *
  *  Interlaced input is refused rather than guessed at: sub_40A630's pass
- *  geometry does not match Adam7 as the spec lays it out, and the encoder side
- *  has not been consulted to settle it.
+ *  geometry does not match Adam7 as the spec lays it out, and it is not a
+ *  partition of the image, so no valid interlaced file could be checked against
+ *  a transcription of it.
  */
 
 #include <stdio.h>
@@ -1017,6 +1018,72 @@ static int DecodePng(const unsigned char *data, int size, unsigned char *pixels,
     return -1;
 }
 
+/*
+ *  loc_40D150: the 8bpp palettised format, format code 4.
+ *
+ *  Header, all little endian, recognised by sub_409260 (which reads the width
+ *  and height from the same two words) and by the dispatch in sub_409560:
+ *
+ *      +0   19 91          magic
+ *      +2   word           width
+ *      +4   word           height
+ *      +A   byte           8, bits per pixel
+ *      +B   byte           0
+ *      +20  256 * 3 bytes  RGB palette
+ *      +320 width*height   one palette index per pixel, row major
+ *
+ *  The palette transform is the odd one out and is in the original: the first
+ *  channel is biased by 0x40 and the result is scaled by four, so
+ *
+ *      pal[i] = 4 * (((((p[0] - 64) << 8) + p[1]) << 8) + p[2])
+ *
+ *  (`sub edx, 40h` / `shl edx, 8` / `add edx, ebx` / `shl edx, 8` /
+ *  `add edx, ebx` / `shl edx, 2`).  There is no clamp, so a first channel below
+ *  64 wraps the entry; that is what the original does.
+ *
+ *  It fills the same dword_190A420 the PNG path uses and sets the three globals
+ *  main() reads, so nothing downstream has to know the format came from here.
+ *  The pixel loop clips against the width and height it was given at both ends
+ *  of the inner test rather than trusting the header, and the index is read
+ *  straight through the palette with no range check - 256 entries and an 8 bit
+ *  index, so there is nothing to check.
+ */
+static int DecodePal8(const unsigned char *data, unsigned char *pixels,
+                      int pitch, unsigned int width, unsigned int height,
+                      int xorigin, int roworigin)
+{
+    const unsigned char *p;
+    unsigned char *base;
+    unsigned row, col;
+    int i;
+
+    OutColType = 3;                 /* byte_190A824 */
+    OutBitDepth = 8;                /* byte_190A825 */
+    unk_190A820 = 256;              /* dword_190A820 */
+
+    if (*(const unsigned short *)(data + 2) == 0)
+        return -1;
+    if (*(const unsigned short *)(data + 4) == 0)
+        return -1;
+
+    p = data + 0x20;
+    for (i = 0; i < 256; i++, p += 3)
+        Pal[i] = ((((((int)p[0] - 0x40) << 8) + p[1]) << 8) + p[2]) << 2;
+
+    if ((unsigned)(height - roworigin) == 0)
+        return 0;
+
+    base = pixels + (size_t)pitch * roworigin;
+    for (row = roworigin; row < height; row++) {
+        unsigned char *line = base + (size_t)pitch * row;
+
+        for (col = 0; col < width; col++)
+            *(int *)(line + (size_t)col * 4) = Pal[*p++];
+    }
+
+    return 0;
+}
+
 int DecodeImage(unsigned char *fileimg, int filesize, unsigned char *pixels,
                 int pitch, unsigned int width, unsigned int height,
                 int unused7, int unused8)
@@ -1024,11 +1091,24 @@ int DecodeImage(unsigned char *fileimg, int filesize, unsigned char *pixels,
     (void)unused7;
     (void)unused8;
 
-    if (fileimg && filesize >= 8 && fileimg[0] == 0x89 && fileimg[1] == 'P')
-        return DecodePng(fileimg, filesize, pixels, pitch, width, height);
+    /*
+     *  sub_409560's dispatch, in its order.  The format codes it returns are
+     *  1 PNG, 2 JPEG, 3 GIF, 4 the 8bpp palette below, 5 BMP, 6 PCX, 7 DDS and
+     *  8 Targa; of those only 1 and 4 are transcribed.
+     */
+    if (fileimg && filesize >= 2) {
+        if (fileimg[0] == 0x89 && fileimg[1] == 'P')
+            return DecodePng(fileimg, filesize, pixels, pitch, width, height);
+
+        if (fileimg[0] == 0x19 && fileimg[1] == 0x91 &&
+            fileimg[10] == 8 && fileimg[11] == 0)
+            return DecodePal8(fileimg, pixels, pitch, width, height,
+                              unused7, unused8);
+    }
 
     printf("\n*** That input format has not been reconstructed yet.\n"
-           "*** This build decodes PNG only; see README.md.\n\n");
+           "*** This build decodes PNG and the 8bpp palettised format;"
+           " see README.md.\n\n");
     exit(3);
     return -1;
 }
