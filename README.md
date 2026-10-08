@@ -2261,6 +2261,133 @@ is then matched against the SOF components by id, and given its block cursor,
 its sampling factors and its quantisation table selector, with the MCU edges
 `v188 - h_idx + 3` and `vmax - v_idx + 3`.
 
+#### The inner decode loop
+
+The bit stream is a 32-bit register `v83` with `v81` counting *down* the bits
+still in it, refilled whenever a read would not have enough:
+
+```c
+v103 = ((unsigned int)(15 - v81) >> 3) + 1;      /* for a Huffman symbol */
+v81 += 8 * v103;
+do {
+    v104 = *v102++;
+    if (v104 == 0xFF) ++v102;                     /* the byte stuffing */
+    v83 = v104 + (v83 << 8);
+} while (--v103);
+```
+
+The coefficient path refills the same way with `((v94 - v81 - 1) >> 3) + 1`,
+i.e. "however many bytes it takes to have `v94` bits", so both paths share one
+refill. `v81` counting down is why every read is written as `v81 -= length`.
+
+**Huffman symbols go through a ten bit look-ahead first.** Ten bits are peeked
+without consuming them:
+
+```c
+v105 = (v83 >> (v81 - 10)) & 0x3FF;
+if (v105 >= v200)
+    sub_40C700(dword_18CFF70[v166] + 4, v81, v83, &symbol, &length);  /* walk */
+else {
+    symbol = dword_18F60A8[2 * v105];           /* the fast table */
+    v81 -= dword_18EE0A8[2 * v105];            /* and its length */
+}
+```
+
+`v200` is how many of the table's 1024 slots DHT filled, so a peek below it hits
+and anything else falls back to the bit-at-a-time walk. The tables are two dwords
+per peeked value: `dword_18EE0A8` and `dword_18F60A8` are exactly `0x400` bytes
+past the `dword_18EA0A8` and `dword_18F20A8` DHT writes, so there are two halves
+of the same array and the inner loop uses the second. (The decompiler's
+`*(int *)((char *)dword_18F60A8 + (_DWORD)&v194[v106])` is just
+`dword_18F60A8[2 * v105]` with a stack slot standing in for the array base.)
+
+**The DC difference is sign-extended through a pair of tables** rather than by a
+shift, which is worth noting because it is not how the spec words it:
+
+```c
+v98 = dword_4100D8[v94];                        /* the mask, by size   */
+v99 = v98 & (v83 >> v81);
+if (v99 <= *(_DWORD *)&aOut8dBytesStor[4 * v94 + 20])
+    v99 -= v98;
+dword_18D9F94[v166] += v99;                     /* the predictor       */
+```
+
+The predictor is one dword per component, accumulated rather than assigned.
+`aOut8dBytesStor` is another `.rdata` table of thresholds indexed by size.
+
+**Progressive is handled properly, not incidentally.** The coefficient store
+shifts by `Al` (`*(v82) = LOWORD(dword_18D9F94[v166]) << v182`, where `v182` is
+`Al`), the magnitude bits are skipped when `Ah` is set - `if (v180) goto
+LABEL_198` before the bit read - and a DC-only refinement scan works because
+`v101 = max(Ss, 1)` clamps the spectral start so the AC loop never runs. The zero
+runs are accumulated through `dword_18D158[v108]`, which is the **EOB run**
+extension: a run of 15 zeroes followed by size zero adds to a counter instead of
+emitting more EOBs, and `if (v170) { if (v180) goto LABEL_198; --v170; }` drains
+it. That is a real progressive implementation, which settles the question the
+shared SOF arm raised - `sub_40B180` is a full baseline-plus-progressive decoder,
+and the three SOF markers sharing one arm is simply because they share a layout.
+
+#### The output path, and `sub_408D80`
+
+`sub_40B790` is called once per 8x8 block, `v177` stepping 256 bytes a time
+(64 dwords), with the row bound `8 * dword_18CBF58[v166]` - eight rows per block,
+times the horizontal sampling factor. There are two call sites, which is the
+sequential path IDCTing straight out and the buffered path IDCTing out of the
+progressive buffer afterwards.
+
+The pixels themselves are not written by `sub_40B180`. It ends its loop with
+
+```c
+off_4110F8(v142, v141, &unk_18D8358);
+v142 += dword_18DEE68[0];
+...
+v141 += dword_18DA244[0];
+```
+
+an **indirect call**, and `off_4110F8` is initialised in `.data` to
+`&sub_408D80`. So the colour converter is a separate function reached through a
+global pointer, called once per output position with the first component's
+sampling factors as the step.
+
+`sub_408D80` does the upsampling by **bit shift, not a filter** - no fancy
+triangle interpolation anywhere:
+
+```c
+v4 = a3 + 4 * ((v9 >> dword_18DEE40)
+               + 8 * ((v42 >> dword_18DC388) + 8 * dword_18DB898));
+```
+
+`dword_18DEE40` and `dword_18DC388` are the sampling *indices* the SOS arm
+recorded for the first component, so a chroma sample is picked by shifting the
+output coordinate right by them. Point sampling, then.
+
+**And the YCbCr conversion contains no multiplies at all.** The coefficients are
+folded into the addresses of four tables and the result is three lookups added
+together:
+
+```c
+pixel = dword_18DF888[(v16 + dword_18CDF74[v6]) >> 22]
+      + dword_18DC4D8[(v16 + dword_18D6358[result]) >> 22]
+      + dword_18E90A0[(v16 + dword_18CDF70[v6] + dword_18D635C[result]) >> 22];
+```
+
+with `v6 = (*v15 >> 19) & 0xFFFFFFFE` and `result = (v15[64] >> 19) & 0xFFFFFFFE`
+the two chroma planes - the `>> 19` because `sub_40C790` leaves its output scaled
+by 2^19. `dword_18CDF70`/`dword_18CDF74` and `dword_18D635C`/`dword_18D6358` are
+the Y-plus-k-times-chroma sums precomputed for the even and odd sample positions,
+and the three result tables are the ones `sub_40C580` built: `dword_18E90A0[i] =
+v << 8` and `dword_18DC4D8[i] = (v - 256) << 16`. So G is the sum of two table
+lookups and R and B one each. `if (dword_18CBF58 == 1)` is a greyscale path that
+skips the chroma entirely.
+
+Between all of that the whole decoder is accounted for: marker walk, SOF, DHT,
+DQT, DRI, the buffering branch, the bit reader, the ten bit look-ahead, the
+extend, the progressive refinement with EOB runs, the AAN transform in
+`sub_40C790`, the point upsampling and the table-driven colour conversion in
+`sub_408D80`. Nothing in the JPEG path is unread, so the transcription pass has
+everything it needs - and the pieces that were hardest to pin down turned out to
+be standard, which is the best possible outcome for a transcription.
+
 ### `sub_40DD80`, DDS (format code 7) — analysed, not transcribed
 
 1158 listing lines, 1705 bytes. Not transcribed yet. The front end is short and
