@@ -2646,6 +2646,77 @@ static void JpegDQT(int tq, int prec, const unsigned char *data)
  *  `__int64`.  Variable names follow the decompilation (v3..v18, v38..v45)
  *  so the transcription can be checked line for line against it.
  */
+typedef struct JpegBit {
+    const unsigned char *p;
+    const unsigned char *end;
+    unsigned reg;                   /* v83: buffered bits, MSB first */
+    int nbits;                      /* v81: bits still in reg */
+} JpegBit;
+
+static void JpegRefill(JpegBit *b, int want)
+{
+    /* "however many bytes it takes to have `want` bits", 0x40BFxx */
+    while (b->nbits < want && b->p < b->end) {
+        unsigned c = *b->p++;
+
+        if (c == 0xFF && b->p < b->end && *b->p == 0x00)
+            b->p++;
+        b->reg = (b->reg << 8) | c;
+        b->nbits += 8;
+    }
+}
+
+/* sub_40C700: one symbol by walking lengths; returns length, symbol out */
+static int JpegHuffSlow(JpegHuff *t, JpegBit *b, int *sym)
+{
+    int code = 0, len;
+
+    for (len = 1; len <= 16; len++) {
+        JpegRefill(b, 1);
+        code = (code << 1) | ((b->reg >> (--b->nbits)) & 1);
+        if (code < t->first[len - 1]) {
+            *sym = t->syms[t->base[len - 1] + code];
+            return len;
+        }
+    }
+    *sym = 0;
+    return 16;
+}
+
+static int JpegHuffSym(JpegHuff *t, JpegBit *b)
+{
+    int peek, sym, len;
+
+    JpegRefill(b, 10);
+    peek = (b->reg >> (b->nbits - 10)) & 0x3FF;
+    if (peek < t->nfast) {
+        len = t->fastlen[peek];
+        sym = t->fastsym[peek];
+        b->nbits -= len;
+        return sym;
+    }
+    JpegHuffSlow(t, b, &sym);
+    return sym;
+}
+
+/* table-driven extend: mask and threshold by size, then accumulate */
+static int JpegExtend(JpegBit *b, int size)
+{
+    static const unsigned mask[16] = {
+        0, 1, 3, 7, 15, 31, 63, 127, 255, 511, 1023,
+        2047, 4095, 8191, 16383, 32767
+    };
+    unsigned v;
+
+    if (!size)
+        return 0;
+    JpegRefill(b, size);
+    b->nbits -= size;
+    v = (b->reg >> b->nbits) & mask[size];
+    if (v <= (mask[size] >> 1))
+        return (int)v - (int)mask[size];
+    return (int)v;
+}
 static void JpegIdct(int *a1, unsigned a2)
 {
     /* v46/v47 are byte addresses as unsigned, not pointers - the column
@@ -2740,6 +2811,104 @@ static void JpegIdct(int *a1, unsigned a2)
         } while ((unsigned)v19 < v47);
     }
 }
+/* Sequential entropy decode to integer coefficients, for verification.
+ * Not called in production (DecodeJpeg still returns -1); exercised via
+ * JPEGDEBUG dumps compared against the Python reference bit-for-bit.
+ * Covers interleaved and non-interleaved sequential scans without restart;
+ * restart/progressive fall back to -1 until those paths land.
+ */
+static int JpegDecodeSeq(const unsigned char *scan, const unsigned char *end,
+                         unsigned w, unsigned h,
+#ifdef JPEGDEBUG
+                         int dump
+#else
+                         int unused_dump
+#endif
+                         )
+{
+    JpegBit bit;
+    int pred[4] = {0, 0, 0, 0};
+    unsigned hmax = 1, vmax = 1, ci;
+    unsigned mcux, mcuy, mx, my;
+    int ok = 1;
+#ifndef JPEGDEBUG
+    (void)unused_dump;
+#endif
+
+    for (ci = 0; ci < JpegNComp; ci++) {
+        if (JpegComps[ci].hsamp > hmax)
+            hmax = JpegComps[ci].hsamp;
+        if (JpegComps[ci].vsamp > vmax)
+            vmax = JpegComps[ci].vsamp;
+    }
+    mcux = (w + 8 * hmax - 1) / (8 * hmax);
+    mcuy = (h + 8 * vmax - 1) / (8 * vmax);
+
+    bit.p = scan;
+    bit.end = end;
+    bit.reg = 0;
+    bit.nbits = 0;
+
+    for (my = 0; my < mcuy && ok; my++) {
+        for (mx = 0; mx < mcux && ok; mx++) {
+            for (ci = 0; ci < JpegNComp && ok; ci++) {
+                unsigned hs = JpegComps[ci].hsamp;
+                unsigned vs = JpegComps[ci].vsamp;
+                unsigned bx, by;
+                JpegHuff *dh = &JpegHuffs[JpegComps[ci].dc_sel & 3];
+                JpegHuff *ah = &JpegHuffs[4 + (JpegComps[ci].ac_sel & 3)];
+
+                for (by = 0; by < vs && ok; by++) {
+                    for (bx = 0; bx < hs && ok; bx++) {
+                        int coef[64] = {0};
+                        int sym = JpegHuffSym(dh, &bit);
+                        int diff, k;
+
+                        if (sym < 0 || sym > 11) {
+                            ok = 0;
+                            break;
+                        }
+                        diff = JpegExtend(&bit, sym);
+                        pred[ci] += diff;
+                        coef[0] = pred[ci];
+
+                        k = 1;
+                        while (k < 64) {
+                            int rs = JpegHuffSym(ah, &bit);
+                            int run = (rs >> 4) & 15, size = rs & 15;
+
+                            if (!size) {
+                                if (run == 15) {
+                                    k += 16;
+                                    continue;
+                                }
+                                break;      /* EOB */
+                            }
+                            k += run;
+                            if (k >= 64) {
+                                ok = 0;
+                                break;
+                            }
+                            coef[k++] = JpegExtend(&bit, size);
+                        }
+#ifdef JPEGDEBUG
+                        if (dump) {
+                            int t;
+
+                            fprintf(stderr, "jpeg: blk c%u mx%u my%u bx%u by%u =",
+                                    ci, mx, my, bx, by);
+                            for (t = 0; t < 64; t++)
+                                fprintf(stderr, " %d", coef[t]);
+                            fprintf(stderr, "\n");
+                        }
+#endif
+                    }
+                }
+            }
+        }
+    }
+    return ok ? 0 : -1;
+}
 static int DecodeJpeg(const unsigned char *data, int size,
                       unsigned char *pixels, int pitch,
                       unsigned int width, unsigned int height,
@@ -2771,9 +2940,16 @@ static int DecodeJpeg(const unsigned char *data, int size,
         if (marker == 0xD9)
             break;                          /* EOI */
         if (marker == 0xDA) {
-            /* SOS: component selectors, then spectral/approximation */
+            /* SOS: component selectors, then spectral/approximation.
+             * p is on the 2-byte length here (unlike the segments above,
+             * whose length was already consumed), so skip it first. */
             unsigned ns, i;
-            const unsigned char *q = p;
+            const unsigned char *q;
+
+            if (p + 2 > end)
+                return -1;
+            p += 2;
+            q = p;
 
             if (p + 1 > end)
                 return -1;
@@ -2794,7 +2970,24 @@ static int DecodeJpeg(const unsigned char *data, int size,
                 }
                 q += 2;
             }
-            /* Ss, Se, Ah/Al follow; entropy body not yet */
+            {
+                unsigned ss = q[0], se = q[1], ahal = q[2];
+                const unsigned char *scan = q + 3;
+
+                /* Sequential, no restart, no refinement: decode to
+                 * coefficients for verification (dumps under JPEGDEBUG),
+                 * then still return -1 - no pixels yet.  Anything else
+                 * (progressive, restart, subset scan) waits for its path. */
+                if (ss == 0 && se == 63 && ahal == 0 && JpegRestart == 0) {
+                    JpegDecodeSeq(scan, end, JpegWidth, JpegHeight,
+#ifdef JPEGDEBUG
+                                  1
+#else
+                                  0
+#endif
+                                  );
+                }
+            }
             break;
         }
         if (marker == 0x01 || (marker >= 0xD0 && marker <= 0xD7))

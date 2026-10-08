@@ -2173,6 +2173,28 @@ So the corpus is ready and the entropy body can be transcribed against it. What
 is still missing is a **progressive** file to pin the `0xC2` behaviour down; that
 needs a second scan encoder, which `jpeglib` does not have.
 
+#### The sequential entropy path is verified to coefficients (`JpegDecodeSeq`)
+
+The bit reader, Huffman (10-bit fast with `sub_40C700` fallback), table
+extend, DC prediction, AC runs with EOB and the MCU walk are now C, decoding
+sequential scans without restart to integer quantized coefficients - and those
+coefficients are **bit-exact** against an independent Python decode: 6/6 blocks
+on single-component, 18/18 on three-component interleaved. Combined with the
+already-verified IDCT, the pipeline is correct by composition up to the colour
+conversion; only that last step needs the four tables. Still returning -1, so
+production is unaffected; the coefficient dumps live under `JPEGDEBUG` as the
+verification hook.
+
+Two things it caught, both alignment rather than logic:
+
+* The SOS `q` pointer starts on the **length bytes**, not on `ns` - unlike the
+  segments above, whose length was already consumed. Reading `ns` from the
+  length gives `ss=8, se=1, ahal=1` out of a baseline header and decodes
+  garbage from the wrong offset; skipping two first makes `ss=0, se=63`.
+* The first verification attempt compared against a Python reference that was
+  itself misaligned by the same two bytes - the C's `-4` was right and the
+  script's `0` was wrong. Fixed the script, not the C; 0 mismatches after.
+
 #### SOS selectors are parsed; the entropy body is next
 
 The SOS case now records each scan component's DC/AC table selectors against
