@@ -2377,8 +2377,13 @@ by 2^19. `dword_18CDF70`/`dword_18CDF74` and `dword_18D635C`/`dword_18D6358` are
 the Y-plus-k-times-chroma sums precomputed for the even and odd sample positions,
 and the three result tables are the ones `sub_40C580` built: `dword_18E90A0[i] =
 v << 8` and `dword_18DC4D8[i] = (v - 256) << 16`. So G is the sum of two table
-lookups and R and B one each. `if (dword_18CBF58 == 1)` is a greyscale path that
-skips the chroma entirely.
+lookups and R and B one each. `if (dword_18CBF58 == 1)` is **not** a greyscale path, whatever that sentence
+once said. `dword_18CBF58[i]` is the horizontal sampling factor, so `== 1`
+means no horizontal subsampling - and that branch reads all four address
+tables exactly like the `== 2` branch does. There is no output path that
+avoids them, greyscale included. So a "greyscale first" slice cannot side-step
+the unknown tables, and the transcription has to carry all four as parameters
+from the start.
 
 Between all of that the whole decoder is accounted for: marker walk, SOF, DHT,
 DQT, DRI, the buffering branch, the bit reader, the ten bit look-ahead, the
