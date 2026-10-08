@@ -2320,6 +2320,16 @@ solves to date are consistency checks, not determinations; the gradient
 joint solve is the defined next step and the first one that can actually
 conclude.
 
+#### Linear `v4` fails at MCU boundaries; per-MCU bases required
+
+Row 0 (single MCU in `x`) fits linear tables to worst 3; row 1 spanning three
+MCUs fails at worst 147 with no `v4` offset fixing it (offsets -2..+2 blocks
+all 46+). Hence `v4 = a3+256+4x+32y` is wrong past `x=8`: the true `v4` resets
+per MCU (from per-component block pointers/`v201` cursors in the outer loop),
+with `v9`/`v42` MCU-local (0..7). Slopes from row 0 stand as the intra-MCU
+solution; cross-MCU consistency will confirm the bases. Implementing that
+outer per-MCU base selection - not more fitting - is the defined next step.
+
 #### Shared-index contradiction proves plane/component in the index
 
 `B[1020]` would need `[+746M,+751M)` for red but `[-113M,-109M)` for blue -
