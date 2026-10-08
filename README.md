@@ -1927,6 +1927,47 @@ faithful to the listing and unreachable through `main()`.
 `tools\decodetest.py --bmp` and `--bmp-roundtrip` check six cases, both header
 shapes and 8, 16, 24 and 32 bits.
 
+### `sub_40CA70`, GIF (format code 3) — analysed, not transcribed
+
+1712 bytes, of which roughly 700 is the LZW decoder. Not transcribed yet; this
+is what has been read off the listing, so the next pass does not start by
+re-reading it.
+
+The front end is straightforward and mostly confirmed:
+
+* `byte_190A824 = 3` and `byte_190A825 = 8` are set at `0x40CA77` **before** the
+  magic is checked, so a file that fails `'G' 'I' 'F'` has already published
+  colour type 3 on its way to returning −1.
+* The global palette size is `1 << ((packed & 7) + 1)` and goes straight into
+  `dword_190A820` (`0x40CAB1`-`0x40CAB7`); `packed` bit 7 decides whether the
+  table is present at all, and `0x40CAC4` skips `3 * size` past it.
+* The extension loop at `0x40CAE0` walks the sub-block chain with
+  `lea ebx, [ebx+eax+1]` *before* the `test`, so the zero terminator is
+  consumed — worth noting because the instruction order makes it look otherwise.
+  A Graphic Control Extension with the transparency flag set yields its index
+  from `p[6]`, and that index later has its alpha byte cleared at `0x40CBF9`.
+* The image descriptor is read with the pointer one byte past the `,`, so left
+  is `[+0]`, top `[+2]`, width `[+4]`, height `[+6]`, flags `[+8]`, and
+  `add ebx, 9` lands on the LZW minimum code size.
+* The palette transform is the same trick the PCX path uses, on the *green*
+  channel this time: `sub ecx, 100h` / `shl ecx, 8` / `add ecx, esi` /
+  `shl ecx, 8` / `add ecx, esi` at `0x40CBAA`, i.e.
+  `((green - 256) << 8 + blue) << 8 + red`, which is the identity on RGB and
+  leaves the top byte at `0xFF` by the borrow. Unfilled entries are
+  `0xFF000000` (`rep stosd` at `0x40CBE6`).
+
+**One thing that looks wrong and is not yet settled.** `0x40CB3D` tests
+`cl & 0x40` — the local colour table flag — and stores it in `var_55`, but the
+block that then computes a local table size, `1 << ((cl & 7) + 1)`, and skips
+`3 * size` bytes of palette is guarded by `test cl, cl` / `jns` at `0x40CB66`,
+which tests **bit 7, the interlace flag**. So as far as can be read here, a GIF
+with a local colour table and no interlacing would not have the table skipped,
+and an interlaced GIF without one would skip palette bytes that are not there.
+`var_48` and `var_55` are both consumed later in the LZW minimum-code-size
+switch at `0x40D06F`, so it is possible the pair is doing something the reading
+above misses. That needs a GIF with a local colour table and a real LZW stream
+to settle, which is why nothing has been transcribed from it yet.
+
 ### Still to do inside DecodeImage
 
 The chunk walk, the bit reader and its pump, the three Huffman helpers, the
