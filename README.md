@@ -2492,6 +2492,32 @@ addresses), and not in `reference/data.lst` either - so it fills through a
 register-held pointer somewhere, and tracing that pointer is the remaining job.
 Everything else about the decoder is known, standard, and has its values.
 
+#### The fill is not a `rep` either - narrowing to computed stores
+
+Seventy-two `rep` operations in the binary, and every one in JPEG range is a
+small, attributable operation rather than a table fill:
+
+* `0x40B1ED rep stosd` - the prologue clearing eight dwords (`ecx = 8`).
+* `0x40B4A9 rep movsd` / `0x40B4B0 rep movsb` - a segment copy (`esi = ebx`,
+  count from `ebp`, DHT/SOS setup data).
+* `0x40B517` / `0x40B530 rep stosd` - small fills feeding
+  `dword_18DEE48[ecx*4]`, the Huffman count (DHT setup).
+* `0x40B818 rep stosd` / `0x40B81F rep stosb`, `0x40BD23 rep stosd` - the same
+  class of small setup fills.
+* `0x40C634`, `0x40C642`, `0x40C6EE rep stosd` - the three `memset`s in
+  `sub_40C580`'s decompilation.
+* The GIF `rep`s (`0x40CBEB`, `0x40CD41`, `0x40CD88`, `0x40CDA3`, `0x40CDE0`,
+  `0x40CECD`, `0x40CED4`, `0x40CF47`, `0x40CF52`) - palette fill and LZW
+  refill, all known.
+
+So the two interleaved arrays are not `rep movsd`'d from `.rdata` and not
+`rep stosd`'d. Combined with the earlier findings - no direct store, no base
+load, not in `sub_40C580`, not in `sub_408D80`, not in the dispatch - the fill
+must be a **loop with computed register stores** (`mov [reg], ...` /
+`mov [reg+4], ...` in pairs), sitting in `sub_40B180`'s setup code. That is a
+much smaller search than "anywhere": read that function's DHT/SOS setup loops
+for pair stores, rather than grepping the binary again.
+
 #### Those tables are `.data`, not `.bss` - and the cheap hypotheses are out
 
 `pngout.exe.lst` settles the segment question directly:
