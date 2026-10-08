@@ -2126,10 +2126,51 @@ straight into whatever representation PNGOUT's own IDCT wants, and the standard
 So the IDCT is an integer one with its own basis tables, not a scaled AAN. The
 `.bss` this decoder alone needs runs from `unk_18CFF81` to `unk_18FA1BC`.
 
-Verifying it needs a corpus the tree does not have: baseline 4:4:4, 4:2:2 and
-4:2:0, greyscale, a restart interval, 16 bit quantisation tables, and a
-progressive file to pin the `0xC2` behaviour down. Unlike DDS, these are
-generatable - the encoder side is the hard part, not the corpus.
+**The corpus now exists.** `tools/jpeglib.py` writes baseline JPEG - greyscale,
+4:4:4, 4:2:2 and 4:2:0, restart intervals and 16 bit quantisation tables - and
+`python tools/decodetest.py --jpeg` runs 33 cases over it. Useful things about it:
+
+* `sub_40B180` reads whatever Huffman and quantisation tables the file carries,
+  so the corpus does **not** have to use the exact tables from the spec's annex
+  K; any legal ones work and `jpeglib` builds its own from a code-length list.
+  A slip in a table there cannot make a test pass that should fail, because the
+  decoder under test never consults them - they only have to be self-consistent.
+  The counts *are* checked against the values, since a mismatch there produces a
+  file that is not legal.
+* It also carries a separate, deliberately naive reader written from the spec,
+  used only to check the writer. That reader is **not** a substitute for a third
+  party decoder: if the writer and the reader share a misreading of the standard
+  they will agree with each other and both be wrong.
+* The pictures are smooth on purpose. A source with a sharp edge or a modulo
+  wrap in it loses a large *legitimate* amount - ringing at a step edge reaches
+  255 on a near-Nyquist pattern - so a bound measured against one says nothing.
+  A flat picture comes back within 1 level, a smooth gradient within 33, and
+  those bounds are what the cases assert; `checker` is kept as a smoke case with
+  no bound, only "it decodes and it is the right size".
+
+Four bugs in the writer, all found by the round trip and all of the kind that
+produce a plausible file rather than a failure:
+
+* `1/sqrt(2)` was folded into both the cosine table and the per-axis scale, so
+  every coefficient was half what it should be and the round trip came back at
+  a quarter. A flat block of 100 has a DC of 800, not 400.
+* the quantisation table is stored in natural order but indexed by zigzag
+  position, so both the coefficient and its divisor go through `ZIGZAG[k]`.
+* the row count of the block grid was taken from a leftover loop variable, which
+  is right for 4:4:4, 4:2:2 and greyscale and wrong only for 4:2:0 - the first
+  layout with a vertical sampling factor of 2.
+* the YCbCr coefficients were a wrong set; the ones that are actually the
+  inverse of the reader's are `19595/38470/7471`, `-11056/-21712/32768` and
+  `32768/-27440/-5328`.
+
+The padding matters too, and was worth a change: filling it with black drags the
+last row and column towards it, because a partial edge block then mixes real
+samples with level -128. Repeating the edge - which is what a real encoder does -
+brings a flat picture at an odd width back exactly.
+
+So the corpus is ready and the entropy body can be transcribed against it. What
+is still missing is a **progressive** file to pin the `0xC2` behaviour down; that
+needs a second scan encoder, which `jpeglib` does not have.
 
 ### `sub_40DD80`, DDS (format code 7) — analysed, not transcribed
 
@@ -2181,7 +2222,8 @@ verified pixel for pixel. What is left:
   | `0x40DD80` DDS | 1 158 | 1 705 | front end read, above; needs hand-built DXT to check |
   | `0x40B180` JPEG | 3 491 | 5 058 | baseline sequential, with Huffman, IDCT, upsampling, YCbCr |
 
-  JPEG is about twice GIF and wants a pass of its own.
+  JPEG is about twice GIF and wants a pass of its own. Its corpus now exists -
+  `tools/jpeglib.py`, 33 cases - so the remaining work is the entropy body.
 
 ## Verification so far
 
@@ -2209,7 +2251,14 @@ python tools\decodetest.py --bmp        BMP, 6 cases
 python tools\decodetest.py --bmp-roundtrip   the same six through pngout.exe
 python tools\decodetest.py --gif        GIF, 11 cases
 python tools\decodetest.py --gif-roundtrip   the same eleven through pngout.exe
+python tools\decodetest.py --jpeg       JPEG, 33 cases (see below)
 ```
+
+`--jpeg` is the odd one out: `sub_40B180` is not transcribed, so there are no
+pixels to compare. What it checks is that `tools/jpeglib.py` writes a baseline
+JPEG which reads back within a measured bound, and that `dumpdec.exe` and
+`pngout.exe` both refuse it cleanly while it is missing. It pins the corpus
+rather than the decoder.
 
 The GIF cases need an LZW *encoder* in the test harness rather than a row of
 literals, so that the code table, the size bump and the "repeat the previous

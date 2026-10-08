@@ -30,6 +30,7 @@ import struct
 import subprocess
 import sys
 import zlib
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD = os.path.join(ROOT, "build")
@@ -1608,8 +1609,136 @@ def gif_cases():
     ]
 
 
+# ------------------------------------------------------------------ JPEG
+def jpeg_sources(w, h):
+    """
+    Pictures for the JPEG cases.
+
+    They are all smooth, and deliberately so.  A source with a sharp edge or a
+    modulo wrap in it produces a large *legitimate* error - JPEG's own ringing
+    at a step edge reaches 255 on a near-Nyquist pattern - so a bound measured
+    against such a source says nothing about anything.  A smooth gradient comes
+    back within about 13 levels at these table settings and a flat picture
+    within one, and both of those are worth asserting.
+
+    `checker` is the exception: it is kept as a smoke case only.  It must
+    round-trip without raising and at the right size, and nothing more.
+    """
+    out = {}
+    out["flat"] = [[(90, 140, 200)] * w for _ in range(h)]
+    # a gentle colour gradient: the chroma ramp has to be shallow as well as
+    # the luma one, because the annex K chroma table is 99 throughout, so a
+    # steep one loses most of itself to quantisation before subsampling even
+    # starts.  `checker` below is where the contrast goes instead.
+    out["ramp"] = [[((x * 70) // (w - 1) + 90,
+                     (y * 60) // (h - 1) + 100,
+                     (x * 40) // (w - 1) + (y * 30) // (h - 1) + 130)
+                    for x in range(w)] for y in range(h)]
+    out["grey"] = [[((min(x * 255 // (w - 1) + y * 255 // (h - 1) // 2
+                          + y * 3, 255),) * 3) for x in range(w)]
+                   for y in range(h)]
+    out["checker"] = [[((255 if (x // 3 + y // 3) % 2 else 20),
+                        (255 if (x // 5 + y // 2) % 2 else 90),
+                        (200 if (x // 2 + y // 5) % 2 else 40))
+                       for x in range(w)] for y in range(h)]
+    return out
+
+
+# What each source may be expected to lose, measured with the sources above and
+# given headroom.  The worst observed are 1 (flat), 33 (ramp, 4:2:2) and 19
+# (grey); the extra room is for the arithmetic differing between this build of
+# Python and another.
+JPEG_BOUND = {"flat": 4, "ramp": 48, "grey": 32}
+
+
+def jpeg_cases():
+    """
+    JPEG: every component layout the front end accepts, plus restart
+    intervals and 16 bit quantisation tables.
+    """
+    w, h = 17, 9
+    out = []
+    for name in ("flat", "ramp", "grey", "checker"):
+        for comps in ("grey", "444", "422", "420"):
+            for restart in (0, 2):
+                out.append((name, comps, restart, 8))
+    out.append(("ramp", "444", 0, 16))
+    return out
+
+
+def run_jpeg(case):
+    """
+    sub_40B180 is not transcribed, so this cannot check pixels.  What it does
+    check is the two halves that are in place: that tools/jpeglib.py writes a
+    baseline JPEG which reads back to within a known error (so the corpus is
+    legal and the expectations are sane), and that both binaries refuse the
+    file cleanly rather than crashing or half-decoding it.
+    """
+    import jpeglib
+
+    name, comps, restart, precision = case
+    w, h = 17, 9
+    rgb = jpeg_sources(w, h)[name]
+    if comps == "grey" and name != "grey":
+        rgb = [[(sum(px) // 3,) * 3 for px in row] for row in rgb]
+    src = os.path.join(BUILD, "dt_j_%s_%s_%d_%d.jpg"
+                       % (name, comps, restart, precision))
+    try:
+        jpeglib.write_jpeg(src, w, h, rgb, comps=comps, restart=restart,
+                           precision=precision)
+    except Exception as exc:                       # noqa: BLE001
+        return "%-22s write failed: %s" % (name, exc)
+
+    # 1. the file is a baseline JPEG that decodes back to a known picture
+    try:
+        gw, gh, got = jpeglib.read_jpeg(src)
+    except Exception as exc:                       # noqa: BLE001
+        return "%-22s not decodable: %s" % (name, exc)
+    if (gw, gh) != (w, h):
+        return "%-22s wrong size %dx%d" % (name, gw, gh)
+    worst = 0
+    for y in range(h):
+        for x in range(w):
+            for k in range(3):
+                worst = max(worst, abs(rgb[y][x][k] - got[y][x][k]))
+    # `checker` has no bound: see jpeg_sources().  The smooth ones do.
+    bound = JPEG_BOUND.get(name)
+    if bound is not None and worst > bound:
+        return "%-22s re-read differs by %d (bound %d)" % (name, worst, bound)
+
+    # 2. GetImageSize() must size it, and both binaries must refuse it
+    #    cleanly while sub_40B180 is still missing
+    r = subprocess.run([DUMPDEC, src], stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE)
+    err = r.stderr.decode("latin1")
+    if r.returncode == 0:
+        return "%-22s dumpdec decoded it; expected a refusal" % name
+    if "not reconstructed yet" not in err:
+        return "%-22s dumpdec said %r" % (name, err.strip()[-60:])
+
+    dst = os.path.join(BUILD, "dt_j_%s_%s_%d_%d.out.png"
+                       % (name, comps, restart, precision))
+    if os.path.exists(dst):
+        os.remove(dst)
+    r = subprocess.run([PNGOUT, "/force", src, dst], stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE)
+    if os.path.exists(dst):
+        return "%-22s pngout.exe wrote a PNG; expected a refusal" % name
+    if r.returncode == 0 or "not been reconstructed" not in (
+            (r.stdout + r.stderr).decode("latin1")):
+        return "%-22s pngout.exe exit %d" % (name, r.returncode)
+
+    return ("%-22s  ok  (%dx%d %s restart=%d q%d, re-read within %d%s)"
+            % (name, w, h, comps, restart, precision, worst,
+               "" if bound is None else " of %d" % bound))
+
+
 def main():
-    if "--gif" in sys.argv:
+    if "--jpeg" in sys.argv:
+        cases = jpeg_cases()
+        mode = run_jpeg
+        argv = [a for a in sys.argv[1:] if not a.startswith("--")]
+    elif "--gif" in sys.argv:
         cases = gif_cases()
         mode = run_gif
         argv = [a for a in sys.argv[1:] if not a.startswith("--")]
