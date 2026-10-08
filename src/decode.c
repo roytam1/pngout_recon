@@ -2325,15 +2325,15 @@ static int DecodeDds(const unsigned char *data, int size, unsigned char *pixels,
 
     row0 = data + 128;
     {
-        int stride = (code == 1) ? 2 * (int)w : 4 * (int)w;
+        int stride = (code <= 2) ? 2 * (int)w : 4 * (int)w;
 
         for (by = 0; by < (int)h; by += 4) {
             const unsigned char *blkrow =
                 row0 + (size_t)(by / 4) * (size_t)stride;
             for (bx = 0; bx < (int)w; bx += 4) {
                 const unsigned char *blk = blkrow + (size_t)(bx / 4) *
-                    (code == 1 ? 8 : 16);
-                const unsigned char *cb = blk + (code == 1 ? 0 : 8);
+                    (code <= 2 ? 8 : 16);
+                const unsigned char *cb = blk + (code <= 2 ? 0 : 8);
                 unsigned c0 = (unsigned)cb[0] | ((unsigned)cb[1] << 8);
                 unsigned c1 = (unsigned)cb[2] | ((unsigned)cb[3] << 8);
                 unsigned idx = (unsigned)cb[4] | ((unsigned)cb[5] << 8) |
@@ -2382,8 +2382,18 @@ static int DecodeDds(const unsigned char *data, int size, unsigned char *pixels,
 
                         if (code == 1) {
                             aa = A[ci];
-                        } else if (code == 2 || code == 3) {
-                            /* explicit 4-bit alpha, low nibble first */
+                        } else if (code == 2) {
+                            /*
+                             *  DXT2 has no alpha block: transparency is
+                             *  implicit from punch-through (stored c0 <= c1
+                             *  and index 3), everything else opaque.  Colour
+                             *  stays four-colour (the `c0 <= c1` colour test
+                             *  also requires code == 1), only alpha is punched.
+                             */
+                            aa = (c0 <= c1 && ci == 3) ? 0 : 255;
+                        } else if (code == 3 || code == 4) {
+                            /* explicit 4-bit alpha, low nibble first
+                             * (DXT3 and DXT4; DXT5 interpolates below) */
                             unsigned ab = blk[(pi >> 1)];
                             int nib = (pi & 1) ? (ab >> 4) & 15 : ab & 15;
 

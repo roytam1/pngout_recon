@@ -1923,7 +1923,7 @@ shapes and 8, 16, 24 and 32 bits.
 
 ### `sub_40CA70`, GIF (format code 3)
 
-Transcribed and verified with eleven cases in each direction.
+Transcribed and verified with twelve cases in each direction - the twelfth (`g-bit7`) pins the transposed-flag bug by construction: bit 7 set without bit 6, with 6 bytes after the descriptor for the signed skip to eat.  It decodes correctly *only* if those bytes are skipped (repointing the palette at them and clobbering `Pal[0,1]`, which the expectation models); a correct reader would parse them as LZW.  Passing proves the bug is reproduced, not fixed.
 
 **The interlace and local-colour-table flags are transposed.** Two places in the
 function get them the wrong way round, and both are visible in the decompilation
@@ -2890,7 +2890,13 @@ and the JPEG transcription.
 ### `sub_40DD80`, DDS (format code 7)
 
 Transcribed as `DecodeDds()`, 1158 listing lines, and verified pixel-exact
-with six cases in each direction.
+with eight cases in each direction - DXT1/2/3/4/5 and uncompressed32.  DXT2
+(implicit punch-through alpha, no alpha block) and DXT4 (explicit alpha with
+premultiplied colour) exercise the even-code un-premultiply path (`v101[a] =
+`0xFF0000 / a`) that DXT1/3/5 never touch; C-vs-expected is exact on both.
+ImageMagick cannot read DXT2/DXT4 at all (`ImageTypeNotSupported`), so those
+two lack third-party pixels and rely on exact transcription fidelity plus
+structural sanity instead - stated, not hidden.
 
 The front end is as analysed: `ddspf.flags` at +80, DDPF_RGB (0x40) taking an
 uncompressed A8R8G8B32 surface with the four masks exactly, DDPF_FOURCC (0x4)
@@ -2973,13 +2979,13 @@ python tools\decodetest.py --targa      Targa, 12 cases
 python tools\decodetest.py --targa-roundtrip  the same twelve through pngout.exe
 python tools\decodetest.py --bmp        BMP, 6 cases
 python tools\decodetest.py --bmp-roundtrip   the same six through pngout.exe
-python tools\decodetest.py --gif        GIF, 11 cases
-python tools\decodetest.py --gif-roundtrip   the same eleven through pngout.exe
+python tools\decodetest.py --gif        GIF, 12 cases
+python tools\decodetest.py --gif-roundtrip   the same twelve through pngout.exe
 python tools\decodetest.py --jpeg       JPEG, 33 cases (see below)
 python tools\decodetest.py --jpeg-im    the same 33 through ImageMagick,
                                     plus a progressive file it generates
-python tools\decodetest.py --dds        DDS, 6 cases
-python tools\decodetest.py --dds-roundtrip   the same six through pngout.exe
+python tools\decodetest.py --dds        DDS, 8 cases
+python tools\decodetest.py --dds-roundtrip   the same eight through pngout.exe
 ```
 
 `--jpeg` is the odd one out: `sub_40B180` is not transcribed, so there are no

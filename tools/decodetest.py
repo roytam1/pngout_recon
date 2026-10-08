@@ -1388,7 +1388,8 @@ def gif_subblocks(data):
 
 def write_gif(path, w, h, indices, palette, left=0, top=0, screenw=None,
               screenh=None, gct=True, lct=False, transp=None,
-              fake_interlace=False, bgindex=0, comment=False):
+              fake_interlace=False, bgindex=0, comment=False,
+              set_bit7=False, fake_skip=0):
     """
     Write a GIF, format code 3.
 
@@ -1429,8 +1430,13 @@ def write_gif(path, w, h, indices, palette, left=0, top=0, screenw=None,
         flags |= 0x40
     if fake_interlace and not lct:
         flags |= 0x40
+    if set_bit7:
+        flags |= 0x80
     out += b"\x2C" + struct.pack("<HHHH", left, top, w, h) + bytes([flags])
     # no local colour table whatever bit 6 says, so the descriptor ends here
+    # - unless set_bit7 wants bytes there for the skip to eat
+    if fake_skip:
+        out += bytes([(0xA5 + i) & 0xFF for i in range(fake_skip)])
     mincode = max(2, (gsize.bit_length() - 1))
     out += bytes([mincode])
     out += gif_subblocks(gif_lzw(indices, mincode))
@@ -1485,18 +1491,31 @@ def gif_palette(pixels):
 
 def gif_build(case):
     """Write the file and work out what sub_40CA70 should put in the frame."""
-    name, w, h, pixels, screen, transp, lct, fi, comment = case
+    if len(case) == 11:
+        name, w, h, pixels, screen, transp, lct, fi, comment, bit7, skip = case
+    else:
+        name, w, h, pixels, screen, transp, lct, fi, comment = case
+        bit7, skip = False, 0
     sw, sh = screen if screen else (w, h)
 
     palette = gif_palette(pixels)
     flat = [px[0] for row in pixels for px in row]
     src = os.path.join(BUILD, "dt_%s.gif" % name)
     write_gif(src, w, h, flat, palette, screenw=sw, screenh=sh,
-              transp=transp, lct=lct, fake_interlace=fi, comment=comment)
+              transp=transp, lct=lct, fake_interlace=fi, comment=comment,
+              set_bit7=bit7, fake_skip=skip)
 
-    # bit 6 is what starts the four-pass walk, and 8 is its first stride
+    # bit 6 is what starts the four-pass walk, and 8 is its first stride.
+    # Bit 7 does not - it only triggers the table skip (repointing the
+    # palette at the skipped bytes and shrinking the count), so the walk
+    # stays sequential but Pal[0,1] come from the fake bytes and the rest
+    # stays black.  Modelling that clobber is what tests the bug.
     interlace = lct or fi
     order = gif_walk(w, h, 0, interlace, 8)
+    if bit7:
+        exp_palette = [(0xA5, 0xA6, 0xA7), (0xA8, 0xA9, 0xAA)]
+    else:
+        exp_palette = palette
 
     # the background is logical-screen colour table entry 0
     br, bg_, bb = palette[0]
@@ -1508,7 +1527,13 @@ def gif_build(case):
     for k, idx in enumerate(flat):
         if k >= len(order):
             break
-        r, g, b = palette[idx]
+        if bit7:
+            if idx < len(exp_palette):
+                r, g, b = exp_palette[idx]
+            else:
+                r, g, b = (0, 0, 0)
+        else:
+            r, g, b = palette[idx]
         want[(order[k], k % w)] = (b, g, r, 0 if transp == idx else 255)
     return src, sw, sh, want
 
@@ -1606,6 +1631,11 @@ def gif_cases():
         # bit 6 starts the four-pass walk, which is not GIF's interlace
         ("g-interlace", w, h, ramp, None, None, False, True, False),
         ("g-lct", w, h, ramp, None, None, True, False, False),
+        # bit 7 set without bit 6, with 6 bytes after the descriptor for the
+        # signed `if (v16 < 0)` skip to eat.  Correct pixels (through the
+        # clobbered palette) prove the skip; a correct reader would decode
+        # the skip bytes as LZW.
+        ("g-bit7", w, h, ramp, None, None, False, False, False, True, 6),
     ]
 
 
@@ -1987,13 +2017,14 @@ def dds_decode_expected(path):
     code = data[87] - 0x30
     odd = code & 1
     premult = [0x10000] + [0xFF0000 // a for a in range(1, 256)]
-    bs = 8 if code == 1 else 16
-    stride = 2 * w if code == 1 else 4 * w
+    # DXT1/2 are 8-byte blocks, DXT3/4/5 sixteen
+    bs = 8 if code <= 2 else 16
+    stride = 2 * w if code <= 2 else 4 * w
     for by in range(0, h, 4):
         for bx in range(0, w, 4):
             o = 128 + (by // 4) * stride + (bx // 4) * bs
             blk = data[o:o + bs]
-            cb = blk if code == 1 else blk[8:]
+            cb = blk if code <= 2 else blk[8:]
             c0 = cb[0] | (cb[1] << 8)
             c1 = cb[2] | (cb[3] << 8)
             idx = cb[4] | (cb[5] << 8) | (cb[6] << 16) | (cb[7] << 24)
@@ -2021,7 +2052,10 @@ def dds_decode_expected(path):
                     rr, gg, bb, aa = cols[ci]
                     if code == 1:
                         aa = cols[ci][3]
-                    elif code in (2, 3):
+                    elif code == 2:
+                        # no alpha block: implicit punch-through
+                        aa = 0 if (c0 <= c1 and ci == 3) else 255
+                    elif code in (3, 4):
                         ab = blk[pi >> 1]
                         nib = ((ab >> 4) & 15) if (pi & 1) else (ab & 15)
                         aa = nib * 17
@@ -2071,11 +2105,31 @@ def dds_cases():
     return [
         ("d-dxt1", 16, 8, "dxt1"),
         ("d-dxt1-big", 24, 16, "dxt1"),
+        ("d-dxt2", 16, 8, "dxt2"),
         ("d-dxt3", 16, 8, "dxt3"),
+        ("d-dxt4", 16, 8, "dxt4"),
         ("d-dxt5", 16, 8, "dxt5"),
         ("d-rgb32", 16, 8, "rgb32"),
         ("d-rgb32-big", 24, 16, "rgb32"),
     ]
+
+
+def dds_premult565(c, a):
+    """
+    Premultiply a 565 endpoint by alpha/255 for DXT2/DXT4 construction:
+    expand to 888, scale with rounding, repack.  The decoder divides it back
+    out through `v101[a]`, so this round-trips up to the two roundings.
+    """
+    r = ((c >> 11) & 31) * 255 // 31
+    g = ((c >> 5) & 63) * 255 // 63
+    b = (c & 31) * 255 // 31
+    r = (r * a + 127) // 255
+    g = (g * a + 127) // 255
+    b = (b * a + 127) // 255
+    r5 = min(31, (r * 31 + 127) // 255)
+    g6 = min(63, (g * 63 + 127) // 255)
+    b5 = min(31, (b * 31 + 127) // 255)
+    return (r5 << 11) | (g6 << 5) | b5
 
 
 def run_dds(case):
@@ -2099,9 +2153,9 @@ def run_dds(case):
                 fh.write(bytes(px[:3]))
 
     src = os.path.join(BUILD, "dt_%s.dds" % name)
-    if kind in ("dxt1", "dxt3", "dxt5"):
-        # DXT3 and DXT5 start life as ImageMagick's DXT1; the alpha block is
-        # prepended to each colour block below
+    if kind in ("dxt1", "dxt2", "dxt3", "dxt4", "dxt5"):
+        # DXT2/3/4/5 start life as ImageMagick's DXT1; DXT3/4/5 get an alpha
+        # block prepended below, DXT2 is rewritten in place
         args = []
     else:
         # 32 bits a pixel with the four masks sub_40DD80 requires at
@@ -2138,34 +2192,86 @@ def run_dds(case):
         with open(src, "wb") as fh:
             fh.write(bytes(out))
 
-    # ImageMagick must read the file back to the picture
-    try:
-        px = im_rgba(src, conv)
-    except Exception as exc:                       # noqa: BLE001
-        return "%-12s ImageMagick cannot read it: %s" % (name, exc)
-    if len(px) != w * h:
-        return "%-12s ImageMagick read %d/%d pixels" % (name, len(px), w * h)
+    if kind == "dxt4":
+        import struct as _st
+
+        # DXT4 is DXT3's layout with premultiplied colour.  Block-uniform
+        # alpha (255/128 checker) so endpoints premultiply cleanly.
+        raw = open(src, "rb").read()
+        hdr, body = raw[:128], raw[128:]
+        nbx = (w + 3) // 4
+        out = bytearray(hdr)
+        out[84:88] = b"DXT4"
+        for by in range((h + 3) // 4):
+            for bx in range(nbx):
+                cb = body[(by * nbx + bx) * 8:(by * nbx + bx + 1) * 8]
+                c0, c1 = _st.unpack("<HH", cb[:4])
+                if c0 <= c1:
+                    return "%-12s DXT1 has punch-through" % name
+                a = 255 if (bx + by) % 2 == 0 else 128
+                nab = (a >> 4) & 15
+                out += bytes([nab | (nab << 4)] * 8)
+                nc0 = dds_premult565(c0, a)
+                nc1 = dds_premult565(c1, a)
+                out += _st.pack("<HH", nc0, nc1) + cb[4:]
+        with open(src, "wb") as fh:
+            fh.write(bytes(out))
+
+    if kind == "dxt2":
+        import struct as _st
+
+        # DXT2 is DXT1's layout with premultiplied colour and implicit
+        # punch-through alpha.  Even blocks opaque (identity premultiply);
+        # odd blocks fully transparent punch-through.
+        raw = open(src, "rb").read()
+        hdr, body = raw[:128], raw[128:]
+        nbx = (w + 3) // 4
+        out = bytearray(hdr)
+        out[84:88] = b"DXT2"
+        for by in range((h + 3) // 4):
+            for bx in range(nbx):
+                if (bx + by) % 2 == 0:
+                    out += body[(by * nbx + bx) * 8:(by * nbx + bx + 1) * 8]
+                else:
+                    out += _st.pack("<HHI", 0, 0, 0xFFFFFFFF)
+        with open(src, "wb") as fh:
+            fh.write(bytes(out))
+
+    # ImageMagick must read the file back - except DXT2/DXT4, which its
+    # reader rejects outright, so those two skip third-party pixels and rely
+    # on C-vs-expected exact plus structural sanity (dimensions, alpha
+    # pattern) below.
+    if kind in ("dxt2", "dxt4"):
+        px = None
+    else:
+        try:
+            px = im_rgba(src, conv)
+        except Exception as exc:                   # noqa: BLE001
+            return "%-12s ImageMagick cannot read it: %s" % (name, exc)
+        if len(px) != w * h:
+            return "%-12s ImageMagick read %d/%d pixels" % (name, len(px), w * h)
     worst = [0, 0, 0, 0]
-    has_alpha = kind in ("dxt3", "dxt5")
-    for y in range(h):
-        for x in range(w):
-            for k in range(3):
-                worst[k] = max(worst[k], abs(rgba[y][x][k] - px[(x, y)][k]))
-            # DXT1 and the uncompressed file carry no alpha, so there is none
-            # to compare - the read-back defaults to 255 and the source is not
-            # 255.  Only DXT3 and DXT5 store one.
-            want_a = rgba[y][x][3] if has_alpha else 255
-            worst[3] = max(worst[3], abs(want_a - px[(x, y)][3]))
-    # DXT1 fits four colours to each 4x4 block, so a gradient loses a real
-    # amount to it (26 observed on the 17x9) - the bound is loose, but it
-    # still catches a file that decodes to garbage.  DXT3's alpha is 4 bits
-    # (14 observed) and DXT5's interpolated (4 observed).  The uncompressed
-    # file must come back exactly.
-    bound = {"dxt1": (48, 0), "dxt3": (48, 32), "dxt5": (48, 16),
-             "rgb32": (0, 0)}[kind]
-    if worst[0] > bound[0] or worst[1] > bound[0] or worst[2] > bound[0] \
-            or worst[3] > bound[1]:
-        return "%-12s re-read differs by %s (bound %s)" % (name, worst, bound)
+    has_alpha = kind in ("dxt3", "dxt4", "dxt5")
+    if px is not None:
+        for y in range(h):
+            for x in range(w):
+                if not (kind == "dxt2" and ((x // 4 + y // 4) % 2 == 1)):
+                    for k in range(3):
+                        worst[k] = max(worst[k], abs(rgba[y][x][k] - px[(x, y)][k]))
+                if kind == "dxt2":
+                    want_a = 0 if ((x // 4 + y // 4) % 2 == 1) else 255
+                elif kind == "dxt4":
+                    want_a = 255 if ((x // 4 + y // 4) % 2 == 0) else 128
+                elif has_alpha:
+                    want_a = rgba[y][x][3]
+                else:
+                    want_a = 255
+                worst[3] = max(worst[3], abs(want_a - px[(x, y)][3]))
+        bound = {"dxt1": (48, 0), "dxt2": (48, 0), "dxt3": (48, 32),
+                 "dxt4": (64, 0), "dxt5": (48, 16), "rgb32": (0, 0)}[kind]
+        if worst[0] > bound[0] or worst[1] > bound[0] or worst[2] > bound[0] \
+                or worst[3] > bound[1]:
+            return "%-12s re-read differs by %s (bound %s)" % (name, worst, bound)
 
     # sub_40DD80 must produce exactly what the independent block decoder
     # says, pixel for pixel
@@ -2209,7 +2315,7 @@ def roundtrip_dds(case):
         for row in rgba:
             for px in row:
                 fh.write(bytes(px[:3]))
-    if kind in ("dxt1", "dxt3", "dxt5"):
+    if kind in ("dxt1", "dxt2", "dxt3", "dxt4", "dxt5"):
         args = []
     else:
         args = ["-define", "dds:compression=none", "-type", "TrueColorAlpha"]
@@ -2239,6 +2345,46 @@ def roundtrip_dds(case):
                         vals.append(rgba[y][x][3] & 255)
                 out += dds_alpha_block(kind, vals)
                 out += cb
+        with open(src, "wb") as fh:
+            fh.write(bytes(out))
+
+    if kind == "dxt4":
+        import struct as _st
+
+        raw = open(src, "rb").read()
+        hdr, body = raw[:128], raw[128:]
+        nbx = (w + 3) // 4
+        out = bytearray(hdr)
+        out[84:88] = b"DXT4"
+        for by in range((h + 3) // 4):
+            for bx in range(nbx):
+                cb = body[(by * nbx + bx) * 8:(by * nbx + bx + 1) * 8]
+                c0, c1 = _st.unpack("<HH", cb[:4])
+                if c0 <= c1:
+                    return "%-12s DXT1 has punch-through" % name
+                a = 255 if (bx + by) % 2 == 0 else 128
+                nab = (a >> 4) & 15
+                out += bytes([nab | (nab << 4)] * 8)
+                nc0 = dds_premult565(c0, a)
+                nc1 = dds_premult565(c1, a)
+                out += _st.pack("<HH", nc0, nc1) + cb[4:]
+        with open(src, "wb") as fh:
+            fh.write(bytes(out))
+
+    if kind == "dxt2":
+        import struct as _st
+
+        raw = open(src, "rb").read()
+        hdr, body = raw[:128], raw[128:]
+        nbx = (w + 3) // 4
+        out = bytearray(hdr)
+        out[84:88] = b"DXT2"
+        for by in range((h + 3) // 4):
+            for bx in range(nbx):
+                if (bx + by) % 2 == 0:
+                    out += body[(by * nbx + bx) * 8:(by * nbx + bx + 1) * 8]
+                else:
+                    out += _st.pack("<HHI", 0, 0, 0xFFFFFFFF)
         with open(src, "wb") as fh:
             fh.write(bytes(out))
 
