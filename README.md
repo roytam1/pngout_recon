@@ -2043,11 +2043,12 @@ Everything else in the range - `0xC3`, `0xC5`..`0xC8`, `0xC9`..`0xCF`, `0xCC`,
 is **no** arithmetic coding (`0xC9`..`0xCB`) and **no** lossless (`0xC3`), and
 `0xC8` (JPG extensions) is skipped rather than parsed.
 
-**`0xC2` is progressive JPEG and is handled exactly like `0xC0` and `0xC1`** -
-one arm, cases 192-194, with nothing in it that distinguishes them. A progressive
-file has multiple scans, spectral selection and successive approximation, and its
-SOS segments do not carry the three parameters this code reads, so a progressive
-file is fed to a sequential decoder. Worth pinning with a test.
+**`0xC2` is progressive JPEG and shares the arm with `0xC0` and `0xC1` - and
+that is correct, not a bug.** I wrote the opposite in the commit that introduced
+this section. SOF0, SOF1 and SOF2 have *identical* layouts; only the marker
+differs, so there is nothing for the arm to distinguish, and the work that
+progressive needs is done later, in SOS. See the buffering branch below: it keys
+off exactly the three parameters a progressive scan varies.
 
 **The SOF parse is correct, but `inc ebx` at `0x40B262` is what makes it so.**
 The marker loop leaves `ebx` on the byte *after* the two length bytes, which is
@@ -2171,6 +2172,94 @@ brings a flat picture at an odd width back exactly.
 So the corpus is ready and the entropy body can be transcribed against it. What
 is still missing is a **progressive** file to pin the `0xC2` behaviour down; that
 needs a second scan encoder, which `jpeglib` does not have.
+
+#### The entropy body, and two helpers that make it tractable
+
+`sub_40B180` calls only four things: `sub_409540` (Swap16), `sub_40C580` (the
+one-time init above), and `sub_40C700` and `sub_40C790`. Those last two are the
+whole of the decode inner loop, and both are recognisable.
+
+**`sub_40C790` is the IDCT, and it is the AAN scaled integer transform.** It takes
+a pointer to 64 dwords and a shift count, and works in place: eight iterations
+handling a row each, guarded by `(shift & 1) != 0` with `shift >>= 1` after
+each, then eight iterations over the columns. The four multiply constants are
+recognisable once they are divided by 2^30:
+
+| literal | / 2^30 | |
+|---|---|---|
+| `1518500224` | 1.41421356 | sqrt(2) |
+| `1984016192` | 1.84775907 | 2 cos(pi/16) |
+| `1402911296` | 1.30656296 | |
+| `1162209792` | 1.08239220 | the row pass's c5 |
+
+Those are the Arai/Agui-Nakajima scale factors to eight digits, so this is the
+standard AAN butterfly rather than something of Ken Silverman's own devising.
+The caller supplies the shift and does the final scaling and level shift. This is
+worth knowing because it is a table-free transform: there is nothing here to
+mis-transcribe beyond the arithmetic, and the constants can simply be written as
+the literal 64-bit products they are.
+
+**`sub_40C700` is one Huffman symbol**, taken a bit at a time:
+
+```c
+v5 = dword_410154[a2];              /* the byte, a2 the bit index */
+result = (a3 & v5) != 0;            /* the next bit, a3 the mask */
+v7 = 1;                             /* the code length so far */
+while (result >= *((_DWORD *)&unk_18D9FB0 + 20 * a1 + v7)) {
+    v5 >>= 1;
+    result *= 2;
+    if ((v5 & a3) != 0) ++result;   /* shift the code in */
+    if (++v7 > 16) { *a5 = 16; *a4 = 0; return result; }
+}
+*a5 = v7;
+v8 = byte_18E0898[256 * a1 + dword_18DB4C0[20 * a1 + v7] + result];
+*a4 = v8;
+```
+
+`a1` is the table, `a2` the bit position, `a3` the bit mask; `*a4` comes back as
+the symbol and `*a5` as its length. The per-length table it compares against is
+the one DHT built - `unk_18D9FB0` and `dword_18D9FB4` are the same array under
+two names, four bytes apart, the same thing that happened with the CRC table.
+The 20-byte stride is the DHT slot size, and the symbol index is
+`base[length] + code` with `code` the accumulated value, so the stored per-length
+value has the two folded together.
+
+`dword_410154` is the bit stream, `byte_190A825` the bit position (set to 8 in
+the prologue, so MSB-first out of the byte), and `byte_190A824` set to 2 when the
+scan has more than one component, i.e. when the data is interleaved.
+
+#### The SOS arm, and what it says about progressive
+
+`case 218` refuses outright if the width or height is zero, reads the scan's
+component count into `unk_18FA1BC` and each component's id plus its DC and AC
+table selectors, and then reads `Ss`, `Se` and `Ah`/`Al`. Those three are where
+the progressive question is answered, and it is answered *here*, not in the SOF
+arm:
+
+```c
+if (!restart_interval && (Ss || Se != 63 || (AhAl >> 4) || (AhAl & 0xF))) {
+    /* buffer the whole image */
+    ...  v58 = sum over components of (blocks_across * blocks_down);
+    v9 = malloc(v58 << 7);          /* 128 bytes a block: 8x8 16 bit samples */
+    memset(v9, 0, v58 << 7);
+    v201[i + 32] = (int)v9 + 128 * running;
+}
+```
+
+So a scan that is *not* a full sequential one, and has no restart interval to
+resynchronise on, decodes into an interleaved block buffer first. That is
+precisely the progressive case, so progressive input is at least partly
+supported after all - which is why the shared SOF arm is not a defect. With a
+restart interval the decoder streams instead, and with a plain sequential scan
+neither branch is taken.
+
+The buffer's geometry is worth recording because it is where the MCU sizes come
+from: `v60 = (width + 8 * hmax - 1) >> (hmax_idx + 3)` and likewise for the
+height, i.e. the MCU count shifted by the sampling index plus three (three being
+half a block, so the edges are rounded up to a half-block). Each scan component
+is then matched against the SOF components by id, and given its block cursor,
+its sampling factors and its quantisation table selector, with the MCU edges
+`v188 - h_idx + 3` and `vmax - v_idx + 3`.
 
 ### `sub_40DD80`, DDS (format code 7) — analysed, not transcribed
 
