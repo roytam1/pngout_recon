@@ -2510,12 +2510,17 @@ blocks, and the per-format block sizing. Nothing has been transcribed yet, but t
 files could not be written by anything in the tree - is gone. ImageMagick
 writes DXT1 (its default, and it ignores requests for DXT3/DXT5) and
 uncompressed 32-bit with `-type TrueColorAlpha`, which gives exactly the four
-masks `0x40DDAA` requires. `python tools/decodetest.py --dds` runs four cases
-over those two, generated and read back by ImageMagick itself, sized and
-refused cleanly. DXT3 and DXT5 are still ungenerated: their colour blocks are
-ImageMagick's DXT1 with an alpha block prepended, which is straightforward but
-not yet done, and wants its own validation pass through ImageMagick's reader
-before it counts as corpus.
+masks `0x40DDAA` requires. DXT3 and DXT5 start life as ImageMagick's DXT1 with
+an 8-byte alpha block prepended to each colour block - explicit 4-bit nibbles
+for DXT3, two endpoints plus 48 bits of 3-bit indices for DXT5 with the
+endpoints ordered max-then-min so the eight-value interpolation is used - and
+both are validated through ImageMagick's own reader before they count as
+corpus (RGB within the DXT1 bound, alpha within 14 for DXT3 and 4 for DXT5).
+`python tools/decodetest.py --dds` runs six cases over the four, generated
+and read back by ImageMagick itself, sized and refused cleanly. The colour
+half of a DXT3/5 file must be four-colour throughout, so the builder refuses
+a punch-through block rather than extending it - which an opaque source never
+produces anyway.
 
 ### Still to do inside DecodeImage
 
