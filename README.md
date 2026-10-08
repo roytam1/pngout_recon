@@ -2388,6 +2388,46 @@ extend, the progressive refinement with EOB runs, the AAN transform in
 everything it needs - and the pieces that were hardest to pin down turned out to
 be standard, which is the best possible outcome for a transcription.
 
+#### The one thing still missing: who fills the colour tables
+
+`sub_408D80` reads four tables - `dword_18CDF70`, `dword_18CDF74`,
+`dword_18D635C`, `dword_18D6358` - and nothing in `reference\text.lst` ever
+writes any of them. That is worth stating carefully, because it is the one thing
+standing between here and the transcription.
+
+What was checked:
+
+* All four are `.bss` (`_globals.c` lists them uninitialised, `// weak` with no
+  initialiser), so they are zero on entry.
+* Searching the listing for those four names gives **twelve hits and all twelve
+  are reads**, all inside `sub_408D80` at `0x408F1A`..`0x40918E`.
+* There are **no direct writes** anywhere: no `mov dword_18CDF70, ...` and no
+  `[dword_18CDF70 + ...]` store.
+* The listing is not missing the writer. It runs continuously from `0x401000` to
+  `0x40E600` with only two gaps, `0x40E456..0x40E566` (272 bytes, a library stub
+  past the last function at `0x40E584`) and `0x40E5B8..0x40E600`. Nothing of
+  consequence is absent.
+
+So the fill has to go through a **register-held pointer**, which is why no address
+literal appears for it. Two further hints that IDA's naming here is unreliable,
+and the reason I am not going to reconstruct these by guesswork:
+
+* The listing indexes them as `dword_18D635C[eax*4]` and `dword_18CDF70[edx*4]`
+  while `_globals.c` types the same symbols as `int ...[]` with no scale. The two
+  cannot both be right, so these are splits of one array IDA could not type - the
+  same situation as `byte_40C560`/`jpt_40B25B` and the CRC table, where one
+  object had two names.
+* `off_4110D8`, the eight-entry scaling table DQT indexes, is not an array either
+  but `&unk_16A09E6`, a pointer into the `.rdata` blob.
+
+The consequence for the work: the IDCT, the bit reader, the Huffman tables, the
+progressive refinement, the marker walk, the upsampling and the *shape* of the
+colour conversion are all known, and every one of them is standard. What is not
+known is the contents of four tables that hold `Y + k*Cr` and `Y + k*Cb` folded
+into addresses. Transcribing `sub_408D80` without them would mean inventing the
+colour conversion, which is the one thing this reconstruction is not allowed to do
+- so the next pass traces the pointer in the listing instead.
+
 ### `sub_40DD80`, DDS (format code 7) — analysed, not transcribed
 
 1158 listing lines, 1705 bytes. Not transcribed yet. The front end is short and
