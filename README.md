@@ -2492,6 +2492,31 @@ addresses), and not in `reference/data.lst` either - so it fills through a
 register-held pointer somewhere, and tracing that pointer is the remaining job.
 Everything else about the decoder is known, standard, and has its values.
 
+#### `sub_40C580` replicates exactly - three of the six colour tables are known-good
+
+The one-time init was reimplemented in Python from its decompilation and every
+table it builds checks out, which matters because three of them feed the colour
+conversion directly:
+
+* the zigzag `dword_18DF780[64]` comes out **identical to Annex K** - all 64
+  entries, built by the same seven-anti-diagonal walk;
+* the inverse `dword_18DB758` is consistent both ways, and `byte_18EDF1[k] =
+  1 << (zigzag[k] >> 3)` follows;
+* `dword_18DF888` maps `0..127 -> 128..255` and `896..1023 -> 0..127`, and the
+  two fixed-point conversions `dword_18E90A0[i] = v << 8` and
+  `dword_18DC4D8[i] = (v - 256) << 16` replicate cleanly;
+* the IDCT basis fills 2048 entries from the four progressions as written.
+
+So `T0 = dword_18DF888`, `T1 = dword_18DC4D8`, `T2 = dword_18E90A0` are known
+quantities. The colour equation `T0[(Y+A[cr])>>22] + T1[(Y+B[cb])>>22] +
+T2[(Y+C[cr]+D[cb])>>22]` therefore has only the four address tables unknown,
+and those must be `k * chroma` for small integer `k`. That is a fittable
+problem: transcribe the decoder with those four as parameters, solve for them
+against ImageMagick on the corpus, and either recover the standard
+coefficients (confirming them) or discover PNGOUT's own (still correct for
+PNGOUT). The form is known from the code structure; only the constants are
+fitted, and a failed fit would say the form itself is wrong.
+
 #### All forty-seven stores in `sub_40B180` are accounted for - and it is not there either
 
 Forty-seven distinct store targets in `0x40B180..0x40C542`, and the only
