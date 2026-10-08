@@ -2228,6 +2228,18 @@ next piece, with the bit-reader/Huffman/extend helpers already drafted
 (`JpegBit`, `JpegHuffSym`, `JpegExtend`) awaiting the block decoder that
 calls them.
 
+#### The colour equation replicates - zero tables give structured grey
+
+Replicated `T0[(Y+A)>>22] + T1[(Y+B)>>22] + T2[(Y+C+D)>>22]` in Python with
+the verified `T0/T1/T2` and zero address tables, fed flat mid-grey
+(`Y = 128<<19`): out comes `(144, 144, 144, 255)`. Correct shape - grey plus
+opaque alpha, from three table lookups summing to BGRA - off by 16 levels.
+So the equation form is right and the four tables are small corrections, not
+zeroes; flat greys at several levels give equations for `A0/B0/C0/D0`
+(the tables at chroma index 0, the only entries grey touches), which is how
+those four get determined without guessing. Colour needs the full tables;
+grey needs just those four.
+
 #### `sub_40C790` is transcribed and verified (`JpegIdct`)
 
 The AAN integer IDCT is now C, variable for variable with the decompilation,
