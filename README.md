@@ -2228,6 +2228,22 @@ next piece, with the bit-reader/Huffman/extend helpers already drafted
 (`JpegBit`, `JpegHuffSym`, `JpegExtend`) awaiting the block decoder that
 calls them.
 
+#### Index advance is per-pixel for 1:1, paired for 2:1 (`sar edi,1`)
+
+The listing at `0x408FF0` shows the index computation directly, correcting
+the decompiler's rendering: `mov ecx,[esi+ecx*4]` / `mov eax,[esi+ecx*4+100h]`
+where `ecx = edi>>1` (`sar ecx,1`), then `sar ...,19` / `and ...,0FFFFFFFEh`,
+then `dword_18CDF70[ecx*4]` / `dword_18D635C[eax*4]` etc. So both indices come
+from one base (`esi`) 256 bytes apart, and the `>>1` pairs them: pixels
+`(0,1)` share an index, `(2,3)` share, and so on. That is horizontal
+subsampling (two luma pixels per chroma sample), i.e. the `h=2` path - for
+`h=1` (4:4:4, greyscale) there is no pairing and indices advance per pixel.
+This validates the per-pixel assumption behind the red/grey solves (all
+`h=1` files), and means the slope fit must pair indices for `4:2:2`/`4:2:0`
+but not for `4:4:4`. The `+100h` is 64 dwords (256 bytes) ahead, confirming
+the decompiler's `v15[64]` was right about the offset but wrong to imply two
+bases - it is one base, two offsets.
+
 #### Colour slopes blocked on plane mapping; B~747M contradiction proves result != Cb
 
 Red flat (`Y=-218103808`, want `(254,1,0)`) forces `B ~ +747M` via
