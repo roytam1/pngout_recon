@@ -2018,6 +2018,119 @@ edge. There is a fast path at `0x40CC1D` for the image at 0,0 exactly filling th
 screen that skips the fill entirely, so the cases include a screen larger than
 the image to exercise the other path.
 
+### `sub_40B180`, JPEG (format code 2)
+
+3491 listing lines, 36 666 characters of decompilation - about twice GIF. The
+front end is worked through below so the transcription pass starts from facts.
+The entropy body (`case 218`, 19 000 of those characters) is not transcribed.
+
+**The marker dispatch is a two-step table.** `0x40B245` does `sub eax, 0C0h` and
+`0x40B24A` `cmp eax, 1Dh`, so the range is `0xC0`..`0xDD` and anything outside
+goes to `def_40B25B`; inside, `byte_40C560` maps the offset to a handler index and
+`jpt_40B25B` dispatches on that. Seven markers are handled:
+
+| marker | arm | what it does |
+|---|---|---|
+| `0xC0` `0xC1` `0xC2` | `0x40B262` | SOF0, SOF1 **and SOF2** |
+| `0xC4` | `0x40B3C8` | DHT |
+| `0xD9` | - | EOI |
+| `0xDA` | `0x40B4..` | SOS and the entropy-coded body |
+| `0xDB` | - | DQT |
+| `0xDD` | - | DRI |
+
+Everything else in the range - `0xC3`, `0xC5`..`0xC8`, `0xC9`..`0xCF`, `0xCC`,
+`0xDC` - falls to the default, which is `v10 += v15`: skip the segment. So there
+is **no** arithmetic coding (`0xC9`..`0xCB`) and **no** lossless (`0xC3`), and
+`0xC8` (JPG extensions) is skipped rather than parsed.
+
+**`0xC2` is progressive JPEG and is handled exactly like `0xC0` and `0xC1`** -
+one arm, cases 192-194, with nothing in it that distinguishes them. A progressive
+file has multiple scans, spectral selection and successive approximation, and its
+SOS segments do not carry the three parameters this code reads, so a progressive
+file is fed to a sequential decoder. Worth pinning with a test.
+
+**The SOF parse is correct, but `inc ebx` at `0x40B262` is what makes it so.**
+The marker loop leaves `ebx` on the byte *after* the two length bytes, which is
+the precision byte, so the SOF arm increments once and then reads the height as
+a word at `+0`, the width as a word at `+2` and the component count as a byte at
+`+4`, both words through `Swap16`. The decompiler renders that increment as
+`v16 = v10 + 1` with `v16 = v10 + 1` then `*(_WORD *)v16` for the height, which
+reads as though the fields were all one byte early; they are not, and the extra
+`+5` lands on the first component's id. Per component, three bytes:
+
+* the component id, into `dword_18DC1A0[i]`
+* the sampling byte, high nibble horizontal into `dword_18DEE68[i]`, low nibble
+  vertical into `dword_18DA244[i]`
+* the quantisation table selector, into `dword_18FA0A8[i]`
+
+Each sampling factor is then mapped through an eight entry table at
+`dword_410158` by a linear scan - `0x40B350`: `cmp esi, dword_410158[ecx*4]`,
+`jz`, `inc ecx`, `cmp ecx, 8`, `jl` - and the *index found* is stored, in
+`dword_18DE9D8[i]` horizontally and `dword_18DEE30[i]` vertically, not the value.
+The maxima of the two are tracked across components (`v190`/`v188`,
+`v191`/`v189`), and once the marker loop has ended each component's factors are
+scaled: `dword_18CBF58[i] = h`, `dword_18DEE68[i] = 8 * h`,
+`dword_18DA244[i] = 8 * v`, and the MCU edges `v201[i] = v188 - idx + 3`,
+`v201[i + 4] = v189 - idx + 3`.
+
+**A defect in the DHT index.** `0x40B3D4` computes the table's index as
+
+```
+index = spec < 0x10 ? spec : spec - 0x0C
+```
+
+where `spec` is the `Tc << 4 | Th` byte. DC tables (`Tc = 0`) get slots 0..15 and
+AC tables (`Tc = 1`) get slots **4..7**, so AC0 aliases DC4 and AC1 aliases DC5.
+It should be `- 0x10`. In practice it is harmless, because a JPEG has at most
+four components so DC4..DC7 are never defined - the aliased slots are always
+dead. A file that did define DC4 would be silently corrupted. In the original,
+and reproduced.
+
+The DHT body puts the sixteen count bytes into a twenty byte slot
+(`unk_18CFF81 + 20 * index`, copied as four dwords), then walks lengths 1..16
+building three things per length: the cumulative symbol table
+(`dword_18D9FB4`), the start index for that length (`dword_18DB4C4`, the running
+total minus the cumulative), and the symbols themselves, `memcpy`'d to
+`byte_18E0898`. It also expands a ten bit fast table, `dword_18EA0A8` holding the
+code length and `dword_18F20A8` the symbol, with the shift count counting down
+from 9 - the usual look-ahead table.
+
+**The DQT builds fixed-point tables, not standard ones.** The precision is
+`spec >> 4`, and 16 bit entries are read big-endian. Each value is shifted left
+19 (`v47 << 19`) and then put through *two* further scalings, chosen by two fields
+of `*dword_18DF780` - three bits and five bits - indexing the table `off_4110D8`,
+each a 64-bit multiply shifted back down by 24. So the quantised coefficients go
+straight into whatever representation PNGOUT's own IDCT wants, and the standard
+`q * x` integer scaling is nowhere to be seen.
+
+`0xDD` is one swapped word, the restart interval.
+
+**`sub_40C580` is a one-time init, guarded by `dword_190A1D4`** (`0x40B192`, and
+`0x40B1A2` sets it). It is the part that says PNGOUT has a decoder of its own:
+
+* the **zigzag order** `dword_18DF780[64]`, built by walking the seven
+  anti-diagonals and alternating direction - `for i = 0, 2, ... 14` with
+  `v3 = i + 49` stepping down by 7 and `v5 = i + 1` stepping up by 7 - and the
+  **inverse zigzag** `dword_18DB758[64]` filled backwards (`for j = 63..0`).
+* `byte_18EDF1[64] = 1 << (dword_18DF780[k] >> 3)`, which is where the DQT's two
+  field reads come from.
+* `dword_18DF888[128 + m] = m` and `[896 + n] = n`, a level-to-magnitude pair of
+  ranges, and the two fixed-point conversions `dword_18E90A0[i] = v << 8` and
+  `dword_18DC4D8[i] = (v - 256) << 16`.
+* the IDCT's cosine basis, `dword_18CBF70/74` and `dword_18D4358/5C` filled from
+  four arithmetic progressions stepping by `1470104`, `1858077`, `-360857` and
+  `-748830`, two entries at a time.
+* `memset32(&unk_18DFA88, 255, 0x180)`, `memset(&unk_18E0088, 0, 0x600)` and
+  `memset(&unk_18D8D58, 0, 0x200)`.
+
+So the IDCT is an integer one with its own basis tables, not a scaled AAN. The
+`.bss` this decoder alone needs runs from `unk_18CFF81` to `unk_18FA1BC`.
+
+Verifying it needs a corpus the tree does not have: baseline 4:4:4, 4:2:2 and
+4:2:0, greyscale, a restart interval, 16 bit quantisation tables, and a
+progressive file to pin the `0xC2` behaviour down. Unlike DDS, these are
+generatable - the encoder side is the hard part, not the corpus.
+
 ### `sub_40DD80`, DDS (format code 7) — analysed, not transcribed
 
 1158 listing lines, 1705 bytes. Not transcribed yet. The front end is short and
