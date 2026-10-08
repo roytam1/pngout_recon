@@ -412,11 +412,15 @@ def write_jpeg(path, w, h, rgb, comps="444", restart=0, precision=8):
     out = bytearray(b"\xFF\xD8")
     out += _segment(0xE0, b"JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00")
     for i, q in enumerate(quant):
+        # DQT entries go in zigzag order, not natural row-major - writing
+        # them natural misplaces every value past the second, which a strict
+        # reader (like sub_40B180, which indexes the store by zigzag) puts in
+        # the wrong band.
         if precision == 8:
-            body = bytes([i]) + bytes(q[k] for k in range(64))
+            body = bytes([i]) + bytes(q[ZIGZAG[k]] for k in range(64))
         else:
             body = bytes([(1 << 4) | i])
-            body += b"".join(struct.pack(">H", q[k]) for k in range(64))
+            body += b"".join(struct.pack(">H", q[ZIGZAG[k]]) for k in range(64))
         out += _segment(0xDB, body)
     # the frame header's sample precision is always 8 - baseline JPEG has no
     # other, and libjpeg rejects "Unsupported JPEG data precision 16".  It is
@@ -545,7 +549,7 @@ def read_jpeg(path):
                         i += 1
                 q = [0] * 64
                 for k in range(64):
-                    q[k] = tbl[ZIGZAG[k]]
+                    q[ZIGZAG[k]] = tbl[k]
                 quant[tq] = q
         elif m == 0xC4:
             i = 0

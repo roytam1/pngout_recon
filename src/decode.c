@@ -2480,6 +2480,262 @@ static int DecodeDds(const unsigned char *data, int size, unsigned char *pixels,
     return 0;
 }
 
+/* ------------------------------------------------------------------ */
+/*  sub_40B180: JPEG, format code 2 - front end only                  */
+/* ------------------------------------------------------------------ */
+
+/*
+ *  The marker walk, SOF, DQT, DHT and DRI - everything before the
+ *  entropy-coded scan.  The scan itself (case 218's body), the IDCT and the
+ *  colour conversion are not transcribed yet, so this returns -1 after
+ *  parsing; it exists so the front end can be verified against the corpus
+ *  before the entropy body goes in.
+ *
+ *  Two things are deliberately not reproduced yet:
+ *  - the sampling-factor to index map through dword_410158, which has no
+ *    definition in the reference material.  The raw factors are kept and
+ *    the indices left for the full decode.  (A table of 1..8 would serve
+ *    for the corpus, but that is a guess, not a transcription.)
+ *  - the colour tables (see the JPEG section in README.md).
+ */
+
+/* PNGOUT's fixed-point DQT scalings, from reference/data.lst */
+static const int JpegScale[8] = {
+    0x16A09E6, 0x163150B, 0x14E7AE9, 0x12D062F,
+    0x1000000, 0x0C9234E, 0x08A8BD4, 0x046A157
+};
+
+/* Annex K zigzag, verified identical to what sub_40C580 builds */
+static const unsigned char JpegZigzag[64] = {
+     0,  1,  8, 16,  9,  2,  3, 10,
+    17, 24, 32, 25, 18, 11,  4,  5,
+    12, 19, 26, 33, 40, 48, 41, 34,
+    27, 20, 13,  6,  7, 14, 21, 28,
+    35, 42, 49, 56, 57, 50, 43, 36,
+    29, 22, 15, 23, 30, 37, 44, 51,
+    58, 59, 52, 45, 38, 31, 39, 46,
+    53, 60, 61, 54, 47, 55, 62, 63
+};
+
+typedef struct JpegComp {
+    unsigned id, hsamp, vsamp, qsel;
+} JpegComp;
+
+typedef struct JpegHuff {
+    unsigned char counts[16];
+    unsigned char vals[256];
+    int nvals;
+    /* PNGOUT's derived tables, per the DHT arm */
+    int first[16];                  /* cumulative count per length */
+    int base[16];                   /* start index per length */
+    unsigned char syms[256];        /* symbols in length order */
+    int fastlen[1024];              /* 10-bit look-ahead: length */
+    int fastsym[1024];              /* 10-bit look-ahead: symbol */
+    int nfast;                      /* slots filled (v200) */
+} JpegHuff;
+
+static unsigned JpegWidth, JpegHeight, JpegNComp, JpegRestart;
+static JpegComp JpegComps[4];
+static int JpegQuant[4][64];        /* fixed-point, zigzag order */
+static JpegHuff JpegHuffs[8];       /* slots 0..3 DC, 4..7 AC (spec-12) */
+
+static unsigned JpegGet16(const unsigned char **pp)
+{
+    unsigned v = ((unsigned)(*pp)[0] << 8) | (*pp)[1];
+
+    *pp += 2;
+    return v;
+}
+
+/*
+ *  0x40B3C8: one DHT table.  `spec` is Tc<<4|Th; the slot is `spec` for
+ *  DC and `spec - 12` for AC (0x40B3D4: `cmp al, 10h` / `sub eax, 0Ch`),
+ *  so AC0 lands in slot 4.  In the original and reproduced.
+ */
+static void JpegDHT(JpegHuff *t, const unsigned char *counts,
+                    const unsigned char *vals)
+{
+    int i, len, k = 0, total = 0, run = 0;
+
+    for (i = 0; i < 16; i++) {
+        t->counts[i] = counts[i];
+        total += counts[i];
+    }
+    for (i = 0; i < total && i < 256; i++)
+        t->vals[i] = vals[i];
+    t->nvals = total;
+
+    /* cumulative counts and start indices, then the symbols in order */
+    for (len = 1; len <= 16; len++) {
+        t->first[len - 1] = run + counts[len - 1];
+        t->base[len - 1] = run;
+        run += counts[len - 1];
+    }
+    k = 0;
+    for (len = 1; len <= 16; len++) {
+        int c;
+
+        for (c = 0; c < counts[len - 1]; c++, k++)
+            t->syms[k] = t->vals[k];
+    }
+
+    /* the 10-bit fast table: each symbol of length L gets 2^(10-L) slots */
+    t->nfast = 0;
+    {
+        int pos = 0, L, c2;
+
+        for (L = 1; L <= 16; L++) {
+            int span = (L <= 10) ? (1 << (10 - L)) : 0;
+
+            for (c2 = 0; c2 < counts[L - 1]; c2++) {
+                int s;
+
+                for (s = 0; s < span && pos < 1024; s++, pos++) {
+                    t->fastlen[pos] = L;
+                    t->fastsym[pos] = t->syms[t->base[L - 1] + c2];
+                }
+            }
+        }
+        t->nfast = pos;
+    }
+}
+
+/* unsigned __int64 for VC6 (no `long long`) */
+typedef unsigned __int64 u64;
+
+static void JpegDQT(int tq, int prec, const unsigned char *data)
+{
+    int k;
+
+    for (k = 0; k < 64; k++) {
+        unsigned v;
+        u64 scaled;
+        int zz = JpegZigzag[k];
+
+        if (!prec) {
+            v = data[k];
+        } else {
+            v = ((unsigned)data[2 * k] << 8) | data[2 * k + 1];
+        }
+        scaled = (u64)v << 19;
+        if (zz & 7)
+            scaled = ((u64)(unsigned)JpegScale[zz & 7] * scaled) >> 24;
+        if (zz >> 3)
+            scaled = ((u64)(unsigned)JpegScale[zz >> 3] * scaled) >> 24;
+        JpegQuant[tq][zz] = (int)scaled;
+    }
+}
+
+static int DecodeJpeg(const unsigned char *data, int size,
+                      unsigned char *pixels, int pitch,
+                      unsigned int width, unsigned int height,
+                      int xorigin, int yorigin)
+{
+    const unsigned char *p, *end;
+    unsigned marker, seglen;
+
+    (void)size; (void)pixels; (void)pitch;
+    (void)width; (void)height; (void)xorigin; (void)yorigin;
+
+    OutColType = 2;
+    OutBitDepth = 8;
+
+    if (data[0] != 0xFF || data[1] != 0xD8)
+        return -1;
+
+    p = data + 2;
+    end = data + size;
+    JpegRestart = 0;
+
+    for (;;) {
+        /* skip fill bytes */
+        while (p < end && *p == 0xFF)
+            p++;
+        if (p >= end)
+            return -1;
+        marker = *p++;
+        if (marker == 0xD9)
+            break;                          /* EOI */
+        if (marker == 0xDA)
+            break;                          /* SOS: entropy body not yet */
+        if (marker == 0x01 || (marker >= 0xD0 && marker <= 0xD7))
+            continue;                       /* no length: TEM, RSTn */
+        if (p + 2 > end)
+            return -1;
+        seglen = JpegGet16(&p);
+        /* Markers outside 0xC0..0xDD (APPn, COM, ..) fall to the default
+         * arm, which skips by the length - 0x40B245 `ja def_40B25B`. */
+
+        if (seglen < 2 || p + seglen - 2 > end)
+            return -1;
+
+        if (marker >= 0xC0 && marker <= 0xC2) {
+            /* SOF0/1/2: precision, height, width, components */
+            unsigned prec, h, w, nc, i;
+
+            p++;                            /* precision (always 8) */
+            h = JpegGet16(&p);
+            w = JpegGet16(&p);
+            nc = *p++;
+            JpegWidth = w;
+            JpegHeight = h;
+            JpegNComp = nc;
+            if (nc > 4)
+                return -1;
+            for (i = 0; i < nc; i++) {
+                JpegComps[i].id = *p++;
+                JpegComps[i].hsamp = (*p >> 4) & 15;
+                JpegComps[i].vsamp = *p & 15;
+                p++;
+                JpegComps[i].qsel = *p++;
+            }
+            (void)prec;
+        } else if (marker == 0xC4) {
+            /* DHT: one or more tables */
+            const unsigned char *q = p;
+            const unsigned char *segend = p + seglen - 2;
+
+            while (q < segend) {
+                unsigned spec = *q++;
+                unsigned tc = (spec >> 4) & 15, th = spec & 15;
+                unsigned slot = (spec < 0x10) ? spec : spec - 12;
+                int total = 0, i;
+
+                if (slot > 7)
+                    return -1;
+                for (i = 0; i < 16; i++)
+                    total += q[i];
+                JpegDHT(&JpegHuffs[slot],
+                        q, q + 16);
+                (void)tc; (void)th;
+                q += 16 + total;
+            }
+            p += seglen - 2;
+        } else if (marker == 0xDB) {
+            /* DQT: one or more tables */
+            const unsigned char *q = p;
+            const unsigned char *segend = p + seglen - 2;
+
+            while (q < segend) {
+                unsigned spec = *q++;
+                unsigned prec = (spec >> 4) & 15, tq = spec & 15;
+
+                if (tq > 3)
+                    return -1;
+                JpegDQT((int)tq, (int)prec, q);
+                q += prec ? 128 : 64;
+            }
+            p += seglen - 2;
+        } else if (marker == 0xDD) {
+            JpegRestart = JpegGet16(&p);
+        } else {
+            p += seglen - 2;                /* skip anything else */
+        }
+    }
+
+    return -1;                              /* entropy body not yet */
+}
+
 int DecodeImage(unsigned char *fileimg, int filesize, unsigned char *pixels,
                 int pitch, unsigned int width, unsigned int height,
                 int unused7, int unused8)
@@ -2490,11 +2746,15 @@ int DecodeImage(unsigned char *fileimg, int filesize, unsigned char *pixels,
     /*
      *  sub_409560's dispatch, in its order.  The format codes it returns are
      *  1 PNG, 2 JPEG, 3 GIF, 4 the 8bpp palette below, 5 BMP, 6 PCX, 7 DDS and
-     *  8 Targa; of those 1, 3, 4, 5, 6, 7 and 8 are transcribed.
+     *  8 Targa; of those 1, 3, 4, 5, 6, 7 and 8 are transcribed (2 parses only).
      */
     if (fileimg && filesize >= 2) {
         if (fileimg[0] == 0x89 && fileimg[1] == 'P')
             return DecodePng(fileimg, filesize, pixels, pitch, width, height);
+
+        if (fileimg[0] == 0xFF && fileimg[1] == 0xD8)
+            return DecodeJpeg(fileimg, filesize, pixels, pitch, width, height,
+                              unused7, unused8);
 
         if (fileimg[0] == 0x19 && fileimg[1] == 0x91 &&
             fileimg[10] == 8 && fileimg[11] == 0)

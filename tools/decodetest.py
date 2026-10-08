@@ -1724,8 +1724,13 @@ def run_jpeg(case):
                        stderr=subprocess.PIPE)
     if os.path.exists(dst):
         return "%-22s pngout.exe wrote a PNG; expected a refusal" % name
-    if r.returncode == 0 or "not been reconstructed" not in (
-            (r.stdout + r.stderr).decode("latin1")):
+    # While only the front end is wired (it returns -1), pngout reports
+    # "unsupported format"; before wiring it said "not been reconstructed".
+    # Either is a clean refusal.  Once the entropy body lands this becomes
+    # a pixel check instead.
+    out = (r.stdout + r.stderr).decode("latin1")
+    if r.returncode == 0 or ("not been reconstructed" not in out
+                             and "unsupported format" not in out):
         return "%-22s pngout.exe exit %d" % (name, r.returncode)
 
     return ("%-22s  ok  (%dx%d %s restart=%d q%d, re-read within %d%s)"

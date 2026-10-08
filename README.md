@@ -2173,6 +2173,42 @@ So the corpus is ready and the entropy body can be transcribed against it. What
 is still missing is a **progressive** file to pin the `0xC2` behaviour down; that
 needs a second scan encoder, which `jpeglib` does not have.
 
+#### The front end is transcribed and verified (`DecodeJpeg`, markers through DRI)
+
+The marker walk, SOF, DQT, DHT and DRI are now C, wired to the dispatch but
+returning -1 until the entropy body lands - so production still refuses JPEG
+cleanly, and `--jpeg` accepts both refusal messages meanwhile. Verified by
+dumping the parsed tables out of the binary and comparing against
+independently computed values: both fixed-point quant tables exact over all 64
+entries, all four Huffman tables with correct counts, fast-table fills (1022,
+1023, 1019, 1019 - the incomplete codes, as they should be) and symbols in
+order, dimensions/components/sampling/restart correct across grey, 444, 422,
+420, restart intervals and 16-bit tables.
+
+Two things it caught, both worth recording because each produced a parse that
+looked plausible rather than an error:
+
+* Markers outside `0xC0..0xDD` must be **skipped, not rejected**. The first
+  version refused APP0 outright; the original's `ja def_40B25B` sends them to
+  the default arm, which skips by the segment length. (TEM and RSTn have no
+  length and are continued past.)
+* `JpegHuffs` needs **eight slots, not four**. DC tables take 0..3 but AC
+  tables map via `spec - 12` to 4..7, so four slots overflow into whatever
+  global follows - which presented as a garbage restart interval, not a crash.
+
+And one real bug in the test generator, found because the C expects zigzag
+order as the spec requires: `jpeglib` wrote DQT entries in natural row-major
+order, misplacing every value past the second. The C put them in the wrong
+band; fixing the writer to `q[ZIGZAG[k]]` (and the reader, which had
+double-zigzagged to match the wrong writer) makes both tables exact. The
+writer and its reader had agreed with each other and both been wrong - the
+same failure mode the module docstring warns about, caught here by a third
+implementation rather than by ImageMagick.
+
+Still missing: the sampling-factor index map (`dword_410158`, no definition
+in the reference), the entropy body, and the colour tables. The front end
+stores the raw sampling factors and stops there.
+
 #### The entropy body, and two helpers that make it tractable
 
 `sub_40B180` calls only four things: `sub_409540` (Swap16), `sub_40C580` (the
