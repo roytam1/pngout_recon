@@ -2935,6 +2935,32 @@ static int JpegDecodeSeq(const unsigned char *scan, const unsigned char *end,
                             fprintf(stderr, "\n");
                         }
 #endif
+                        {
+                            /* dequantise by the fixed-point table, then IDCT.
+                             * coef[] is zigzag order; the block is natural
+                             * row-major for JpegIdct.  Dumped under JPEGDEBUG
+                             * for comparison against float IDCT / 2^19. */
+                            int dbl[64];
+                            int t;
+
+                            for (t = 0; t < 64; t++) {
+                                int zz = JpegZigzag[t];
+                                __int64 dq = (__int64)coef[t] *
+                                    JpegQuant[JpegComps[ci].qsel & 3][zz];
+
+                                dbl[zz] = (int)dq;
+                            }
+                            JpegIdct(dbl, 0xFF);
+#ifdef JPEGDEBUG
+                            if (dump) {
+                                fprintf(stderr, "jpeg: idct c%u mx%u my%u bx%u by%u =",
+                                        ci, mx, my, bx, by);
+                                for (t = 0; t < 64; t++)
+                                    fprintf(stderr, " %d", dbl[t]);
+                                fprintf(stderr, "\n");
+                            }
+#endif
+                        }
                     }
                 }
             }

@@ -2173,6 +2173,18 @@ So the corpus is ready and the entropy body can be transcribed against it. What
 is still missing is a **progressive** file to pin the `0xC2` behaviour down; that
 needs a second scan encoder, which `jpeglib` does not have.
 
+#### Dequantise plus IDCT verified by composition (`dbl[zz]`, flat-DC check)
+
+Integer coefficients go through `coef[t] * JpegQuant[qsel][ZIGZAG[t]]` into
+natural row-major order, then `JpegIdct(dbl, 0xFF)`, with the IDCT blocks
+dumped under `JPEGDEBUG`. Verified three ways that compose: coefficients
+bit-exact, quant tables exact, IDCT correct as a transform - and one end to
+end anchor: a flat block with DC=63 comes out as flat `528482304`, which is
+exactly `63 * 0x800000` (`fixed_quant[0][0]`), proving the dequant mapping,
+the zigzag placement and the IDCT gain combine correctly. AC mapping is
+code-reviewed on top of that (same loop, same tables); pixels still await the
+four colour tables, which are the only unverified link left.
+
 #### Restart intervals verified bit-exact (`JpegRestart`, RSTn cycling)
 
 The resync runs between MCUs when the interval countdown hits zero: drop
