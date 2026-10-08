@@ -2323,17 +2323,18 @@ conclude.
 #### Tables solved: linear fit worst 3 on 153 pixels, worst 5 on 422/420
 
 Per-MCU `v4` (`Cb`/`Cr` blocks via `+256`, `bpm=1`, interleaved) plus linear
-tables `Tbl[i] = m*i + c` hill-climbed on ramp 444 row data: `m =
-(1M, 725k, -100k, -400k)`, `c = (-8M, -6.4M, -4M, -4M)`, worst 3 over 153
-pixels (full image, all MCUs). Same params on 422/420 (approximate
-subsample mapping, no shifts) give worst 5 over 144+128 pixels - so the
-mapping generalises across layouts within a few levels, and remaining error
-is IDCT/rounding/coefficient differences vs ImageMagick, not table error.
-Intercepts shifted from grey-flat fit (`cB` -8M to -6.4M) once gradients
-constrain them; slopes stable. These eight integers are the colour tables
-(functionally; original values unknowable to 2^22 from pixels, which is
-immaterial since any value in range gives identical output). Transcription
-with hardcoded tables plus C-vs-IM pixel verification is next, then dispatch.
+tables `Tbl[i] = m*i + c` hill-climbed on ramp 444 row data, then refit on
+306 diverse smooth pixels (flat/ramp 444, grey) with correct `txt:` parsing:
+`m = (1M, 750k, -100k, -400k)`, `c = (-8M, -8M, -4M, -4M)`, worst 5
+globally on smooth data (was worst 3 on 153, worst 5 only after fixing the
+`txt:` group-3/4/5 parse that had silently dropped grey points). Same params
+on 422/420 (approximate subsample mapping, no shifts) give worst 5 over
+144+128 pixels - so the mapping generalises across layouts within a few
+levels on smooth content. BUT the linear form fails globally (see "Linear
+tables structurally insufficient" below): white/bright-neutral and restart
+content are silent garbage, so the tables are range-limited placeholders,
+not the original values. Transcription with hardcoded tables plus C-vs-IM
+pixel verification is next, then dispatch.
 
 #### Per-MCU `v4` verified: worst 147 to 8 on row 1, slopes generalise to 5 on 422/420
 
@@ -2348,19 +2349,29 @@ vs ImageMagick (integer vs float IDCT/rounding/coefficients), not table error.
 Transcription with hardcoded tables plus C-vs-IM pixel verification is next,
 then dispatch - no further analysis needed, only implementation.
 
-#### First JPEG pixels: correct on smooth, garbage on edges (table range)
+#### First JPEG pixels: correct in-range, silent garbage on extremes (linear form insufficient)
 
-`JpegOutput444()` with fitted tables produces the first pixels: rows 0-4 of
-a grey ramp are a smooth gradient matching ImageMagick within levels, rows
-5+ degenerate to black/white garbage (`000000FF`, `FFFFFFFF` alternating).
-The split is not MCU geometry (rows 5-7 share MCU row 0 with good rows 0-4)
-but table range: high-contrast edges (`%200` wraps) give extreme IDCT outputs
-whose indices land in the dead zone (`128..895`, `T=0` → black) or overflow
-(white). Linear tables fitted on smooth data do not cover extremes - either
-nonlinearity there, or the fit range was too narrow. Still unwired (returns
--1); exercising via debug harness only. Structure (per-MCU blocks, equation,
-store, clipping) verified by the good rows; values need extreme-range data
-to complete.
+`JpegOutput444()` with fitted tables produces the first pixels: flat/ramp
+444 and grey ramps match ImageMagick to worst 5, but flat grey is worst 14,
+grey-444 white decodes to black (worst 255), and restart files degrade
+(worst 15-16 vs 5 without). The split is structural, not range: fitting
+required offsets `(idx<<22)-Y` per chroma index over 1836 pixels (12 files,
+exact C IDCT via `jd.exe` + IM targets) gives max-min spreads to 4.4B for a
+single `i6` - the full index range - so no 1D table in `(i6,ir)` (linear or
+free) can work; `Y` dominates and the target is sawtooth in brightness
+because `dword_18DF888`'s inverse is non-monotonic (values `0..127 ->
+896..1023`, `128..255 -> 0..127`), jumping ~3.7B at the 128 boundary for
+fixed chroma. Least-squares over the corpus gives absurd slopes
+(`mA=10M`, `cA=+811M`); mean-fit keeps mean 3.4 but worst stays 255. The
+true equation must scale/mix `Y` differently (or the index derivation
+`>>19 &~1` is incomplete) - re-derivation from `sub_408D80`, not more
+fitting, is the defined next step. Output stays unwired (`DecodeJpeg`
+returns -1; `dumpdec` refuses JPEG) so the probe never emits the silent
+garbage; `JpegOutput444` runs only under `JPEGDEBUG` for dumps. Grey+restart
+(`dt_j_grey_grey_2_8`) refuses cleanly (single-component restart bit-reader
+edge, separate from tables). Structure (per-MCU blocks, equation, store,
+clipping, floor-to-even indices) verified by the in-range rows; values need
+re-derivation to complete.
 
 #### Linear `v4` fails at MCU boundaries; per-MCU bases required
 

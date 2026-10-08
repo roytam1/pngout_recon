@@ -3253,17 +3253,17 @@ static int DecodeJpeg(const unsigned char *data, int size,
 #endif
                                       ) == 0) {
                         /*
-                         *  h=1 grey/444 output runs here for verification
-                         *  (dumps/pixels under JPEGDEBUG) but the pixels are
-                         *  not trusted yet - correct on smooth regions,
-                         *  garbage on high-contrast edges (table range).
-                         *  Still returns -1 below; wiring for real once the
-                         *  tables cover extremes.  Anything else (progressive,
-                         *  restart subset, h=2) waits for its path.
+                         *  h=1 grey/444 output runs here for JPEGDEBUG dumps
+                         *  only; production still returns -1 below.  Linear
+                         *  fitted tables are correct in-range (worst 5) but
+                         *  silent garbage on extremes (white->black), so no
+                         *  wiring until the tables are re-derived (see
+                         *  README: df888 wrap/sawtooth).  Anything else
+                         *  (progressive, restart subset, h=2) waits for its
+                         *  path.
                          */
-                        if (JpegOutput444(pixels, pitch, width, height,
-                                             xorigin, yorigin) == 0)
-                            return 0;
+                        JpegOutput444(pixels, pitch, width, height,
+                                      xorigin, yorigin);
                     }
                 }
             }
