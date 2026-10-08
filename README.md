@@ -139,15 +139,9 @@ silently produce a wrong PNG.
 The inflate inside it is verified byte for byte against `zlib`, and `src/decode.c`
 implements the PNG path - chunk walk, bit reader and pump, Huffman, inflate,
 unfilter and row expansion - for colour types 0, 2, 3, 4 and 6 at bit depths 1,
-2, 4 and 8. Interlaced input is refused rather than guessed at.
-
-The PNG half is worked through and written up above: format dispatch, the
-signature, the IHDR/PLTE/bKGD/tRNS handlers, the sub-8-bit table expansion, the
-sample count and row byte count, the bit reader and input pump, the whole
-inflate body, the unfilter, the pixel expansion, and the Adam7 constants. The
-inflate is verified byte for byte against `zlib`, so what is left is writing it
-out in C. Nothing has been written for any of it yet, so a build reports the
-entry point as unimplemented rather than guessing.
+2, 4 and 8, plus the 8bpp palettised, GIF, BMP, PCX and Targa decoders.
+Interlaced PNG input is refused rather than guessed at, and JPEG and DDS are not
+written yet, so a build reports those two as unimplemented rather than guessing.
 
 ## Optimize (0x402AD0): how it fits together
 
@@ -1927,86 +1921,102 @@ faithful to the listing and unreachable through `main()`.
 `tools\decodetest.py --bmp` and `--bmp-roundtrip` check six cases, both header
 shapes and 8, 16, 24 and 32 bits.
 
-### `sub_40CA70`, GIF (format code 3) — analysed, not transcribed
+### `sub_40CA70`, GIF (format code 3)
 
-1712 bytes, of which roughly 700 is the LZW decoder. Not transcribed yet; this
-is what has been read off the listing, so the next pass does not start by
-re-reading it.
+Transcribed and verified with eleven cases in each direction.
 
-The front end is straightforward and mostly confirmed:
+**The interlace and local-colour-table flags are transposed.** Two places in the
+function get them the wrong way round, and both are visible in the decompilation
+as well as the listing:
 
-* `byte_190A824 = 3` and `byte_190A825 = 8` are set at `0x40CA77` **before** the
-  magic is checked, so a file that fails `'G' 'I' 'F'` has already published
-  colour type 3 on its way to returning −1.
-* The global palette size is `1 << ((packed & 7) + 1)` and goes straight into
-  `dword_190A820` (`0x40CAB1`-`0x40CAB7`); `packed` bit 7 decides whether the
-  table is present at all, and `0x40CAC4` skips `3 * size` past it.
-* The extension loop at `0x40CAE0` walks the sub-block chain with
-  `lea ebx, [ebx+eax+1]` *before* the `test`, so the zero terminator is
-  consumed — worth noting because the instruction order makes it look otherwise.
-  A Graphic Control Extension with the transparency flag set yields its index
-  from `p[6]`, and that index later has its alpha byte cleared at `0x40CBF9`.
-* The image descriptor is read with the pointer one byte past the `,`, so left
-  is `[+0]`, top `[+2]`, width `[+4]`, height `[+6]`, flags `[+8]`, and
-  `add ebx, 9` lands on the LZW minimum code size.
-* The palette transform is the same trick the PCX path uses, on the *green*
-  channel this time: `sub ecx, 100h` / `shl ecx, 8` / `add ecx, esi` /
-  `shl ecx, 8` / `add ecx, esi` at `0x40CBAA`, i.e.
-  `((green - 256) << 8 + blue) << 8 + red`, which is the identity on RGB and
-  leaves the top byte at `0xFF` by the borrow. Unfilled entries are
-  `0xFF000000` (`rep stosd` at `0x40CBE6`).
-**Settled, and it is a bug in the original.** The Hex-Rays decompilation has it
-as `if ( v16 < 0 )` — a **signed** test on the image descriptor's flags byte — so
-the block that computes a local table size, `1 << ((v16 & 7) + 1)`, publishes it
-to `dword_190A820` and steps the pointer over `3 * size` bytes of palette is
-guarded by **bit 7, the interlace flag**, not by bit 6, the local colour table
-flag. Bit 6 is tested separately at `0x40CB3D` and only parks its result in
-`var_55`/`var_48`. So as written:
+* `test cl, cl` / `jns` at `0x40CB66` is a *signed* test, so **bit 7** guards the
+  block at `0x40CB6A` that sizes a table, repoints the palette at
+  `0x40CB75` and steps the pointer over `3 * size` bytes. Bit 7 is the
+  **interlace** flag.
+* `test cl, 40h` at `0x40CB3D` sets `var_48 = 8` and `var_55 = 1`, and 8 is the
+  first interlace pass's *stride*. So **bit 6** - the **local colour table**
+  flag - is what starts the four-pass walk.
 
-* a GIF with a local colour table and no interlacing does **not** have the table
-  skipped, and the LZW stream is read from the palette bytes;
-* an interlaced GIF with no local colour table skips palette bytes that are not
-  there.
+As written, a GIF carrying a local colour table (bit 6 set, bit 7 clear) is
+decoded as interlaced and its palette is *not* skipped, so the LZW stream is read
+from the palette bytes; and an interlaced one skips palette bytes that are not
+there. Neither is recoverable from the file, and a local colour table is
+extremely common. That is the original's behaviour and the transcription
+reproduces it.
 
-Neither is recoverable from the file, and a GIF with a local colour table is
-extremely common. That is the original's behaviour and a transcription has to
-reproduce it.
+The palette pointer is the **global** colour table. `0x40CAAE` computes
+`fileimg + 13` and `0x40CAC7` saves it into `var_24` before skipping `3 * size`
+bytes; only the bit 7 arm overwrites it. So with bit 7 clear the palette is the
+global table even when the image has a local one, and if the file has *no* global
+table either then `var_24` is never written and the 256 entries are read from
+whatever was on the stack.
 
-#### The rest of the function, so the next pass starts from facts
+The palette transform is the PCX trick again. `0x40CB98`-`0x40CBBE` loads `p[0]`
+into `ecx`, subtracts `0x100`, shifts up twice and adds `p[1]` then `p[2`:
 
-The LZW is a conventional one, over three globals: `dword_18D0030` (768 bytes of
-input buffer), `dword_18D0330` (4100 code slots) and `byte_18D8F87` /
-`byte_18D8F88` (the same slot's code and its length) with `byte_18DD9D8` as the
-output string stack.
+```
+Pal[i] = ((p[0] - 0x100) << 8 + p[1]) << 8 + p[2]
+```
 
-* The minimum code size byte gives `clear = 1 << n` and `end = clear + 1`; slots
-  `0 .. clear - 1` are seeded with themselves (`dword_18D0330[i] = i`,
-  `byte_18D8F88[i] = i`, the loop at `0x40CE92`).
-* Codes arrive LSB-first out of `dword_18D0030`, and when the reader gets within
-  three bytes of the end of the buffer it shifts the tail down (`0x40CF19`,
-  `mov si, word ptr dword_18D0030[ecx]`) and appends the next sub-block; the
-  `v48 = v59 - v47` shift at `0x40CF15` is the shift-and-refill.
-* The code size grows when the next free slot would reach `1 << codesize`, and is
-  capped at 12 (`cmp v63, 0Ch` / `jnz` at `0x40CFB1`).
-* A code is expanded by walking the chain back to a literal, filling
-  `byte_18DD9D8` and then emitting it **backwards** — the emit loop at `0x40D025`
-  walks `v73` down from the string length, which is why the expansion builds the
-  string in reverse.
-* The interlacing is four passes with strides 8, 8, 4 and 2, driven by `var_55`
-  and the switch at `0x40D068`: a stride of 1 or 2 means done and returns 0, 4
-  starts the pass at `yorigin + 1`, and 8 alternates between `yorigin + 2` and
-  `yorigin + 4` on `var_55`. The strides are GIF's (rows 0, 8, 16 … then 4, 12
-  … then 2, 6 … then 1, 3, 5 …) but the pass offsets are built from a
-  *stride* variable, so it is worth checking against a real interlaced GIF.
+which is the identity on R,G,B and leaves the top byte at `0xFF` by the borrow,
+so a GIF ends up with the same internal `0xFFBBGGRR` byte order as PNG and BMP.
+The entry counter is stored directly (`mov dword_190A420[ebp*4], ecx` at
+`0x40CBC0`, with the source advancing by three), so the indices are `0..size-1`,
+and `cmp ebp, 100h` is what stops the `rep stosd` at `0x40CBE6` that fills the
+rest of the ramp with opaque black. A Graphic Control Extension's transparent
+index has its alpha byte cleared at `0x40CBF9`.
 
-The frame placement is the least clear part of the function and the part most
-likely to be mis-transcribed: `0x40CCAE` onwards computes four clamped bounds and
-then runs four `rep stosd` passes to fill the background, and the clamps mix the
-image's left with its *height* (`v78 = v28 + v18 + v57 <= 0 ? 0 : ...`, where
-`v18` is the left offset, `v57` the image width and `v28` the x origin). There is
-a fast path at `0x40CC1D` for the common case — the image at 0,0 exactly filling
-the screen — which skips the fill entirely, and that is the case a test suite
-would hit first, so a transcription needs cases that deliberately miss it.
+The LZW runs over `dword_18D0030` (768 bytes of input), `dword_18D0330` (4100
+code slots) and `byte_18D8F87`/`byte_18D8F88` (a slot's code and its length),
+with `byte_18DD9D8` as the output stack. Codes arrive LSB first; the reader
+shifts the tail down to the bottom of the buffer and appends the next sub-block
+when it gets within three bytes of the end (`v48 = v59 - v47` at `0x40CF15`). A
+code expands by walking `slot[]` - each slot's *tail* code - back to a root and
+then pushing that root, and the emit loop at `0x40D025` walks the length *down*,
+so the string comes out in order without being reversed first.
+
+Two things about the code table are not what a straightforward reading suggests,
+and both were needed to make the tests pass:
+
+* **A code equal to the next free slot** repeats the *previous* string's own head,
+  so the expansion has to start from `prev`, not from `next - 1`. `next - 1` is
+  the last slot built, whose string is a different one.
+* **The size bump needs `+1` on both sides.** The encoder's table runs one entry
+  ahead of the decoder's, so the encoder steps up to `bits + 1` when the code it
+  is about to assign is `2**bits - 1` while the decoder steps up after it has
+  built slot `2**bits - 2`. Without the `+1` the first eight codes are right and
+  every code after them is read at the wrong width.
+
+The interlace passes are GIF's own after all - the switch at `0x40D068` keys off
+the **stride** alone, 8, 8, 4 then 2, and each new pass starts at a fixed offset
+from the row the image *began* at (`arg_1C`), so the four passes are 0, 4, 2 and 1.
+Nothing guards the switch except the stride, which is why a stride of 1 only
+reaches it on the last row and a stride of 2 ends the image. `var_55` only
+alternates the two stride-8 passes.
+
+Three things in the transcription are worth knowing about, because each produced
+a plausible-looking decode rather than a crash:
+
+* The clamp at `0x40CBAA` reads `(p[0] - 0x100) << 8 + p[1]) << 8 + p[2]`, and
+  written without the outer parentheses C's `+` binds tighter than `<<`, so it
+  becomes a shift by `8 + p[2]` - every palette entry a different colour, all of
+  them valid. `/W3` catches it as C4554.
+* `far` is a reserved word in MSVC's 16 bit memory models, so it cannot be the
+  name of the right-hand clamp.
+* Reproducing the interlace as "four passes if a flag is set" gets the row order
+  wrong in a way that only shows on an image taller than four rows: the flag and
+  the stride are different things, and only the stride is tested.
+
+The frame placement at `0x40CCAE` computes four clamped bounds and runs four
+`rep stosd` passes to lay down the background. The clamps look as if they mix the
+image's left with its width, and they do - `v77` is
+`min(xorigin + left, width)`, the image's *left* edge in destination coordinates,
+not its right edge. It is still correct, because the fill covers `[colfirst, v77)`
+and `[v78, faredge)` and so paints the gap left of the image and the gap right of
+it without touching the image's own columns. `v78 = v28 + v18 + v57` is the right
+edge. There is a fast path at `0x40CC1D` for the image at 0,0 exactly filling the
+screen that skips the fill entirely, so the cases include a screen larger than
+the image to exercise the other path.
 
 ### `sub_40DD80`, DDS (format code 7) — analysed, not transcribed
 
@@ -2049,17 +2059,16 @@ verified pixel for pixel. What is left:
 * `sub_40A630`, the Adam7 path. Interlaced input is refused rather than guessed
   at, because the pass table it reads is not a partition of the image and so
   could not be checked against anything - see **The Adam7 tables** above.
-* The other three decoders — JPEG, GIF and DDS — and re-declaring the 22 MB of
+* The other two decoders — JPEG and DDS — and re-declaring the 22 MB of
   `.bss` they use. Six of the eight input formats are transcribed now: PNG, the
-  8bpp palettised one, PCX, Targa and BMP. The three left, measured:
+  8bpp palettised one, GIF, PCX, Targa and BMP. The two left, measured:
 
   | original | listing lines | bytes | note |
   |---|---|---|---|
-  | `0x40CA70` GIF | 1 311 | 1 717 | front end read, one open question, above |
   | `0x40DD80` DDS | 1 158 | 1 705 | front end read, above; needs hand-built DXT to check |
   | `0x40B180` JPEG | 3 491 | 5 058 | baseline sequential, with Huffman, IDCT, upsampling, YCbCr |
 
-  JPEG is about two and a half GIFs and wants a pass of its own.
+  JPEG is about twice GIF and wants a pass of its own.
 
 ## Verification so far
 
@@ -2085,7 +2094,15 @@ python tools\decodetest.py --targa      Targa, 12 cases
 python tools\decodetest.py --targa-roundtrip  the same twelve through pngout.exe
 python tools\decodetest.py --bmp        BMP, 6 cases
 python tools\decodetest.py --bmp-roundtrip   the same six through pngout.exe
+python tools\decodetest.py --gif        GIF, 11 cases
+python tools\decodetest.py --gif-roundtrip   the same eleven through pngout.exe
 ```
+
+The GIF cases need an LZW *encoder* in the test harness rather than a row of
+literals, so that the code table, the size bump and the "repeat the previous
+string's head" case are actually exercised; `gif_lzw()` is a real encoder and
+`gif_walk()` models the row order `sub_40CA70` walks so the interlace cases can
+be checked independently of the decoder.
 
 The probe has to put stdout in binary mode (`_setmode(1, O_BINARY)`, as `main()`
 does for the "-" case): left in text mode the CRT turns every 0x0A sample into
@@ -2528,4 +2545,3 @@ tools/            extraction scripts, build.cmd, run.cmd, selftest.cmd, regen.cm
                   pngcheck (the encoder's round trip), dumpdec + decodetest
                   (the decoder's)
 reference/        extracted listing/decompilation/strings (generated, gitignored)
-```

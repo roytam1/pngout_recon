@@ -65,7 +65,7 @@ int main(int argc, char **argv)
     w = (unsigned)iw;
     h = (unsigned)ih;
     if (fmt != FMT_PNG && fmt != FMT_PAL8 && fmt != FMT_PCX && fmt != FMT_TGA &&
-        fmt != FMT_BMP) {
+        fmt != FMT_BMP && fmt != FMT_GIF) {
         fprintf(stderr, "dumpdec: format %d is not reconstructed yet\n", fmt);
         return 1;
     }

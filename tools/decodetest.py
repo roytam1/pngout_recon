@@ -1304,8 +1304,320 @@ def bmp_cases():
     ]
 
 
+# ------------------------------------------------------------------ GIF
+class GifBits(object):
+    """LSB-first bit packer, the order GIF's codes arrive in."""
+
+    def __init__(self):
+        self.out = bytearray()
+        self.acc = 0
+        self.n = 0
+
+    def put(self, code, width):
+        self.acc |= (code & ((1 << width) - 1)) << self.n
+        self.n += width
+        while self.n >= 8:
+            self.out.append(self.acc & 0xFF)
+            self.acc >>= 8
+            self.n -= 8
+
+    def flush(self):
+        if self.n:
+            self.out.append(self.acc & 0xFF)
+            self.acc = 0
+            self.n = 0
+        return bytes(self.out)
+
+
+def gif_lzw(indices, mincode):
+    """
+    A real GIF LZW encoder, so the tests exercise the code table and not just a
+    stream of literals.  The size bump matches sub_40CA70's: the code size goes
+    up when the *next free slot* reaches `1 << bits`, checked before the slot is
+    added, so codes 0-7 go out in three bits and code 8 in four.
+    """
+    clear = 1 << mincode
+    end = clear + 1
+    bits = mincode + 1
+    nxt = end + 1
+    table = {}
+    for i in range(clear):
+        table[bytes([i])] = i
+    w = GifBits()
+    w.put(clear, bits)
+    prefix = b""
+    for c in indices:
+        b = bytes([c])
+        if prefix + b in table:
+            prefix += b
+            continue
+        w.put(table[prefix], bits)
+        if nxt < 4096:
+            table[prefix + b] = nxt
+            # the decoder's table runs one entry behind, so it reaches 2**bits
+            # one code later; this is the pairing that keeps the two in step
+            if nxt + 1 == (1 << bits) and bits < 12:
+                bits += 1
+            nxt += 1
+        else:
+            w.put(clear, bits)
+            table = {}
+            for i in range(clear):
+                table[bytes([i])] = i
+            bits = mincode + 1
+            nxt = end + 1
+        prefix = b
+    if prefix:
+        w.put(table[prefix], bits)
+    w.put(end, bits)
+    return w.flush()
+
+
+def gif_subblocks(data):
+    out = bytearray()
+    i = 0
+    while i < len(data):
+        n = min(255, len(data) - i)
+        out.append(n)
+        out += data[i:i + n]
+        i += n
+    out.append(0)
+    return bytes(out)
+
+
+def write_gif(path, w, h, indices, palette, left=0, top=0, screenw=None,
+              screenh=None, gct=True, lct=False, transp=None,
+              fake_interlace=False, bgindex=0, comment=False):
+    """
+    Write a GIF, format code 3.
+
+    `screenw`/`screenh` are the logical screen, and when they are left out they
+    default to the image size, which is the case sub_40CA70 takes the 0x40CC1D
+    fast path through.
+
+    `lct` puts a local colour table in the image descriptor *and* sets bit 6,
+    because the original reads bit 6 as the interlace flag; `fake_interlace`
+    sets only bit 6.  Both produce the four-pass walk rather than GIF's own
+    interlace, which is the point of having them.
+    """
+    if screenw is None:
+        screenw = w
+    if screenh is None:
+        screenh = h
+    out = bytearray(b"GIF89a")
+    out += struct.pack("<HH", screenw, screenh)
+    gsize = 1
+    while gsize < len(palette):
+        gsize <<= 1
+    if gct:
+        out += bytes([0x80 | ((gsize.bit_length() - 2) & 7), bgindex, 0])
+        for i in range(gsize):
+            e = palette[i] if i < len(palette) else (0, 0, 0)
+            out += bytes([e[0] & 0xFF, e[1] & 0xFF, e[2] & 0xFF])
+    else:
+        out += bytes([0, bgindex, 0])
+
+    if comment:
+        out += b"\x21\xFE" + gif_subblocks(b"decodetest")
+
+    if transp is not None:
+        out += b"\x21\xF9\x04\x01\x00\x00" + bytes([transp]) + b"\x00"
+
+    flags = 0
+    if lct or fake_interlace:
+        flags |= 0x40
+    if fake_interlace and not lct:
+        flags |= 0x40
+    out += b"\x2C" + struct.pack("<HHHH", left, top, w, h) + bytes([flags])
+    # no local colour table whatever bit 6 says, so the descriptor ends here
+    mincode = max(2, (gsize.bit_length() - 1))
+    out += bytes([mincode])
+    out += gif_subblocks(gif_lzw(indices, mincode))
+    out += b"\x3B"
+    with open(path, "wb") as fh:
+        fh.write(bytes(out))
+    return bytes(out)
+
+
+def gif_walk(w, h, top, interlace, stride, yorigin=0):
+    """
+    The row each *pixel* lands on, in the order sub_40CA70 walks them, so the
+    cases can be checked without trusting this module.  The passes are 8, 8, 4,
+    2 and a stride of 1 or 2 ends the image; bit 6 is what starts the walk.
+
+    Each visited row contributes its whole width, because the emit loop runs
+    `width` times before advancing the row by the stride.
+    """
+    rows = list(range(h))
+    if interlace:
+        rows = []
+        row, stride, v55 = yorigin + top, stride, 1
+        while True:
+            while row < yorigin + top + h:
+                rows.append(row)
+                row += stride
+            if stride <= 2:
+                break
+            if stride == 4:
+                row, stride = yorigin + top + 1, 2
+            elif v55:
+                v55 = 0
+                row, stride = yorigin + top + 4, 8
+            else:
+                row, stride = yorigin + top + 2, 4
+    out = []
+    for r in rows:
+        out.extend([r] * w)
+    return out
+
+
+def gif_palette(pixels):
+    """The colour table, in index order, from (index, r, g, b, a) pixels."""
+    found = {}
+    top = 0
+    for row in pixels:
+        for px in row:
+            found[px[0]] = px[1:4]
+            top = max(top, px[0])
+    return [found.get(i, (0, 0, 0)) for i in range(top + 1)]
+
+
+def gif_build(case):
+    """Write the file and work out what sub_40CA70 should put in the frame."""
+    name, w, h, pixels, screen, transp, lct, fi, comment = case
+    sw, sh = screen if screen else (w, h)
+
+    palette = gif_palette(pixels)
+    flat = [px[0] for row in pixels for px in row]
+    src = os.path.join(BUILD, "dt_%s.gif" % name)
+    write_gif(src, w, h, flat, palette, screenw=sw, screenh=sh,
+              transp=transp, lct=lct, fake_interlace=fi, comment=comment)
+
+    # bit 6 is what starts the four-pass walk, and 8 is its first stride
+    interlace = lct or fi
+    order = gif_walk(w, h, 0, interlace, 8)
+
+    # the background is logical-screen colour table entry 0
+    br, bg_, bb = palette[0]
+    bg = (bb, bg_, br, 255)
+    want = {}
+    for y in range(sh):
+        for x in range(sw):
+            want[(y, x)] = bg
+    for k, idx in enumerate(flat):
+        if k >= len(order):
+            break
+        r, g, b = palette[idx]
+        want[(order[k], k % w)] = (b, g, r, 0 if transp == idx else 255)
+    return src, sw, sh, want
+
+
+def run_gif(case):
+    """The same comparison as run(), for GIF."""
+    name = case[0]
+    try:
+        src, sw, sh, want = gif_build(case)
+        gw, gh, got = dump(src)
+    except Exception as exc:                       # noqa: BLE001
+        return "%-14s %s" % (name, exc)
+    if (gw, gh) != (sw, sh):
+        return "%-14s wrong size %dx%d" % (name, gw, gh)
+    bad = 0
+    first = None
+    for y in range(sh):
+        for x in range(sw):
+            px = want[(y, x)]
+            if got[y][x] != px:
+                bad += 1
+                if first is None:
+                    first = "x=%d y=%d got %s want %s" % (x, y, got[y][x], px)
+    if bad:
+        return "%-14s %d/%d pixels differ, first %s" % (name, bad, sw * sh, first)
+    return "%-14s  ok  (%dx%d gif%s)" % (
+        name, sw, sh, " bit6-interlaced" if (case[6] or case[7]) else "")
+
+
+def roundtrip_gif(case):
+    """The same file through pngout.exe and back out of the PNG it writes."""
+    name = case[0]
+    src, sw, sh, want = gif_build(case)
+    dst = os.path.join(BUILD, "dt_%s.gif.out.png" % name)
+    if os.path.exists(dst):
+        os.remove(dst)
+    r = subprocess.run([PNGOUT, "/force", src, dst], stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE)
+    if not os.path.exists(dst):
+        out = (r.stdout + r.stderr).decode("latin1")
+        return "%-14s no output: %s" % (name, out.strip()[-70:])
+    try:
+        got = read_pixels(dst)
+    except Exception as exc:                       # noqa: BLE001
+        return "%-14s output unreadable: %s" % (name, exc)
+    if (got["width"], got["height"]) != (sw, sh):
+        return "%-14s wrong size %dx%d" % (name, got["width"], got["height"])
+    bad = 0
+    first = None
+    for y in range(sh):
+        for x in range(sw):
+            b, g, rr, a = want[(y, x)]
+            wantpx = (rr, g, b, a)
+            if tuple(got["rows"][y][x]) != wantpx:
+                bad += 1
+                if first is None:
+                    first = "x=%d y=%d got %s want %s" % (
+                        x, y, got["rows"][y][x], wantpx)
+    if bad:
+        return "%-14s %d/%d pixels differ, first %s" % (name, bad, sw * sh, first)
+    return "%-14s  ok  (%dx%d gif round trip)" % (name, sw, sh)
+
+
+def gif_cases():
+    """
+    GIF: the fast path, the LZW code table, the extension blocks,
+    transparency, the background fill the fast path skips, and bit 6 read as the
+    interlace flag.
+    """
+    w, h = 9, 5
+    pal = [(i * 7 & 0xFF, i * 13 & 0xFF, i * 29 & 0xFF) for i in range(40)]
+    ramp = [[((x * 3 + y * 5,) + pal[(x * 3 + y * 5) % 40] + (255,))
+             for x in range(w)] for y in range(h)]
+    # one long run per row, so the LZW table has something to compress
+    runs = [[(0 if y % 2 else 1,) + pal[0 if y % 2 else 1] + (255,)
+             for x in range(w)] for y in range(h)]
+    # a repeat of the last symbol, which is what produces a code that is not in
+    # the table yet - the KwKwK case
+    kwkwk = [[((1 if x < w - 1 else 2,) + pal[1 if x < w - 1 else 2] + (255,))
+              for x in range(w)] for y in range(h)]
+    # every index used, so the table is a full 256 and the code size grows
+    many = [[((x + y * w,) + pal[(x + y * w) % 40] + (255,))
+             for x in range(w)] for y in range(h)]
+    return [
+        ("g-ramp", w, h, ramp, None, None, False, False, False),
+        ("g-runs", w, h, runs, None, None, False, False, False),
+        ("g-kwkwk", w, h, kwkwk, None, None, False, False, False),
+        ("g-many", w, h, many, None, None, False, False, False),
+        ("g-comment", w, h, ramp, None, None, False, False, True),
+        ("g-transp", w, h, ramp, None, 0, False, False, False),
+        ("g-transp2", w, h, ramp, None, 3, False, False, False),
+        # the screen is bigger than the image, so the fill at 0x40CCAE runs
+        ("g-fill", w, h, ramp, (16, 12), None, False, False, False),
+        ("g-fill-tall", w, h, ramp, (16, 20), None, False, False, False),
+        # bit 6 starts the four-pass walk, which is not GIF's interlace
+        ("g-interlace", w, h, ramp, None, None, False, True, False),
+        ("g-lct", w, h, ramp, None, None, True, False, False),
+    ]
+
+
 def main():
-    if "--bmp" in sys.argv:
+    if "--gif" in sys.argv:
+        cases = gif_cases()
+        mode = run_gif
+        argv = [a for a in sys.argv[1:] if not a.startswith("--")]
+    elif "--gif-roundtrip" in sys.argv:
+        cases = gif_cases()
+        mode = roundtrip_gif
+        argv = [a for a in sys.argv[1:] if not a.startswith("--")]
+    elif "--bmp" in sys.argv:
         cases = bmp_cases()
         mode = run_bmp
         argv = [a for a in sys.argv[1:] if not a.startswith("--")]

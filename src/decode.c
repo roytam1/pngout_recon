@@ -1788,6 +1788,431 @@ if (compression == 3) {
     return 0;
 }
 
+/* ------------------------------------------------------------------ */
+/*  sub_40CA70: GIF, format code 3                                    */
+/* ------------------------------------------------------------------ */
+
+/*
+ *  The LZW, in the shape the original has it.  Three globals and a stack:
+ *
+ *      InBuf[768]      dword_18D0030, the input, refilled in place
+ *      Slot[4100]      dword_18D0330, the code table
+ *      SlotLen[]       byte_18D8F88, and byte_18D8F87, the same slot's code
+ *      Stack[]         byte_18DD9D8, the expanded string
+ *
+ *  Codes arrive LSB first.  The reader shifts what is left down to the bottom
+ *  of InBuf whenever it gets within three bytes of the end and appends the next
+ *  sub-block - the `v48 = v59 - v47` at 0x40CF15 - and the code size grows when
+ *  the next free slot would reach `1 << codesize`, capped at 12 at 0x40CFB1.
+ *
+ *  A code expands by walking the chain back to a literal, filling Stack from the
+ *  end, and the emit loop then walks the length *down*: the string comes out in
+ *  order without being reversed first.
+ */
+typedef struct GifLzw {
+    unsigned char  in[768];
+    int            inlen;           /* bytes valid in `in`                */
+    int            bitpos;
+    int            bits;            /* code size in bits                  */
+    int            clear, end;      /* clear and end codes                */
+    int            next;            /* the next free slot                 */
+    unsigned short slot[4100];
+    unsigned char  slotcode[4100];
+    unsigned char  slotlen[4100];
+    unsigned char  stack[4100];
+} GifLzw;
+
+/* the GIF sub-block chain: a length byte then that many bytes, to a zero */
+typedef struct GifBlocks {
+    const unsigned char *p;
+    const unsigned char *end;
+} GifBlocks;
+
+/*
+ *  Pull the next sub-block into the buffer, keeping whatever has not been read
+ *  yet.  `keep` is the number of unread bytes already at the front.
+ */
+static void GifRefill(GifLzw *z, GifBlocks *b, int keep)
+{
+    int n = 0;
+
+    if (b->p < b->end && *b->p)
+        n = *b->p++;
+    else if (b->p < b->end)
+        b->p++;                        /* the terminating zero */
+    else
+        n = 0;
+
+    if (n > 0) {
+        int avail = (int)(b->end - b->p);
+
+        if (n > avail)
+            n = avail;
+        if (keep + n > (int)sizeof z->in)
+            n = (int)sizeof z->in - keep;
+        if (n > 0)
+            memcpy(z->in + keep, b->p, (size_t)n);
+        b->p += n;
+    }
+    z->inlen = keep + (n > 0 ? n : 0);
+}
+
+/* 0x40CEE0: one code, or -1 when the image data runs out */
+static int GifNextCode(GifLzw *z, GifBlocks *b)
+{
+    for (;;) {
+        int avail, code, keep;
+
+        /* enough bits left for the widest code we could have? */
+        avail = z->inlen * 8 - z->bitpos;
+        if (avail < z->bits) {
+            keep = z->inlen - (z->bitpos >> 3);
+            if (keep < 0)
+                keep = 0;
+            if (keep > 0)
+                memmove(z->in, z->in + (z->bitpos >> 3), (size_t)keep);
+            z->bitpos &= 7;
+            GifRefill(z, b, keep);
+            avail = z->inlen * 8 - z->bitpos;
+            if (avail < z->bits)
+                return -1;
+        }
+
+        code = 0;
+        {
+            int i;
+
+            for (i = 0; i < z->bits; i++)
+                if (z->bitpos + i < z->inlen * 8 &&
+                    (z->in[(z->bitpos + i) >> 3] >> ((z->bitpos + i) & 7)) & 1)
+                    code |= 1 << i;
+        }
+        z->bitpos += z->bits;
+
+        if (code == z->clear) {
+            z->next = z->end + 1;
+            z->bits = 1;
+            while ((1 << (z->bits - 1)) < z->clear)
+                z->bits++;
+            if (z->bits > 12)
+                z->bits = 12;
+            continue;
+        }
+
+        return code;
+    }
+}
+
+/*
+ *  sub_40CA70: GIF, format code 3.
+ *
+ *  **The interlace and local-colour-table flags are transposed.**  Two separate
+ *  places in the function get them the wrong way round, and both are visible in
+ *  the decompilation:
+ *
+ *    - `if (v16 < 0)` - a *signed* test, so bit 7, guards the block that sizes
+ *      and skips a local colour table.  Bit 7 is the **interlace** flag.
+ *    - `v61 = 8, v55 = 1` when bit 6 is set, and 8 is the *first interlace
+ *      pass's stride*, so bit 6 - the **local colour table** flag - is what
+ *      starts the four-pass walk.
+ *
+ *  So a GIF carrying a local colour table (bit 6 set, bit 7 clear) is decoded as
+ *  interlaced, and its palette is *not* skipped; an interlaced one skips palette
+ *  bytes that are not there.  In the original, and reproduced here.
+ *
+ *  The interlace passes themselves are GIF's, though: the switch at 0x40D068
+ *  keys off the stride alone - 8, 8, 4, 2 - and starts each new pass at a
+ *  fixed offset from the row the image began at, so the four passes are 0, 4,
+ *  2 and 1 exactly as GIF specifies.  Nothing guards the switch except the
+ *  stride, which is why a stride of 1 only reaches it on the last row and a
+ *  stride of 2 ends the image.
+ *
+ *  The palette transform is the PCX trick again.  0x40CB98-0x40CBBE loads
+ *  p[0] into ecx, subtracts 0x100, shifts up twice and adds p[1] then p[2]:
+ *
+ *      Pal[i] = ((p[0] - 0x100) << 8 + p[1]) << 8 + p[2]
+ *
+ *  which is the identity on R,G,B and leaves the top byte at 0xFF by the
+ *  borrow - so a GIF ends up with the same internal 0xFFBBGGRR byte order as
+ *  PNG and BMP.  The entry counter ebp is stored directly (`[ebp*4]` at
+ *  0x40CBC0, advancing the source by three), so the indices are 0..size-1 and
+ *  `cmp ebp, 100h` is what stops the fill.  The rest of the ramp is then filled
+ *  with opaque black by the `rep stosd` at 0x40CBE6, and a Graphic Control
+ *  Extension's transparent index has its alpha byte cleared at 0x40CBF9.
+ */
+static int DecodeGif(const unsigned char *data, int size, unsigned char *pixels,
+                    int pitch, unsigned int width, unsigned int height,
+                    int xorigin, int yorigin)
+{
+    const unsigned char *pal;
+    GifBlocks b;
+    GifLzw z;
+    int transp = -1, gsize, flags, left, top, w, h, stride, interlace;
+    int i, col, row, colend, rowend, screenw, screenh;
+    int mincode, prev = -1;
+
+    OutColType = 3;
+    OutBitDepth = 8;
+
+    if (data[0] != 'G' || data[1] != 'I' || data[2] != 'F')
+        return -1;
+
+    b.p = data + 13;
+    b.end = data + size;
+
+    gsize = 1 << ((data[10] & 7) + 1);
+    unk_190A820 = gsize;
+    pal = data + 13;                            /* the global colour table */
+    if ((signed char)data[10] < 0)
+        b.p += 3 * gsize;
+
+    /* ---- the extension blocks, then one image descriptor ---- */
+
+    while (b.p < b.end && *b.p == 0x21) {
+        b.p++;
+        if (b.p + 1 < b.end && b.p[0] == 0xF9 && (b.p[2] & 1) != 0)
+            transp = b.p[5];
+        b.p++;
+        for (;;) {
+            unsigned char n = (b.p < b.end) ? *b.p++ : 0;
+
+            b.p += n;
+            if (!n)
+                break;
+        }
+    }
+
+    if (b.p >= b.end || *b.p != 0x2C)          /* not an image descriptor */
+        return -1;
+    b.p++;
+
+    left  = *(const unsigned short *)(b.p);
+    top   = *(const unsigned short *)(b.p + 2);
+    w     = *(const unsigned short *)(b.p + 4);
+    h     = *(const unsigned short *)(b.p + 6);
+    flags = b.p[8];
+    b.p += 9;
+
+    if (flags & 0x40) {
+        stride = 8;
+        interlace = 1;
+    } else {
+        stride = 1;
+        interlace = 0;
+    }
+
+    if ((signed char)flags < 0) {
+        /*
+         *  0x40CB6A.  `test cl, cl` / `jns` is a *signed* test, so this is bit
+         *  7 - the interlace flag - and it is the only thing that repoints the
+         *  palette.  0x40CAC7 put the *global* colour table there on the way
+         *  in, so this arm is meant to be the local one; bit 7 being interlace,
+         *  a real local colour table is left in place and read as image data,
+         *  and an interlaced one has the LZW stream skipped instead.
+         */
+        gsize = 1 << ((flags & 7) + 1);
+        unk_190A820 = gsize;
+        pal = b.p;
+        b.p += 3 * gsize;
+    }
+
+    /* ---- 0x40CB85: the palette ---- */
+
+    for (i = 0; i < 256; i++)
+        Pal[i] = 0xFF000000u;
+    for (i = 0; i < gsize && i < 256; i++) {
+        const unsigned char *e = pal + 3 * i;
+
+        /* the outer parentheses matter: + binds tighter than << */
+        Pal[i] = ((unsigned int)((((int)e[0] - 0x100) << 8) + e[1]) << 8)
+                   + e[2];
+    }
+    if (transp >= 0 && transp < 256)
+        Pal[transp] &= 0x00FFFFFFu;
+
+    /* ---- 0x40CC1D: the fast path, and then the background ---- */
+
+    screenw = *(const unsigned short *)(data + 6);
+    screenh = *(const unsigned short *)(data + 8);
+
+    col    = xorigin;
+    row    = yorigin;
+    colend = col + w;
+    rowend = row + h;
+
+    if (!(left == 0 && top == 0 && screenw == w && screenh == h)) {
+        unsigned bg = ((signed char)data[10] < 0)
+                          ? (unsigned int)Pal[data[11] & 0xFF] : 0u;
+        int cfirst = xorigin > 0 ? xorigin : 0;
+        int rfirst = yorigin > 0 ? yorigin : 0;
+        int clast  = (left + xorigin) < (int)width ? left + xorigin
+                                                   : (int)width;
+        int faredge    = (screenw + xorigin) < (int)width ? screenw + xorigin
+                                                      : (int)width;
+        int past   = cfirst + left + w;
+        int rlast  = (top + yorigin) < (int)height ? top + yorigin
+                                                   : (int)height;
+        int rlast2 = (yorigin + top + h) < (int)height ? yorigin + top + h
+                                                       : (int)height;
+        int rlast3 = (screenh + yorigin) < (int)height ? screenh + yorigin
+                                                       : (int)height;
+        int r;
+
+        /* the four rep stosd runs, in the order 0x40CCAE lays them out */
+        for (r = rfirst; r < rlast; r++)
+            if (cfirst < faredge)
+                memset32((int *)(pixels + (size_t)pitch * r) + cfirst,
+                         bg, faredge - cfirst);
+        for (r = rlast; r < rlast2; r++) {
+            int *line = (int *)(pixels + (size_t)pitch * r);
+
+            if (cfirst < clast)
+                memset32(line + cfirst, bg, clast - cfirst);
+            if (past < faredge)
+                memset32(line + past, bg, faredge - past);
+        }
+        for (r = rlast2; r < rlast3; r++)
+            if (cfirst < faredge)
+                memset32((int *)(pixels + (size_t)pitch * r) + cfirst,
+                         bg, faredge - cfirst);
+
+        col    = xorigin + left;
+        row    = yorigin + top;
+        colend = col + w;
+        rowend = row + h;
+    }
+
+    /* ---- 0x40CE22: the destination walk ---- */
+
+    if (row >= (int)height) {
+        col += (int)0x80000000;                 /* make the store test fail */
+        colend += (int)0x80000000;
+    }
+
+    /* ---- the LZW ---- */
+
+    if (b.p >= b.end)
+        return 0;
+    mincode = *b.p++;
+
+    memset(&z, 0, sizeof z);
+    z.clear = 1 << mincode;
+    z.end = z.clear + 1;
+    z.next = z.end + 1;
+    z.bits = 1;
+    while ((1 << (z.bits - 1)) < z.clear)
+        z.bits++;
+    if (z.bits > 12)
+        z.bits = 12;
+    for (i = 0; i < z.clear; i++) {
+        z.slot[i] = (unsigned short)i;
+        z.slotcode[i] = (unsigned char)i;
+        z.slotlen[i] = (unsigned char)i;
+    }
+
+    for (;;) {
+        int code, sp = 0, c, first, k;
+
+        code = GifNextCode(&z, &b);
+        if (code < 0 || code == z.end)
+            return 0;
+        if (code == z.clear) {
+            z.next = z.end + 1;
+            z.bits = z.clear == 2 ? 3 : (z.clear == 4 ? 4 :
+                      (z.clear == 8 ? 5 : 6));
+            if (z.bits > 12)
+                z.bits = 12;
+            prev = -1;
+            continue;
+        }
+
+        /*
+         *  Expand.  `slot[c]` is the code of string c's tail and `slotcode[c]`
+         *  its first character, so walking the chain down to a root and then
+         *  pushing that root fills the string in order.  A code equal to the
+         *  next free slot is the case that repeats the *previous* string's own
+         *  head - `c = prev`, not `next - 1`, because the slot the encoder
+         *  created is `prev + first char of prev` and the decoder has not built
+         *  it yet.
+         */
+        c = (code >= z.next) ? prev : code;
+        if (c < 0)
+            return 0;                                /* a malformed stream */
+        while (c >= z.end + 1) {
+            z.stack[sp++] = z.slotcode[c];
+            c = z.slot[c];
+        }
+        first = c;
+        z.stack[sp++] = (unsigned char)c;
+        if (code >= z.next)
+            z.stack[sp++] = (unsigned char)first;
+
+        /* a new slot: the previous string plus this one's first character */
+        if (prev >= 0 && z.next < 4100) {
+            z.slot[z.next] = (unsigned short)prev;
+            z.slotcode[z.next] = (unsigned char)first;
+            z.slotlen[z.next] = (unsigned char)(z.slotlen[prev] + 1);
+            z.next++;
+            /*
+             *  The encoder's table runs one entry ahead of this one, so it
+             *  reaches 1 << bits one code sooner; +1 on both sides of the
+             *  comparison is what keeps the two stepping together.  Without it
+             *  the first eight codes are fine and everything after them is
+             *  read at the wrong width.
+             */
+            if (z.next + 1 == (1 << z.bits) && z.bits < 12)
+                z.bits++;
+        }
+        prev = code;
+
+        /* ---- emit, backwards, 0x40D025 ---- */
+        for (k = sp - 1; k >= 0; k--) {
+            if ((unsigned)col < width && (unsigned)row < height)
+                *(int *)(pixels + (size_t)pitch * row + (size_t)col * 4) =
+                    Pal[z.stack[k]];
+
+            col++;
+            if (col != colend)
+                continue;
+
+            row += stride;
+            if (row >= rowend) {
+                /*
+                 *  0x40D068: the switch is on the *stride*, with no flag
+                 *  guarding it.  A stride of 1 only reaches here on the last
+                 *  row, and 2 ends the image; 8 and 4 start the next pass at a
+                 *  fixed offset from the row the image began at, which is
+                 *  GIF's own 0, 4, 2, 1 after all.  var_55 just alternates the
+                 *  two stride-8 passes.
+                 */
+                if (stride == 8) {
+                    if (interlace) {
+                        interlace = 0;
+                        row = yorigin + top + 4;
+                    } else {
+                        row = yorigin + top + 2;
+                        stride = 4;
+                    }
+                } else if (stride == 4) {
+                    row = yorigin + top + 1;
+                    stride = 2;
+                } else {
+                    return 0;
+                }
+            }
+            col    = xorigin + left;
+            colend = col + w;
+            if (row >= (int)height) {
+                col += (int)0x80000000;
+                colend += (int)0x80000000;
+            }
+        }
+    }
+
+    (void)b;
+    return 0;
+}
+
 int DecodeImage(unsigned char *fileimg, int filesize, unsigned char *pixels,
                 int pitch, unsigned int width, unsigned int height,
                 int unused7, int unused8)
@@ -1798,7 +2223,7 @@ int DecodeImage(unsigned char *fileimg, int filesize, unsigned char *pixels,
     /*
      *  sub_409560's dispatch, in its order.  The format codes it returns are
      *  1 PNG, 2 JPEG, 3 GIF, 4 the 8bpp palette below, 5 BMP, 6 PCX, 7 DDS and
-     *  8 Targa; of those only 1 and 4 are transcribed.
+     *  8 Targa; of those 1, 3, 4, 5, 6 and 8 are transcribed.
      */
     if (fileimg && filesize >= 2) {
         if (fileimg[0] == 0x89 && fileimg[1] == 'P')
@@ -1815,6 +2240,10 @@ int DecodeImage(unsigned char *fileimg, int filesize, unsigned char *pixels,
 
         if (*(const unsigned int *)fileimg == 0x0801050Au)
             return DecodePcx(fileimg, filesize, pixels, pitch, width, height,
+                             unused7, unused8);
+
+        if (fileimg[0] == 'G' && fileimg[1] == 'I')
+            return DecodeGif(fileimg, filesize, pixels, pitch, width, height,
                              unused7, unused8);
 
         /*
@@ -1834,8 +2263,8 @@ int DecodeImage(unsigned char *fileimg, int filesize, unsigned char *pixels,
     }
 
     printf("\n*** That input format has not been reconstructed yet.\n"
-           "*** This build decodes PNG and the 8bpp palettised format;"
-           " see README.md.\n\n");
+           "*** This build decodes PNG, GIF, BMP, PCX, Targa and the 8bpp"
+           " palettised format; see README.md.\n\n");
     exit(3);
     return -1;
 }
