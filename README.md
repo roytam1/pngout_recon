@@ -2173,6 +2173,16 @@ So the corpus is ready and the entropy body can be transcribed against it. What
 is still missing is a **progressive** file to pin the `0xC2` behaviour down; that
 needs a second scan encoder, which `jpeglib` does not have.
 
+#### SOS selectors are parsed; the entropy body is next
+
+The SOS case now records each scan component's DC/AC table selectors against
+its id (defaulting to 0), so the front end is complete through the scan
+header: markers, SOF, DQT, DHT, DRI and SOS selectors. Still returning -1 -
+the bit reader, coefficient loop and MCU walk that consume the scan are the
+next piece, with the bit-reader/Huffman/extend helpers already drafted
+(`JpegBit`, `JpegHuffSym`, `JpegExtend`) awaiting the block decoder that
+calls them.
+
 #### `sub_40C790` is transcribed and verified (`JpegIdct`)
 
 The AAN integer IDCT is now C, variable for variable with the decompilation,

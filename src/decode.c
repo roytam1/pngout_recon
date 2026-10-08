@@ -2519,6 +2519,7 @@ static const unsigned char JpegZigzag[64] = {
 
 typedef struct JpegComp {
     unsigned id, hsamp, vsamp, qsel;
+    unsigned dc_sel, ac_sel;            /* scan selectors (SOS), default 0 */
 } JpegComp;
 
 typedef struct JpegHuff {
@@ -2769,8 +2770,33 @@ static int DecodeJpeg(const unsigned char *data, int size,
         marker = *p++;
         if (marker == 0xD9)
             break;                          /* EOI */
-        if (marker == 0xDA)
-            break;                          /* SOS: entropy body not yet */
+        if (marker == 0xDA) {
+            /* SOS: component selectors, then spectral/approximation */
+            unsigned ns, i;
+            const unsigned char *q = p;
+
+            if (p + 1 > end)
+                return -1;
+            ns = *q++;
+            if (ns > 4 || q + 2 * ns + 3 > end)
+                return -1;
+            for (i = 0; i < JpegNComp; i++)
+                JpegComps[i].dc_sel = JpegComps[i].ac_sel = 0;
+            for (i = 0; i < ns; i++) {
+                unsigned cid = q[0], sel = q[1];
+                unsigned j;
+
+                for (j = 0; j < JpegNComp; j++) {
+                    if (JpegComps[j].id == cid) {
+                        JpegComps[j].dc_sel = (sel >> 4) & 15;
+                        JpegComps[j].ac_sel = sel & 15;
+                    }
+                }
+                q += 2;
+            }
+            /* Ss, Se, Ah/Al follow; entropy body not yet */
+            break;
+        }
         if (marker == 0x01 || (marker >= 0xD0 && marker <= 0xD7))
             continue;                       /* no length: TEM, RSTn */
         if (p + 2 > end)
