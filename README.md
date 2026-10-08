@@ -2320,6 +2320,21 @@ solves to date are consistency checks, not determinations; the gradient
 joint solve is the defined next step and the first one that can actually
 conclude.
 
+#### Tables solved: linear fit worst 3 on 153 pixels, worst 5 on 422/420
+
+Per-MCU `v4` (`Cb`/`Cr` blocks via `+256`, `bpm=1`, interleaved) plus linear
+tables `Tbl[i] = m*i + c` hill-climbed on ramp 444 row data: `m =
+(1M, 725k, -100k, -400k)`, `c = (-8M, -6.4M, -4M, -4M)`, worst 3 over 153
+pixels (full image, all MCUs). Same params on 422/420 (approximate
+subsample mapping, no shifts) give worst 5 over 144+128 pixels - so the
+mapping generalises across layouts within a few levels, and remaining error
+is IDCT/rounding/coefficient differences vs ImageMagick, not table error.
+Intercepts shifted from grey-flat fit (`cB` -8M to -6.4M) once gradients
+constrain them; slopes stable. These eight integers are the colour tables
+(functionally; original values unknowable to 2^22 from pixels, which is
+immaterial since any value in range gives identical output). Transcription
+with hardcoded tables plus C-vs-IM pixel verification is next, then dispatch.
+
 #### Linear `v4` fails at MCU boundaries; per-MCU bases required
 
 Row 0 (single MCU in `x`) fits linear tables to worst 3; row 1 spanning three
