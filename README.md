@@ -2228,6 +2228,26 @@ next piece, with the bit-reader/Huffman/extend helpers already drafted
 (`JpegBit`, `JpegHuffSym`, `JpegExtend`) awaiting the block decoder that
 calls them.
 
+#### Colour slopes blocked on plane mapping; B~747M contradiction proves result != Cb
+
+Red flat (`Y=-218103808`, want `(254,1,0)`) forces `B ~ +747M` via
+`(Y+B)>>22 = 126` (for `R=254` from `T1[126]`), but `Cb` index `-358` reads
+below-base (assumed zero). Contradiction - so `result` does not come from `Cb`
+for red, and by extension the `v15`/`v4` plane assignment (which memory backs
+`v6` vs `result` for single- vs multi-component, direct vs buffered) must be
+mapped from the listing before any table solve. Nine plane-mapping hypotheses
+(`Y/Cb/Cr` x `Y/Cb/Cr` for `v6`/`result`) all fail under analytic IDCT values;
+exact C IDCT values (`Y=-218103808, Cb=-187170816, Cr=534773760` for red flat,
+from verified dumps) confirm the indices (`Y->-416, Cb->-358, Cr->1020`) but
+not which plane feeds which index. That single mapping read - trace `v4 =
+a3+2560` and `v15` advances plus `v15[64]` through one `h=1` 8-pixel run in
+the listing, noting which plane each lands in for the direct path - unblocks
+everything: indices become known, tables solve to ranges (2^22 granularity,
+functionally exact), slopes fit across primaries, `sub_408D80` transcribes
+with hardcoded tables, pixels verify vs ImageMagick. All prior steps (front
+end, entropy, IDCT, dequant, equation form, unsigned wrap, grey biases) are
+committed and green; this mapping is the only missing link.
+
 #### Fitted table biases at chroma index 0: `-2^23, -2^23, -2^22, -2^22`, worst 2
 
 Brute-forced `(A0,B0,C0,D0)` over flat greys `L=0..255` through the replicated
