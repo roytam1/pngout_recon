@@ -2228,6 +2228,26 @@ next piece, with the bit-reader/Huffman/extend helpers already drafted
 (`JpegBit`, `JpegHuffSym`, `JpegExtend`) awaiting the block decoder that
 calls them.
 
+#### Zero tables work for black and mid-grey, fail for white - and one constant cannot fix it
+
+Flat greys through the replicated equation with zero address tables: `L=0`
+gives `(0,0,0,255)` exact, `L=128` gives `(128,128,128,255)` exact, but
+`L=255` gives `(0,0,0,255)` instead of white - the index lands at 128, in the
+dead zone (`T0[128..895]` are zero; only `0..127` and `896..1023` are
+populated). So the tables are nonzero, and specifically they must lift high-Y
+into `896..1023`.
+
+But no single constant can do that for all levels: `Y(L)` spans roughly
+`-2^29..+2^29`, while the two populated regions total 256 indices (`128` plus
+`128`) against a `2^30` span - a constant shift mapping that range onto two
+disjoint regions must cross the dead `128..895` in between. Hence the table
+index itself must vary with the pixel even for grey (i.e. the "chroma" index
+tracks `Y`, because single-component reads chroma from somewhere
+determinate, likely the Y plane itself). Solving the tables therefore needs
+the index computation from `sub_408D80` mapped first - which planes `v15`
+and `v4` point to for single-component - not just the equation. That mapping
+is the next read, and it is small.
+
 #### The colour equation replicates - zero tables give structured grey
 
 Replicated `T0[(Y+A)>>22] + T1[(Y+B)>>22] + T2[(Y+C+D)>>22]` in Python with
