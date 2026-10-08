@@ -2228,6 +2228,27 @@ next piece, with the bit-reader/Huffman/extend helpers already drafted
 (`JpegBit`, `JpegHuffSym`, `JpegExtend`) awaiting the block decoder that
 calls them.
 
+#### Below-base reads must be nonzero - tables extend below, writer fills there
+
+Red flat forces `A ~ -317M` for its `B` channel (via `(Y+A)>>22 = 896`), but
+`A` comes from `v6` below-base under every plane mapping that puts `v6` in
+`Cb`/`Y` (indices `-358`/`-416`). Zero there gives `B=76`, not `0` - so
+below-base memory holds real table values, not zero padding. Hence IDA's
+bases are interior points: the true tables extend at least 4KB below nominal
+(`-1024` indices for dark pixels), and the writer fills that extended range
+via computed pointer. No static trace can name it (global neighbourhood
+search already proved that); the values are recoverable only by fitting
+against observed pixels, which is now fully specified: layout simulation
+gives exact `(v6, result)` per pixel (bpm/shifts/index-advance all known),
+`Y` comes from verified C IDCT dumps, expected RGB from ImageMagick, and each
+pixel constrains table entries at its two indices (ranges via `T` inversion,
+representatives picked, `C`/`D` split via `v6 != result` gradient data).
+Grey (`index 0`) and red (`index 1020`) solves stand as anchor points; green
+and blue (below-base indices) solve the same way once below-base is treated
+as unknowns rather than zeros. That fit plus `sub_408D80` transcription with
+hardcoded tables plus C-vs-IM pixel verification is the complete remaining
+path - no further analysis needed, only implementation.
+
 #### Global store search: nothing writes those neighbourhoods, anywhere
 
 Seventy-six distinct store destinations in `0x18CC`-`0x18DF`, and **none** in
