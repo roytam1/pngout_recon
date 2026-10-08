@@ -2335,6 +2335,19 @@ constrain them; slopes stable. These eight integers are the colour tables
 immaterial since any value in range gives identical output). Transcription
 with hardcoded tables plus C-vs-IM pixel verification is next, then dispatch.
 
+#### Per-MCU `v4` verified: worst 147 to 8 on row 1, slopes generalise to 5 on 422/420
+
+Replacing global-linear `v4` with per-MCU bases (`Cb`/`Cr` blocks via `+256`,
+`bpm=1`, interleaved `Y,Cb,Cr` per MCU) drops row-1 error from worst 147 to 8
+- no offset fixes it, only correct MCU bases. Refit slopes on full-image data
+with correct indices: worst 3 over 153 ramp-444 pixels. Same params on 422/420
+(approximate subsample mapping) give worst 5 over 144+128 pixels. Grey holds
+(worst 2) with refit intercepts, so tables are globally consistent across
+layouts, not overfitted to flats. Remaining error is implementation differences
+vs ImageMagick (integer vs float IDCT/rounding/coefficients), not table error.
+Transcription with hardcoded tables plus C-vs-IM pixel verification is next,
+then dispatch - no further analysis needed, only implementation.
+
 #### Linear `v4` fails at MCU boundaries; per-MCU bases required
 
 Row 0 (single MCU in `x`) fits linear tables to worst 3; row 1 spanning three
