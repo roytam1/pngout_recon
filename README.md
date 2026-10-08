@@ -2173,6 +2173,27 @@ So the corpus is ready and the entropy body can be transcribed against it. What
 is still missing is a **progressive** file to pin the `0xC2` behaviour down; that
 needs a second scan encoder, which `jpeglib` does not have.
 
+#### `sub_40C790` is transcribed and verified (`JpegIdct`)
+
+The AAN integer IDCT is now C, variable for variable with the decompilation,
+and checked as a transform rather than against pixels: linearity is exact
+(`IDCT(a+b) == IDCT(a)+IDCT(b)` to the level), DC gain is 1 (flat in, flat
+out), and a single AC coefficient comes out as the right cosine wave. It is
+not yet called - the entropy body that feeds it is still missing - so this
+is verified arithmetic awaiting its caller, not a decoder.
+
+Two transcription notes, both the kind that produce a wrong transform rather
+than a crash:
+
+* The column loop's bounds are **byte addresses as unsigned**, not pointers.
+  `v46`/`v47` are `(a1+64)` and `- 96` as integers (addr+256, addr+160), and
+  the loop compares `(unsigned)v19 < v47` over addresses. Typing them as
+  `int*` ends the loop after a single column; the rows come out right and
+  everything below row 0 stays zero, which looks almost plausible.
+* The products are multiply-high: `(unsigned __int64)(K * diff) >> 32` with
+  `K` signed 64-bit, so a negative product contributes its high half. VC6
+  has no `long long`; `__int64` is the spelling.
+
 #### The front end is transcribed and verified (`DecodeJpeg`, markers through DRI)
 
 The marker walk, SOF, DQT, DHT and DRI are now C, wired to the dispatch but

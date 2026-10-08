@@ -2626,6 +2626,119 @@ static void JpegDQT(int tq, int prec, const unsigned char *data)
     }
 }
 
+/* ------------------------------------------------------------------ */
+/*  sub_40C790: the 8x8 integer IDCT (AAN)                             */
+/* ------------------------------------------------------------------ */
+
+/*
+ *  sub_40C790(block, shift): the Arai/Agui-Nakajima scaled integer IDCT,
+ *  in place over 64 dwords.  Eight row passes guarded by `(shift & 1)` with
+ *  `shift >>= 1` after each - so `shift` is a bitmask of which rows carry
+ *  data (1 for DC-only, 0xFF for a full block) - then eight column passes
+ *  unconditionally.  The four constants divided by 2^30 are sqrt(2),
+ *  2cos(pi/16), and the two band scales; see the JPEG section in README.md.
+ *
+ *  The products are 64-bit signed multiplies whose high 32 bits are taken:
+ *  `(unsigned __int64)(K * diff) >> 32`.  That is the multiply-high idiom -
+ *  the cast happens after the signed multiply, so a negative product comes
+ *  back as its high half, not as a logical shift.  VC6 spells the type
+ *  `__int64`.  Variable names follow the decompilation (v3..v18, v38..v45)
+ *  so the transcription can be checked line for line against it.
+ */
+static void JpegIdct(int *a1, unsigned a2)
+{
+    /* v46/v47 are byte addresses as unsigned, not pointers - the column
+     * loop compares (unsigned)v19 < v47, i.e. addresses, so 8 iterations
+     * from addr+128 to addr+160.  Typing them as int* ends the loop after
+     * one pass. */
+    int *v2 = a1;
+    unsigned v46 = (unsigned)(a1 + 64);
+
+    do {
+        if (a2 & 1) {
+            int v3 = v2[6];
+            int v4 = v2[2];
+            int v5 = v4 + v3;
+            int v6 = (int)(((unsigned __int64)(1518500224i64 *
+                            (v4 - v3))) >> 32);
+            int v7 = v2[4];
+            int v8 = v7 + *v2;
+            int v9 = *v2 - v7;
+            int v10 = v8 + v5;
+            int v11 = 4 * v6 - v5;
+            int v44 = v8 - v5;
+            int v42 = v9 - v11;
+            int v40 = v9 + v11;
+            int v12 = v2[5];
+            int v13 = v2[3];
+            int v38 = 4 * (int)(((unsigned __int64)(1984016192i64 *
+                            (v12 + v2[1] - v13 - v2[7]))) >> 32);
+            int v14 = v2[7] + v12 + v13 + v2[1];
+            int v15 = v38 + 8 * (int)(((unsigned __int64)(1402911296i64 *
+                            (v13 - v12))) >> 32) - v14;
+            int v16 = 4 * (int)(((unsigned __int64)(1518500224i64 *
+                            (v2[7] + v2[1] - v13 - v12))) >> 32) - v15;
+            int v17 = 4 * (int)(((unsigned __int64)(1162209792i64 *
+                            (v2[1] - v2[7]))) >> 32) - v38;
+            int v18 = v16 + v17;
+
+            *v2 = v14 + v10;
+            v2[6] = v40 - v15;
+            v2[1] = v15 + v40;
+            v2[7] = v10 - v14;
+            v2[2] = v42 + v16;
+            v2[5] = v42 - v16;
+            v2[4] = v18 + v44;
+            v2[3] = v44 - v18;
+        }
+        v2 += 8;
+        a2 >>= 1;
+    } while ((unsigned)v2 < v46);
+
+    {
+        int *v19 = v2 - 32;
+        unsigned v47 = v46 - 96;
+
+        do {
+            int v20 = *(v19 - 16);
+            int v21 = v19[16];
+            int v22 = v20 + v21;
+            int v23 = (int)(((unsigned __int64)(1518500224i64 *
+                            (v20 - v21))) >> 32);
+            int v24 = *(v19 - 32);
+            int v25 = v24 + *v19;
+            int v26 = v24 - *v19;
+            int v27 = 4 * v23 - v22;
+            int v28 = v25 + v22;
+            int v45 = v25 - v22;
+            int v41 = v26 + v27;
+            int v43 = v26 - v27;
+            int v29 = v19[8];
+            int v30 = *(v19 - 8);
+            int v39 = 4 * (int)(((unsigned __int64)(1984016192i64 *
+                            (v29 + *(v19 - 24) - v30 - v19[24]))) >> 32);
+            int v31 = v19[24] + *(v19 - 24) + v30 + v29;
+            int v32 = v39 + 8 * (int)(((unsigned __int64)(1402911296i64 *
+                            (v30 - v29))) >> 32) - v31;
+            int v33 = 4 * (int)(((unsigned __int64)(1518500224i64 *
+                            (v19[24] + *(v19 - 24) - v29 - v30))) >> 32) - v32;
+            int v34 = 4 * (int)(((unsigned __int64)(1162209792i64 *
+                            (*(v19 - 24) - v19[24]))) >> 32) - v39;
+            int v35 = v33 + v34;
+            int v36 = v45 - v35;
+
+            *(v19 - 32) = v31 + v28;
+            v19[16] = v41 - v32;
+            *(v19 - 24) = v32 + v41;
+            v19[8] = v43 - v33;
+            *(v19 - 16) = v43 + v33;
+            v19[24] = v28 - v31;
+            *v19 = v35 + v45;
+            *(v19 - 8) = v36;
+            ++v19;
+        } while ((unsigned)v19 < v47);
+    }
+}
 static int DecodeJpeg(const unsigned char *data, int size,
                       unsigned char *pixels, int pitch,
                       unsigned int width, unsigned int height,
