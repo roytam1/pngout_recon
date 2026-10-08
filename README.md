@@ -2492,6 +2492,34 @@ addresses), and not in `reference/data.lst` either - so it fills through a
 register-held pointer somewhere, and tracing that pointer is the remaining job.
 Everything else about the decoder is known, standard, and has its values.
 
+#### All forty-seven stores in `sub_40B180` are accounted for - and it is not there either
+
+Forty-seven distinct store targets in `0x40B180..0x40C542`, and the only
+register-indirect ones are three known operations, not a fill:
+
+* `mov [ecx] / [ecx+4] / [ecx+8] / [ecx+0Ch]` at `0x40B403..0x40B414` - the DHT
+  sixteen-byte count copy (`*v27 = *v26; v27[1..3]`), straight-line, four
+  dwords. The sole pair-store pattern in the function.
+* `mov [edx+ecx*4], eax` at `0x40BFB3` - the decoded DC coefficient into the
+  block, `ecx` being the zigzag index from `dword_18DF780[edi*4]`.
+* `mov [ebx+edi*2], ax` / `mov [ebx+edi*2], dx` - sixteen-bit coefficient
+  stores (note `ax`/`dx`, not `eax`), the progressive/block buffers.
+
+Everything else is a named `.data` table from the SOF/DHT/DQT/SOS setup or a
+stack local. So the colour-table fill is not in `sub_40B180` by any store
+form - direct, `rep`, pair, or indexed. Combined with clean bills for
+`sub_40C580`, `sub_408D80` and the dispatch, that exhausts every function
+that touches JPEG state.
+
+What remains is one of two things, and both need more than the listing
+alone: a fill through a pointer held in another variable (so neither the
+address nor a `lea` of it ever appears - find it by tracing a `.data`
+pointer value, not an address literal), or IDA mis-segmenting the symbols
+(the `.data: ... dd ?` could still be wrong about *which* object lives at
+those bytes). The `pngout.exe.lst` DATA XREFs confirm only `sub_408D80`
+reads them, so whichever it is, it has no other reader to cross-check
+against.
+
 #### The fill is not a `rep` either - narrowing to computed stores
 
 Seventy-two `rep` operations in the binary, and every one in JPEG range is a
