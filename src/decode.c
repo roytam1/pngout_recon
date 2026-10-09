@@ -3415,7 +3415,26 @@ static void JpegProgFree(void)
 
 /* One refinement raw bit, dry-at-marker counts as 0 (`test ebx,esi/jz` in
  * `sub_40C700`-style slow reads; valid scans always have the bit, corrupt
- * ones complete with 0 instead of crashing/OOB). */
+ * ones complete with 0 instead of crashing/OOB).
+ *
+ * `skip` implements the AC-refine reader's index order.  The listing has two
+ * raw-bit readers that differ by one: the coefficient-sign read masks at the
+ * current bit count and *then* decrements (0040BE4B/0040BE52), while the AC
+ * refine read decrements first and masks the lower bit (0040BECE), against
+ * `dword_410158` = 2^n rather than the DC path's constant `dword_410154`
+ * mask.  Reading the refine bit from the same end as the sign bit refines a
+ * coefficient the original leaves alone (scan 9's Cb k1: -3 instead of -2). */
+static int JpegRawBitSkip(JpegBit *b, int skip)
+{
+    int bit = 0;
+
+    JpegRefill(b, skip + 1);
+    if (b->nbits > skip)
+        bit = (b->reg >> ((b->nbits - 1) - skip)) & 1;
+    b->nbits -= (b->nbits > skip) ? 1 : 0;
+    return bit;
+}
+
 static int JpegRawBit(JpegBit *b)
 {
     int bit = 0;
@@ -3625,7 +3644,7 @@ static const unsigned char *JpegDecodeProgScan(const unsigned char *scan,
                                          * down and break at run < 0. */
                                         while (k <= (int)Se) {
                                             if (blk[k]) {
-                                                if (JpegRawBit(&bit))
+                                                if (JpegRawBitSkip(&bit, 1))
                                                     blk[k] =
                                                         (short)(blk[k] +
                                                         (blk[k] > 0 ?
