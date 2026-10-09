@@ -2572,12 +2572,14 @@ Against the original binary, per-scan prefixes (truncated after each scan)
 are now **bit-exact for scans 1-9** (worst 0 each, previously 17-21 from
 scan 2 on); the whole file sits at **worst 3**, down from 21.
 
-The last residual is scan 10 alone, at worst 3 on two pixels — the final AC
-refinement of the luma band, where every block is already `EOBRUN`-skipped
-except the first and last. Its merged coefficients match the listing-faithful
-Python merge exactly (C and the model agree block-for-block), so the remaining
-difference is in the refine read's bit position on that scan, not in the
-coefficient values. C-vs-IM interior stays within the bound 30 in
+The last residual is scan 10 alone, worst 3 on two pixels, both in the
+clipped-edge region (x>=8, y>=7). It is **not** in the progressive merge: an
+independent listing-faithful Python merge reproduces all ten C prefixes
+exactly ([0,0,0,0,0,0,0,0,0,3]), and an exhaustive search over every Y
+coefficient in the two blocks scan 10 writes cannot drive the error below 3.
+So the difference lives downstream of the coefficient merge — IDCT fixed-point
+rounding or the colour tables, reached only by this scan's specific
+high-frequency pattern. C-vs-IM interior stays within the bound 30 in
 `run_jpeg_progressive`. Per-scan `jpeg: pscan` dumps were temporary (reverted);
 final `jpeg: pblk` stays (like `blk`/`dbl`/`idct`).
 
