@@ -2462,7 +2462,13 @@ slip (DC-only restart is bit-identical, proving framing/predictors right);
 fidelity demands the EOB, not a refuse. A bit-at-a-time fallback that
 refused dry (tried first) diverged - reverted. Grey+restart single-component
 (`dt_j_grey_grey_2_8`) still refuses cleanly (separate bit-reader edge -
-since fixed, decodes tight; historical note).
+since fixed, decodes tight; historical note). EOB runs (`dword_410158`)
+verified r=1 exact by hand-decode (scan2 EOBn at MCU1-b0 covering b1-b3,
+tail padding) and r=2 with data after (49x9 two-tone progressive, temp
+verification only: flat-half exact (4), ramp-half sane (boundary 25);
+misalignment would garbage/refuse, so base+extra alignment held in first
+and refine scans across bands); runs>2 untested (needs bigger images;
+overshoot safe by bounded loops).
 
 #### JPEG h=1 output wired: fitted functional tables, pixel-verified, known gaps
 

@@ -3611,8 +3611,14 @@ static unsigned JpegProgBase[4];
 static unsigned JpegProgBlocks = 0;
 static int JpegProgActive = 0;
 /* `dword_410158` EOB run bases: following-skipped blocks for run r.
- * Verified on scan2 EOBn (r=1,extra=0 covers 3 following: b1,b2,b3, tail
- * (1,1) padding); runs>1 validate via C-vs-IM pixels (sane => held). */
+ * Verified r=1 exact (scan2 hand-decode: EOBn at MCU1-b0 covering b1-b3,
+ * tail (1,1) padding) and r=2 with data after (49x9 two-tone progressive:
+ * flat-half exact (4), ramp-half sane (boundary 25, corner 202 padding);
+ * misalignment would garbage/refuse, so base+extra alignment held for
+ * runs 1-2 in first and refine scans, multiple bands). Runs>2 (15+
+ * following) untested - needs bigger images (all corpus scans <=12 blocks,
+ * max run 7); overshoot is safe (bounded MCU loops, skipped blocks consume
+ * no bits) and the doubling pattern is structural. */
 static const int JpegEobRun[15] =
 {1,3,7,15,31,63,127,255,511,1023,2047,4095,8191,16383,32767};
 
