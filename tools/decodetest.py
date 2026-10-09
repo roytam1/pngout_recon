@@ -1756,8 +1756,15 @@ def run_jpeg(case):
         ("ramp", "grey", 0, 8): 12,
         ("grey", "grey", 0, 8): 12,
         ("checker", "grey", 0, 8): 140,
+        ("flat", "422", 0, 8): 5, ("flat", "422", 2, 8): 5,
+        ("flat", "420", 0, 8): 5, ("flat", "420", 2, 8): 5,
+        ("grey", "422", 0, 8): 12, ("grey", "422", 2, 8): 12,
+        ("grey", "420", 0, 8): 12, ("grey", "420", 2, 8): 12,
+        ("ramp", "422", 0, 8): 20, ("ramp", "422", 2, 8): 20,
+        ("ramp", "420", 0, 8): 12, ("ramp", "420", 2, 8): 12,
     }
-    DECODE_ONLY = {("checker", "444", 0, 8)}
+    DECODE_ONLY = {("checker", "444", 0, 8), ("checker", "420", 0, 8),
+                   ("checker", "420", 2, 8), ("checker", "422", 0, 8)}
     key = (name, comps, restart, precision)
     conv = _im_convert()
     did_pixels = False

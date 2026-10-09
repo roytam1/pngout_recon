@@ -2464,12 +2464,21 @@ refused dry (tried first) diverged - reverted. Grey+restart single-component
 
 #### JPEG h=1 output wired: fitted functional tables, pixel-verified, known gaps
 
-`JpegOutput444` returns 0 and `dumpdec` accepts JPEG: 12/33 corpus files
-decode to pixels, 21 refuse cleanly (`DecodeImage refused`: all h=2
-(422/420), progressive (buffered path missing), single-component restart
+`JpegOutput444` returns 0 and `dumpdec` accepts JPEG: 27/33 corpus files
+decode (23 to pixels, 4 decode-only), 6 refuse cleanly (`DecodeImage
+refused`: progressive (buffered path missing), single-component restart
 (header-gated `JpegRestart && NComp==1`: flat/ramp/grey restart-1comp
 degrade 50/refuse vs 3-comp exact-or-bounded), high-contrast restart
-(checker 444/grey restart-2 refuse). `--jpeg` asserts C-vs-ImageMagick
+(checker 444/grey/422 restart-2 refuse). Subsampled Y-hs=2 (422/420) is
+wired via `JpegOutputSub`: the listing `408FD5` paired loop shares one
+chroma sample per luma pair (`sar ecx,1` - point replication, no filter),
+same four tables + T0/T1/T2 equation per pixel (second Y loaded
+dest-relative, i.e. the next luma sample); chroma column `bx*4+(x>>1)`,
+row `y` (422) or `by*4+(y>>1)` (420). Subsampled chroma is smoother
+(2x1/2x2 averages) so indices land inside the smooth fitted range - no new
+values needed: flat422/420 exact (0 incl. restart), grey422/420 6,
+ramp420 7, ramp422 8/13 (restart same, no extra degradation).
+`--jpeg` asserts C-vs-ImageMagick
 pixels (not refusal): flat444 0/0 (exact incl. restart), grey444 6/6,
 ramp444 7/13 non-restart and 17 restart, flatgrey 5/17-corner-pad,
 rampgrey 6, greygrey 6/6/85-corner-white-pad, checkergrey 6/133-edge -

@@ -3478,6 +3478,112 @@ static int JpegOutput444(unsigned char *pixels, int pitch,
     }
     return 0;
 }
+
+/* Subsampled (422/420) h=1 output: listing `408FD5-408E2` paired loop.
+ * Two luma pixels share one chroma sample (`sar ecx,1` pair index - point
+ * replication, no filtering): chroma column is `bx*4 + (x>>1)`, row is `y`
+ * for 422 (v=1, rows align) or `by*4 + (y>>1)` for 420 (v=2).  The equation
+ * is the same four tables + T0/T1/T2 with logical `shr 22` (the h=2 body at
+ * `408FF0` repeats the h=1 computation per pixel of the pair, only the Y
+ * differing - second Y loaded dest-relative, i.e. the next luma sample).
+ * Gate: 3 components, Y hs=2, chroma 1x1, Y vs 1|2.  Same fitted tables
+ * (subsampled chroma is smoother - averages over 2x1/2x2 - so indices land
+ * inside the smooth fitted range; verified vs ImageMagick, see run_jpeg).
+ * 1-comp restart gate does not apply (NComp==3 here); 3-comp restart EOB
+ * tails carry over (bounded, faithful). */
+static int JpegOutputSub(unsigned char *pixels, int pitch,
+                          unsigned width, unsigned height,
+                          int xorigin, int yorigin)
+{
+    unsigned mx, my, bx, by, x, y;
+    unsigned mcux, mcuy, hmax = 2, vmax, ci;
+
+    JpegMakeTables();
+    JpegMakeT();
+
+    if (JpegNComp != 3)
+        return -1;
+    if (JpegComps[0].hsamp != 2)
+        return -1;
+    vmax = JpegComps[0].vsamp;
+    if (vmax != 1 && vmax != 2)
+        return -1;
+    for (ci = 1; ci < 3; ci++) {
+        if (JpegComps[ci].hsamp != 1 || JpegComps[ci].vsamp != 1)
+            return -1;
+    }
+    mcux = (JpegWidth + 8 * hmax - 1) / (8 * hmax);
+    mcuy = (JpegHeight + 8 * vmax - 1) / (8 * vmax);
+    if (mcux * mcuy > JPEG_MAX_MCU)
+        return -1;
+
+    for (my = 0; my < mcuy; my++) {
+        for (mx = 0; mx < mcux; mx++) {
+            unsigned mcu = my * mcux + mx;
+            int *Cbblk = JpegIdctBuf[mcu][1][0];
+            int *Crblk = JpegIdctBuf[mcu][2][0];
+
+            for (by = 0; by < vmax; by++) {
+                for (bx = 0; bx < 2; bx++) {
+                    int *Yblk = JpegIdctBuf[mcu][0][by * 2 + bx];
+
+                    for (y = 0; y < 8; y++) {
+                        for (x = 0; x < 8; x++) {
+                            int lx = (int)(mx * 16 + bx * 8 + x);
+                            int ly = (int)(my * 8 * vmax + by * 8 + y);
+                            int dx = lx + xorigin;
+                            int dy = ly + yorigin;
+                            int pos = (int)(y * 8 + x);
+                            int cx = (int)(bx * 4 + (x >> 1));
+                            int cy = (vmax == 1) ? (int)y :
+                                                     (int)(by * 4 + (y >> 1));
+                            int cpos = cy * 8 + cx;
+                            int Y, Cb, Cr, v6, res;
+                            int A, B, C, D, i0, i1, i2;
+                            unsigned s;
+
+                            if (dx < 0 || dx >= (int)width || dy < 0 ||
+                                dy >= (int)height)
+                                continue;
+                            Y = Yblk[pos];
+                            Cb = Cbblk[cpos];
+                            Cr = Crblk[cpos];
+                            v6 = (Cb >> 19) & ~1;
+                            res = (Cr >> 19) & ~1;
+                            A = JpegTabLookup(JpegTA, res);
+                            B = JpegTabLookup(JpegTB, v6);
+                            C = JpegTabLookup(JpegTC, res);
+                            D = JpegTabLookup(JpegTD, v6);
+                            i0 = (int)(((unsigned)((unsigned)Y + (unsigned)A +
+                                                   (unsigned)B)) >> 22);
+                            i1 = (int)(((unsigned)((unsigned)Y +
+                                                   (unsigned)C)) >> 22);
+                            i2 = (int)(((unsigned)((unsigned)Y +
+                                                   (unsigned)D)) >> 22);
+                            {
+                                __int64 sum = (__int64)JpegT0[i0] +
+                                              JpegT1[i1] + JpegT2[i2];
+
+                                s = (unsigned)(sum & 0xFFFFFFFF);
+                            }
+                            {
+                                unsigned char *dst = pixels +
+                                                     (size_t)dy * pitch +
+                                                     (size_t)dx * 4;
+
+                                dst[0] = (unsigned char)(s & 255);
+                                dst[1] = (unsigned char)((s >> 8) & 255);
+                                dst[2] = (unsigned char)((s >> 16) & 255);
+                                dst[3] = (unsigned char)((s >> 24) & 255);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return 0;
+}
 static int DecodeJpeg(const unsigned char *data, int size,
                       unsigned char *pixels, int pitch,
                       unsigned int width, unsigned int height,
@@ -3556,15 +3662,16 @@ static int DecodeJpeg(const unsigned char *data, int size,
 #endif
                                       ) == 0) {
                         /*
-                         *  h=1 grey/444 sequential output, wired: equation is
-                         *  the listing structure (`408F06-408F70`) and table
-                         *  VALUES are fitted functional (see JpegMakeTables:
-                         *  interior worst 7, edges <=17 pad, whites <=6,
-                         *  black exact, restart ~15 EOB-faithful).  Returns 0
-                         *  on success; anything else (progressive, h=2,
-                         *  grey+restart edge) falls through to -1.
+                         *  h=1 (all 1x1: `408ECD`) then subsampled Y-hs=2
+                         *  (422/420 paired: `408FB3`); disjoint gates, fitted
+                         *  tables shared (see JpegMakeTables).  Returns 0 on
+                         *  success; anything else (progressive, 1-comp
+                         *  restart gate, high-freq restart) falls to -1.
                          */
                         if (JpegOutput444(pixels, pitch, width, height,
+                                          xorigin, yorigin) == 0)
+                            return 0;
+                        if (JpegOutputSub(pixels, pitch, width, height,
                                           xorigin, yorigin) == 0)
                             return 0;
                     }
