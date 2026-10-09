@@ -3174,6 +3174,78 @@ data-flow trace through the listing, not another grep - which is a dedicated
 session with `pngout.exe.lst`, and is now the only thing standing between here
 and the JPEG transcription.
 
+#### Colour-table writer found: `sub_40C580`'s `40C691` loop (exact tables, checker exact)
+
+The "not the writer" verdict two sections up was wrong: the ten store
+targets it lists include `dword_18CBF70[eax]`, `dword_18CBF74[eax]`,
+`dword_18D4358[eax]`, `dword_18D435C[eax]` - mislabelled "IDCT basis
+arrays". They are the four colour-offset tables, filled by the loop at
+`40C691..40C6E0`: 2048 iterations, `eax += 8`, four arithmetic
+progressions with 32-bit wrap, two entries (one pair) per step:
+
+| array (build) | register | start | delta/pair | role (consumer) |
+|---|---|---|---|---|
+| `18D4358` even dwords | `edx` | `0xA645A000` | `+0x166E98` | TC = R-from-Cr (`18D6358`) |
+| `18D4358` odd dwords | `ecx` | `0x2DB47800` | `-0xB6D1E` | TA = G-from-Cr (`18D635C`) |
+| `18CBF70` even dwords | `edi` | `0x16066400` | `-0x58199` | TB = G-from-Cb (`18CDF70`) |
+| `18CBF70` odd dwords | `esi` | `0x8E978C00` | `+0x1C5A1D` | TD = B-from-Cb (`18CDF74`) |
+
+Loop bound `cmp ecx,0D24B8800h / jg` (signed) gives exactly 2048 steps.
+Per-raw-unit slopes (delta/2) match plane fits of original-binary pixels
+to ~1% (R-Cr +732856 vs +735052, B-Cb +927334 vs +929038, G-Cr -378011
+vs -374415, G-Cb -177733 vs -180428), and the R witness `TC[-238]` lands
+at -175M inside its tight interval. The tables are pure linear - no
+overrides anywhere; the 230 fitted overrides are deleted. The channel
+assignment is the decompilation's own (`pixel = T0[(Y+TD)+..] +
+T1[(Y+TC)+..] + T2[(Y+TA+TB)+..]`, recorded at "The output path" above):
+G sums two tables, R and B one each - `decode.c` had it rotated and is
+corrected (`s = T2[i0]+T1[i1]+T0[i2]`).
+
+The white mechanism is the `rep stosd` pair this record already lists
+(`40C625/40C636`) but never connected: `T0[128..447] = 0xFF`,
+`T0[448..831] = 0` (T1/T2 derive verbatim at `40C665`), so near-white
+sums land on a flat 255 top instead of the dead zone. Black sits at
+idx 891 as before.
+
+Open listing question (values unaffected - bit-exact either way): the Cb
+consumers sit at build `+0x1000` (pair 512) while Cr consumers sit at
+`+0x2000` (pair 1024), yet neutral chroma demands ~zero offsets, i.e.
+effective pair 1024 on both sides. Equivalent readings: the Cb working
+buffer carries a `+2^29` bias, or the consumer labels drift by `0x1000`.
+`decode.c` maps raw-0 to build pair 1024 on all four tables.
+
+#### Slow-path thresholds are maxcode+1, not counts (restart pre-marker tails fixed)
+
+The "cumulative COUNTS" reading of `18D9FB4` (DHT section above, Huffman
+fidelity section) was wrong, and `decode.c` implemented it (`first[]`/
+`base[]`) - which is why the slow path decoded garbage on real data
+(DC -14 vs -3 from the first symbol under forced-slow) while the fast
+path verified clean. Per `sub_40C700` (`cmp eax,[ecx+edx*4] / jl FOUND`,
+`syms[base+code]` at `18DB4C0`/`18E0898`): the walk completes length
+`len` iff `code < maxcode[len]+1` (0 for empty lengths), symbol at
+`start[len]-mincode[len]+code`. `decode.c` now derives exactly that
+(`thresh[]`/`off[]`); forced-slow output is identical to fast on every
+corpus file (18/18 blocks and beyond, 0 diffs), and the independent
+Python standard decode agrees.
+
+This retracts two derived claims. The "restart EOB tails, original
+bug-for-bug" story (Huffman fidelity section) was our slow-path bug, not
+PNGOUT's behaviour: the last MCU before each RST lost its tail (e.g.
+`ramp_444_2_8` MCU1-Cr `1 -2 3` decoded `1 -2 0`) because marker-stop
+starves the fast path and the broken slow walk misread real bits. The
+original reads them; restart files are now bit-exact. The checker
+"structurally beyond fixed tables" proof (wired section) was an artefact
+of the rotated model plus fitted tables: all 8 checker files are
+bit-exact with the true tables, and checker is a full pixel-asserted
+case (IM bounds 24/60/100/5 for 444/422/420/grey - IM's filtering
+distance, not our error).
+
+Verification against the original 2015 binary (temp-only
+`pngout_orig.exe`, 33 sequential+checker files plus prog): C-vs-original
+worst 0 on all 33 (3825+1224 pixels). Progressive decodes (bound 30 vs
+IM holds) but differs from the original by worst 21 - the open
+follow-up; everything sequential is exact.
+
 ### `sub_40DD80`, DDS (format code 7)
 
 Transcribed as `DecodeDds()`, 1158 listing lines, and verified pixel-exact
@@ -3275,11 +3347,13 @@ python tools\decodetest.py --dds        DDS, 8 cases
 python tools\decodetest.py --dds-roundtrip   the same eight through pngout.exe
 ```
 
-`--jpeg` is the odd one out: `sub_40B180` is not transcribed, so there are no
-pixels to compare. What it checks is that `tools/jpeglib.py` writes a baseline
-JPEG which reads back within a measured bound, and that `dumpdec.exe` and
-`pngout.exe` both refuse it cleanly while it is missing. It pins the corpus
-rather than the decoder.
+`--jpeg` now checks the wired decoder, not just the corpus: 33 cases
+(grey/444/422/420 × flat/ramp/grey/checker × restart 0/2, plus 16-bit DQT)
+decode to pixels, asserted against ImageMagick within per-file bounds that
+measure IM's own distance from the original (the C output itself is
+bit-exact vs the original binary on the whole corpus, worst 0 - verified
+externally, see the JPEG record). Checker carries loose subsampled bounds
+(IM filters chroma, the original point-replicates); grey checker is tight.
 
 `--jpeg-im` is the same 33 read back through ImageMagick 7's `convert` instead
 of through `jpeglib`'s own reader, which removes the one honest caveat on the
@@ -3287,9 +3361,9 @@ corpus: that the writer and its reader could share a misreading and agree with
 each other. ImageMagick is an independent decoder and does not share it. It
 needs `C:\ImageMagick\convert.exe` and skips gracefully without it, and it
 also brings the progressive file, generated by ImageMagick itself from a PPM -
-SOF2, ten scans - which `jpeglib` cannot write. That file is sized and refused
-cleanly, and is the corpus side of the `0xC2 shares the SOF0 arm` finding for
-when `sub_40B180` lands.
+SOF2, ten scans - which `jpeglib` cannot write. That file decodes with bound
+30 (`run_jpeg_progressive` asserts pixels + pngout PNG write); against the
+original binary it is worst 21 (open follow-up, sequential+checker are exact).
 
 Two genuine encoder bugs came out of pointing a third-party decoder at the
 corpus, and both are the kind the self-check could never have caught because

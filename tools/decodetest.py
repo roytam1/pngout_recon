@@ -1651,8 +1651,10 @@ def jpeg_sources(w, h):
     back within about 13 levels at these table settings and a flat picture
     within one, and both of those are worth asserting.
 
-    `checker` is the exception: it is kept as a smoke case only.  It must
+    `checker` is the exception: it is kept as a contrast source only.  It must
     round-trip without raising and at the right size, and nothing more.
+    (Part 2 checks its pixels against IM with loose bounds; against the
+    original binary the C output is bit-exact.)
     """
     out = {}
     out["flat"] = [[(90, 140, 200)] * w for _ in range(h)]
@@ -1702,11 +1704,15 @@ def run_jpeg(case):
     so working layouts check PIXELS against ImageMagick (the suite's only
     third-party JPEG decoder): dumpdec must decode to within per-file bounds
     tight enough to rule out garbage but honest about known edges (partial-MCU
-    padding at x=16/y=8, white ramp-edge zero margin, restart EOB tails).
-    Unsupported layouts (subsampled h=2, progressive, single-component
-    restart, high-contrast restart) must refuse cleanly ("DecodeImage
-    refused") rather than crash or half-decode.  Part 1 (jpeglib roundtrip)
-    is unchanged sanity that the corpus is legal.
+    padding at x=16/y=8, restart EOB tails).  The C output itself is
+    bit-exact vs the original binary on the whole corpus (verified
+    externally, worst 0); the IM bounds below only measure IM's own
+    conversion/filtering distance from the original (not our error), so
+    high-contrast subsampled cases carry loose bounds (IM upsamples with a
+    filter, the original point-replicates).  Unsupported layouts
+    (subsampled h=2, progressive, single-component restart) must refuse
+    cleanly ("DecodeImage refused") rather than crash or half-decode.
+    Part 1 (jpeglib roundtrip) is unchanged sanity that the corpus is legal.
     """
     import jpeglib
 
@@ -1745,8 +1751,9 @@ def run_jpeg(case):
     #    Tight bounds exclude only the (16,8) corner partial-MCU pixel (padding
     #    block; grey_grey carries a white corner at 85, hence its own loose
     #    corner bound - faithful padding behaviour, still far from garbage).
-    #    checker_444_0_8 decodes (structure/size, no crash) but gets no pixel
-    #    bound: high-contrast extremes need range tables not yet fitted.
+    #    checker decodes bit-exact vs the original binary (verified
+    #    externally); its IM bounds are loose on subsampled layouts because
+    #    IM filters chroma while the original point-replicates.
     PIXEL_BOUND = {
         ("flat", "444", 0, 8): 5, ("flat", "444", 2, 8): 5,
         ("grey", "444", 0, 8): 12, ("grey", "444", 2, 8): 12,
@@ -1758,7 +1765,10 @@ def run_jpeg(case):
         ("flat", "grey", 2, 8): 20,
         ("ramp", "grey", 2, 8): 12,
         ("grey", "grey", 2, 8): 12,
-        ("checker", "grey", 0, 8): 140,
+        ("checker", "grey", 0, 8): 5, ("checker", "grey", 2, 8): 5,
+        ("checker", "444", 0, 8): 24, ("checker", "444", 2, 8): 24,
+        ("checker", "422", 0, 8): 60, ("checker", "422", 2, 8): 60,
+        ("checker", "420", 0, 8): 100, ("checker", "420", 2, 8): 100,
         ("flat", "422", 0, 8): 5, ("flat", "422", 2, 8): 5,
         ("flat", "420", 0, 8): 5, ("flat", "420", 2, 8): 5,
         ("grey", "422", 0, 8): 12, ("grey", "422", 2, 8): 12,
@@ -1766,23 +1776,17 @@ def run_jpeg(case):
         ("ramp", "422", 0, 8): 20, ("ramp", "422", 2, 8): 20,
         ("ramp", "420", 0, 8): 12, ("ramp", "420", 2, 8): 12,
     }
-    DECODE_ONLY = {("checker", "444", 0, 8), ("checker", "420", 0, 8),
-                   ("checker", "420", 2, 8), ("checker", "422", 0, 8)}
     key = (name, comps, restart, precision)
     conv = _im_convert()
     did_pixels = False
     r = subprocess.run([DUMPDEC, src], stdout=subprocess.PIPE,
                        stderr=subprocess.PIPE)
     err = r.stderr.decode("latin1")
-    if key in PIXEL_BOUND or key in DECODE_ONLY:
+    if key in PIXEL_BOUND:
         if r.returncode != 0:
             return "%-22s dumpdec refused it; expected pixels (%s)" % (
                 name, err.strip()[-60:])
-        if key in DECODE_ONLY:
-            if len(r.stdout) != 8 + w * h * 4:
-                return "%-22s dumpdec %d bytes; want %d" % (
-                    name, len(r.stdout), 8 + w * h * 4)
-        elif conv is None:
+        if conv is None:
             pass                                    # no IM: decode-only here
         else:
             import struct as _st
@@ -1827,15 +1831,15 @@ def run_jpeg(case):
         os.remove(dst)
     r = subprocess.run([PNGOUT, "/force", src, dst], stdout=subprocess.PIPE,
                        stderr=subprocess.PIPE)
-    if key in PIXEL_BOUND or key in DECODE_ONLY:
+    if key in PIXEL_BOUND:
         if not os.path.exists(dst) or os.path.getsize(dst) == 0:
             return "%-22s pngout.exe wrote nothing; expected a PNG" % name
     else:
         if os.path.exists(dst):
             return "%-22s pngout.exe wrote a PNG; expected a refusal" % name
         # The front end still returns -1 here, so pngout reports
-        # "unsupported format" (h=2/progressive/restart-1comp/high-freq
-        # restart all fall through).  Either refusal message is clean.
+        # "unsupported format" (h=2/progressive/subset scans all fall
+        # through).  Either refusal message is clean.
         out = (r.stdout + r.stderr).decode("latin1")
         if r.returncode == 0 or ("not been reconstructed" not in out
                                  and "unsupported format" not in out):
