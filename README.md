@@ -2532,7 +2532,9 @@ refinements set/add bit Al, EOB runs skip (`JpegEobRun` powers of two =
 `dword_410158`, covering the current block too so following skips are
 base+extra-1), new-nonzero position-wise run-skip with sign bit first.
 DRI+progressive refused outright
-(original never allocates there: `!v195`). At EOI `JpegProgFinish`
+(original never allocates there: `!v195` — and empirically it emits garbage
+there rather than decoding, so refusal is the faithful behaviour, not a gap).
+At EOI `JpegProgFinish`
 dequantises (same zigzag-t pattern), IDCTs into `JpegIdctBuf`, and outputs
 via the wired 444/Sub paths (prog file is 420), then frees.
 
@@ -2584,6 +2586,10 @@ listing detail: ZRL (`run=15,size=0`) in a *refinement* scan falls past the
 across the 16 skipped positions are refined in passing (and `v109=size=0`
 stores nothing at 903) — a bare `k+=16` desynchronises everything downstream.
 First-scan ZRL stays a free skip (no prior coefficients exist to refine).
+Further variants all decode bit-exact on first try with no code changes
+(444 sampling, single-component grey, exact-multiple 32x16 with no padding
+blocks, single-MCU 16x16), confirming the grid/traversal logic generalises
+rather than being fitted to the two main files.
 C-vs-IM interior sits at 6 against the bound 10 in `run_jpeg_progressive`
 (the bound measures IM's own distance from the original, not our error).
 Per-scan `jpeg: pscan` dumps were temporary (reverted); final `jpeg: pblk`
