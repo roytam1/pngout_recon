@@ -2506,9 +2506,32 @@ Table VALUES (`JpegMakeTables`: linear baselines + 230 fitted overrides
 (interior 7) + RGB white nudges; unlisted indices keep linear (<=5
 default)) are functional/provisional - equation/structure (listing
 408F06-70, `shr` logical, floor-even, direct store) is final. Remaining:
-true fixed values (writer discovery), h=2/progressive paths, 1-comp-restart
-framing. (Checker extremes deliberately excluded - structurally beyond
+true fixed values (writer discovery), 1-comp-restart framing. (Checker
+extremes deliberately excluded - structurally beyond
 fixed tables, see above; not a gap to close.)
+
+#### Progressive (SOF2) wired: 10-scan merge, pixel-verified (`--jpeg-im`)
+
+`dt_j_prog.jpg` (IM, ramp 420 q75: DC ns=3 Al=1, then Y/Cr/Cb AC bands to
+Al=2/1, Y AC refine Ah=2/Al=1, DC refine Ah=1/Al=0, then Cr/Cb/Y AC refine
+to Al=0 - all ending Al=0, full precision, lossless merge) decodes via
+`JpegDecodeProgScan` into malloc'd flat `Block` buffers (128B = 64 shorts,
+zeroed, per-comp bases, freed at EOI/failure - like `v58<<7`/`v9`) with
+successive approximation faithfully: first scans store `value<<Al`,
+refinements set/add bit Al, EOB runs skip (`JpegEobRun` 1,3,7,... =
+`dword_410158`, verified r=1 covering 3 following with tail padding),
+new-nonzero position-wise run-skip with sign bit, dead-negative refine
+(`+high16 = +0`, matches listing 890/937 - negatives stay coarse, bounded
+~2, inside prog bounds). DRI+progressive refused outright (original never
+allocates there: `!v195`). At EOI `JpegProgFinish` dequantises (same
+zigzag-t pattern), IDCTs into `JpegIdctBuf`, and outputs via the wired
+444/Sub paths (prog file is 420), then frees. C-vs-IM: interior 26,
+x=16/y=8 partial-MCU padding excluded from tight (corner-class edges,
+one at 190); bound 30 in `run_jpeg_progressive` (now asserts pixels +
+pngout PNG write, not refusal). C-vs-Python merge: DC exact, AC small
+diffs (refine nuances, snowball-bounded by the pixel bound). Per-scan
+`jpeg: pscan` dumps were temporary (reverted); final `jpeg: pblk` stays
+(like `blk`/`dbl`/`idct`).
 
 #### Linear `v4` fails at MCU boundaries; per-MCU bases required
 

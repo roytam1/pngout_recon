@@ -2547,6 +2547,13 @@ typedef struct JpegHuff {
 
 static unsigned JpegWidth, JpegHeight, JpegNComp, JpegRestart;
 static JpegComp JpegComps[4];
+/* Per-SOS scan order: SOF comp indices in SOS selector order (sub_40B180
+ * v166 loop over Ns; bitstream follows scan order, not SOF order).  Set by
+ * the SOS arm for every scan (sequential and progressive); full interleaved
+ * scans give [0..NComp-1] (identical to the old all-comps loop), subset or
+ * reordered scans give the matched subset in stream order. */
+static unsigned JpegScanOrder[4];
+static unsigned JpegScanNs;
 static int JpegQuant[4][64];        /* fixed-point, zigzag order */
 static JpegHuff JpegHuffs[8];       /* slots 0..3 DC, 4..7 AC (spec-12) */
 
@@ -2722,20 +2729,21 @@ static int JpegHuffSym(JpegHuff *t, JpegBit *b)
     int peek, sym, len;
 
     JpegRefill(b, 10);
-    /* The original peeks 10 bits unconditionally (`(reg>>(nbits-10))&0x3FF`
-     * per the `v200` fast tables `18EA0A8/18F20A8`, built by sequential
-     * span-packing at `40B4E4` (identical to canonical prefix layout, so
-     * the in-struct `fastlen/fastsym` reproduce it exactly).  Short of a
-     * marker (restart tail) fewer than 10 bits are buffered; x86 masks
-     * the negative shift count to 5 bits (`&31`), yielding peek 0/1 -
-     * i.e. a deterministic EOB - not garbage.  Mask explicitly (defined
-     * behaviour, bit-identical to VC6/x86) instead of branching. */
-    peek = (int)((b->reg >> ((b->nbits - 10) & 31)) & 0x3FF);
-    if (peek < t->nfast) {
-        len = t->fastlen[peek];
-        sym = t->fastsym[peek];
-        b->nbits -= len;
-        return sym;
+    /* Fast 10-bit peek needs 10 buffered bits (`v200` threshold).  Short of
+     * a marker (restart/progressive tails) fewer are available: fall back to
+     * bit-at-a-time, which reads only the bits each symbol needs (all present
+     * in a valid scan) and matches L1/L2 exactly, falling out at length
+     * 16/symbol 0 (EOB) past them - the listing slow path verbatim.  Peeking
+     * short reads stale high bits (deterministic EOB, wrong for L2 tails),
+     * so it must be gated, not masked. */
+    if (b->nbits >= 10) {
+        peek = (b->reg >> (b->nbits - 10)) & 0x3FF;
+        if (peek < t->nfast) {
+            len = t->fastlen[peek];
+            sym = t->fastsym[peek];
+            b->nbits -= len;
+            return sym;
+        }
     }
     JpegHuffSlow(t, b, &sym);
     return sym;
@@ -3211,7 +3219,7 @@ static int JpegDecodeSeq(const unsigned char *scan, const unsigned char *end,
 {
     JpegBit bit;
     int pred[4] = {0, 0, 0, 0};
-    unsigned hmax = 1, vmax = 1, ci;
+    unsigned hmax = 1, vmax = 1, ci, t;
     unsigned mcux, mcuy, mx, my;
     unsigned rst_left = JpegRestart;
     unsigned rst_expect = 0xD0;
@@ -3257,12 +3265,15 @@ static int JpegDecodeSeq(const unsigned char *scan, const unsigned char *end,
                 rst_left = JpegRestart;
                 need_restart = 0;
             }
-            for (ci = 0; ci < JpegNComp && ok; ci++) {
-                unsigned hs = JpegComps[ci].hsamp;
-                unsigned vs = JpegComps[ci].vsamp;
-                unsigned bx, by;
-                JpegHuff *dh = &JpegHuffs[JpegComps[ci].dc_sel & 3];
-                JpegHuff *ah = &JpegHuffs[4 + (JpegComps[ci].ac_sel & 3)];
+            for (t = 0; t < JpegScanNs && ok; t++) {
+                unsigned hs, vs, bx, by;
+                JpegHuff *dh, *ah;
+
+                ci = JpegScanOrder[t];
+                hs = JpegComps[ci].hsamp;
+                vs = JpegComps[ci].vsamp;
+                dh = &JpegHuffs[JpegComps[ci].dc_sel & 3];
+                ah = &JpegHuffs[4 + (JpegComps[ci].ac_sel & 3)];
 
                 for (by = 0; by < vs && ok; by++) {
                     for (bx = 0; bx < hs && ok; bx++) {
@@ -3584,6 +3595,346 @@ static int JpegOutputSub(unsigned char *pixels, int pitch,
     }
     return 0;
 }
+/* Progressive (SOF2) multi-scan accumulation (`sub_40B180` case -38).
+ * First progressive SOS (no restart, non-full selectors) mallocs flat
+ * coefficient buffers (`Block = malloc(total<<7)`, 128B = 64 shorts/block,
+ * zeroed; freed at EOI/failure) with per-comp bases; later scans reuse them
+ * (original keys this off `v195`, which doubles as the restart interval -
+ * nonzero after the first progressive scan, so no realloc; DRI+progressive
+ * is refused outright since the original never allocates there either).
+ * Each scan merges into the buffers (successive approximation: first scans
+ * store `value<<Al`, refinements set/add bit Al, EOB runs skip), and at EOI
+ * the buffers dequantise (same pattern as `JpegDecodeSeq`: zigzag-t to
+ * natural-zz times the fixed-point table), IDCT (`JpegIdct(dbl,0xFF)`) into
+ * `JpegIdctBuf`, and output via the wired h=1/subsampled paths.
+ * Block layout here is [comp][mcu][block] (mine, matching `JpegIdctBuf`
+ * order) rather than the original's flat per-comp v201 pointers - same
+ * (comp,block,coef) values, directly indexable.  Coefficients are zigzag-k
+ * (Ss/Se are zigzag positions), dequantised with `JpegZigzag[t]` like the
+ * sequential path.  Refinement of negatives adds 0 (dead-negative,
+ * `*(&v198+2*(v<0))` high half) exactly like the listing - faithful, not a
+ * bug to fix (bounded ~1-2 levels, inside prog bounds). */
+static short *JpegProg = NULL;
+static unsigned JpegProgBase[4];
+static unsigned JpegProgBlocks = 0;
+static int JpegProgActive = 0;
+/* `dword_410158` EOB run bases: following-skipped blocks for run r.
+ * Verified on scan2 EOBn (r=1,extra=0 covers 3 following: b1,b2,b3, tail
+ * (1,1) padding); runs>1 validate via C-vs-IM pixels (sane => held). */
+static const int JpegEobRun[15] =
+{1,3,7,15,31,63,127,255,511,1023,2047,4095,8191,16383,32767};
+
+static void JpegProgFree(void)
+{
+    if (JpegProgActive) {
+        free(JpegProg);
+        JpegProg = NULL;
+        JpegProgBlocks = 0;
+        JpegProgActive = 0;
+    }
+}
+
+/* One refinement raw bit, dry-at-marker counts as 0 (`test ebx,esi/jz` in
+ * `sub_40C700`-style slow reads; valid scans always have the bit, corrupt
+ * ones complete with 0 instead of crashing/OOB). */
+static int JpegRawBit(JpegBit *b)
+{
+    int bit = 0;
+
+    JpegRefill(b, 1);
+    if (b->nbits > 0)
+        bit = (b->reg >> (--b->nbits)) & 1;
+    return bit;
+}
+
+/* Decode one progressive SOS scan into `JpegProg` (buffers already live).
+ * Returns the scan end (first marker byte, unconsumed) for the outer loop.
+ * Completes always on valid scans (fast/slow/dry-0/len16-sym0 fallbacks,
+ * band bounds, EOB runs); corrupt input completes with zeros/EOBs. */
+static const unsigned char *JpegDecodeProgScan(const unsigned char *scan,
+                                               const unsigned char *end,
+                                               unsigned Ss, unsigned Se,
+                                               unsigned Ah, unsigned Al)
+{
+    JpegBit bit;
+    int pred[4] = {0, 0, 0, 0};
+    unsigned hmax = 1, vmax = 1, t;
+    unsigned mcux, mcuy, mx, my;
+    int eobrun = 0;
+
+    for (t = 0; t < JpegNComp; t++) {
+        if (JpegComps[t].hsamp > hmax)
+            hmax = JpegComps[t].hsamp;
+        if (JpegComps[t].vsamp > vmax)
+            vmax = JpegComps[t].vsamp;
+    }
+    mcux = (JpegWidth + 8 * hmax - 1) / (8 * hmax);
+    mcuy = (JpegHeight + 8 * vmax - 1) / (8 * vmax);
+
+    bit.p = scan;
+    bit.end = end;
+    bit.reg = 0;
+    bit.nbits = 0;
+    bit.marker_hit = 0;
+
+    for (my = 0; my < mcuy; my++) {
+        for (mx = 0; mx < mcux; mx++) {
+            for (t = 0; t < JpegScanNs; t++) {
+                unsigned ci = JpegScanOrder[t];
+                unsigned hs = JpegComps[ci].hsamp;
+                unsigned vs = JpegComps[ci].vsamp;
+                unsigned bx, by;
+                JpegHuff *dh = &JpegHuffs[JpegComps[ci].dc_sel & 3];
+                JpegHuff *ah = &JpegHuffs[4 + (JpegComps[ci].ac_sel & 3)];
+
+                for (by = 0; by < vs; by++) {
+                    for (bx = 0; bx < hs; bx++) {
+                        unsigned mcu = my * mcux + mx;
+                        short *blk = JpegProg +
+                                     (JpegProgBase[ci] +
+                                      mcu * hs * vs + by * hs + bx) * 64;
+                        int k;
+
+                        if (Ss == 0) {
+                            /* DC scan: first (Ah==0) decodes diffs (reduced
+                             * domain, pred per scan-comp) and stores
+                             * `pred<<Al`; refinement (Ah>0) ORs bit Al. */
+                            if (Ah == 0) {
+                                int sym = JpegHuffSym(dh, &bit);
+                                int diff;
+
+                                if (sym < 0)
+                                    sym = 0;
+                                if (sym > 11)
+                                    sym = 11;
+                                diff = JpegExtend(&bit, sym);
+                                pred[t] += diff;
+                                blk[0] = (short)(pred[t] << Al);
+                            } else {
+                                if (JpegRawBit(&bit))
+                                    blk[0] = (short)(blk[0] | (1 << Al));
+                            }
+                        } else {
+                            /* AC scan over band Ss..Se (zigzag k). */
+                            if (eobrun > 0) {
+                                if (Ah == 0) {
+                                    eobrun--;
+                                } else {
+                                    /* LABEL_198: refine existing nonzero
+                                     * (1 bit each, add iff >0), no new. */
+                                    for (k = (Ss < 1) ? 1 : (int)Ss;
+                                         k <= (int)Se; k++) {
+                                        if (blk[k]) {
+                                            if (JpegRawBit(&bit) &&
+                                                blk[k] > 0)
+                                                blk[k] = (short)(blk[k] +
+                                                                 (1 << Al));
+                                        }
+                                    }
+                                    eobrun--;
+                                }
+                                continue;
+                            }
+                            k = (Ss < 1) ? 1 : (int)Ss;
+                            if (Ah == 0) {
+                                while (k <= (int)Se) {
+                                    int rs = JpegHuffSym(ah, &bit);
+                                    int run = (rs >> 4) & 15;
+                                    int size = rs & 15;
+#ifdef JPEGDEBUG
+                                    /* TEMP prog scan4 audit (revert) */
+                                    {
+                                        static int na = 0;
+
+                                        if (ci == 1 && mx == 0 && my == 0 &&
+                                            na < 2) {
+                                            fprintf(stderr, "jpeg: s4ac rs=%d run=%d size=%d p=%ld nbits=%d\n",
+                                                    rs, run, size, (long)(bit.p - scan), bit.nbits);
+                                            na++;
+                                        }
+                                    }
+#endif
+
+                                    if (size == 0) {
+                                        if (run == 15) {
+                                            k += 16;
+                                        } else {
+                                            if (run > 0) {
+                                                int i, extra = 0;
+
+                                                eobrun = JpegEobRun[run];
+                                                for (i = 0; i < run; i++)
+                                                    extra = (extra << 1) |
+                                                        JpegRawBit(&bit);
+                                                eobrun += extra;
+                                            }
+                                            break;
+                                        }
+                                    } else {
+                                        int v;
+
+                                        k += run;
+                                        if (k > (int)Se)
+                                            break;
+                                        v = JpegExtend(&bit, size);
+                                        blk[k] = (short)(v << Al);
+                                        k++;
+                                    }
+                                }
+                            } else {
+                                while (k <= (int)Se) {
+                                    int rs = JpegHuffSym(ah, &bit);
+                                    int run = (rs >> 4) & 15;
+                                    int size = rs & 15;
+
+                                    if (size == 0) {
+                                        if (run == 15) {
+                                            k += 16;
+                                        } else {
+                                            int kk;
+
+                                            if (run > 0) {
+                                                int i, extra = 0;
+
+                                                eobrun = JpegEobRun[run];
+                                                for (i = 0; i < run; i++)
+                                                    extra = (extra << 1) |
+                                                        JpegRawBit(&bit);
+                                                eobrun += extra;
+                                            }
+                                            for (kk = k; kk <= (int)Se;
+                                                 kk++) {
+                                                if (blk[kk]) {
+                                                    if (JpegRawBit(&bit) &&
+                                                        blk[kk] > 0)
+                                                        blk[kk] =
+                                                            (short)(blk[kk] +
+                                                                    (1 << Al));
+                                                }
+                                            }
+                                            break;
+                                        }
+                                    } else {
+                                        /* Position-wise run skip (871-902):
+                                         * existing nonzero refined (1 bit,
+                                         * add iff >0), zeros count down. */
+                                        while (k <= (int)Se) {
+                                            if (blk[k]) {
+                                                if (JpegRawBit(&bit) &&
+                                                    blk[k] > 0)
+                                                    blk[k] =
+                                                        (short)(blk[k] +
+                                                                (1 << Al));
+                                            } else {
+                                                run--;
+                                                if (run < 0)
+                                                    break;
+                                            }
+                                            k++;
+                                        }
+                                        if (k > (int)Se)
+                                            break;
+                                        if (JpegRawBit(&bit))
+                                            blk[k] = (short)(1 << Al);
+                                        else
+                                            blk[k] = (short)(-(1 << Al));
+                                        k++;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return bit.p;
+}
+
+/* EOI with progressive buffers live: dequantise Block to dbl (same pattern
+ * as `JpegDecodeSeq`: zigzag-t to natural-zz times the fixed-point table),
+ * IDCT into `JpegIdctBuf`, output via the wired paths, free buffers. */
+static int JpegProgFinish(unsigned char *pixels, int pitch,
+                           unsigned width, unsigned height,
+                           int xorigin, int yorigin)
+{
+    unsigned hmax = 1, vmax = 1, ci, t;
+    unsigned mcux, mcuy, mx, my;
+    int rc = -1;
+
+    for (t = 0; t < JpegNComp; t++) {
+        if (JpegComps[t].hsamp > hmax)
+            hmax = JpegComps[t].hsamp;
+        if (JpegComps[t].vsamp > vmax)
+            vmax = JpegComps[t].vsamp;
+    }
+    mcux = (JpegWidth + 8 * hmax - 1) / (8 * hmax);
+    mcuy = (JpegHeight + 8 * vmax - 1) / (8 * vmax);
+
+    for (ci = 0; ci < JpegNComp; ci++) {
+        unsigned hs = JpegComps[ci].hsamp;
+        unsigned vs = JpegComps[ci].vsamp;
+
+        for (my = 0; my < mcuy; my++) {
+            for (mx = 0; mx < mcux; mx++) {
+                unsigned mcu = my * mcux + mx;
+                unsigned bx, by;
+
+                for (by = 0; by < vs; by++) {
+                    for (bx = 0; bx < hs; bx++) {
+                        short *blk = JpegProg +
+                                     (JpegProgBase[ci] +
+                                      mcu * hs * vs + by * hs + bx) * 64;
+                        int dbl[64];
+                        int z;
+
+                        unsigned m2 = my * mcux + mx;
+                        unsigned b2 = by * hs + bx;
+                        int t2;
+
+                        for (z = 0; z < 64; z++) {
+                            int zz = JpegZigzag[z];
+                            __int64 dq = (__int64)blk[z] *
+                                JpegQuant[JpegComps[ci].qsel & 3][zz];
+
+                            dbl[zz] = (int)dq;
+                        }
+                        JpegIdct(dbl, 0xFF);
+                        if (m2 < JPEG_MAX_MCU && b2 < 4) {
+                            for (t2 = 0; t2 < 64; t2++)
+                                JpegIdctBuf[m2][ci][b2][t2] = dbl[t2];
+                        }
+#ifdef JPEGDEBUG
+                        {
+                            int td;
+
+                            fprintf(stderr,
+                                    "jpeg: pblk c%u mx%u my%u b%u =",
+                                    ci, mx, my, by * hs + bx);
+                            for (td = 0; td < 64; td++)
+                                fprintf(stderr, " %d", blk[td]);
+                            fprintf(stderr, "\n");
+                        }
+#endif
+                    }
+                }
+            }
+        }
+    }
+    if (JpegNComp == 1 || JpegNComp == 3) {
+        if (JpegOutput444(pixels, pitch, width, height,
+                          xorigin, yorigin) == 0)
+            rc = 0;
+        else if (JpegOutputSub(pixels, pitch, width, height,
+                               xorigin, yorigin) == 0)
+            rc = 0;
+    }
+    free(JpegProg);
+    JpegProg = NULL;
+    JpegProgBlocks = 0;
+    JpegProgActive = 0;
+    return rc;
+}
 static int DecodeJpeg(const unsigned char *data, int size,
                       unsigned char *pixels, int pitch,
                       unsigned int width, unsigned int height,
@@ -3604,13 +3955,16 @@ static int DecodeJpeg(const unsigned char *data, int size,
     p = data + 2;
     end = data + size;
     JpegRestart = 0;
+    JpegProgFree();                     /* stale buffers from a prior image */
 
     for (;;) {
         /* skip fill bytes */
         while (p < end && *p == 0xFF)
             p++;
-        if (p >= end)
+        if (p >= end) {
+            JpegProgFree();
             return -1;
+        }
         marker = *p++;
         if (marker == 0xD9)
             break;                          /* EOI */
@@ -3633,6 +3987,7 @@ static int DecodeJpeg(const unsigned char *data, int size,
                 return -1;
             for (i = 0; i < JpegNComp; i++)
                 JpegComps[i].dc_sel = JpegComps[i].ac_sel = 0;
+            JpegScanNs = 0;
             for (i = 0; i < ns; i++) {
                 unsigned cid = q[0], sel = q[1];
                 unsigned j;
@@ -3641,9 +3996,19 @@ static int DecodeJpeg(const unsigned char *data, int size,
                     if (JpegComps[j].id == cid) {
                         JpegComps[j].dc_sel = (sel >> 4) & 15;
                         JpegComps[j].ac_sel = sel & 15;
+                        /* Scan order (bitstream follows SOS selectors, not
+                         * SOF order); full scans give [0..NComp-1]. */
+                        if (JpegScanNs < 4)
+                            JpegScanOrder[JpegScanNs++] = j;
                     }
                 }
                 q += 2;
+            }
+            /* Unmatched selector (corrupt: SOS names a comp SOF never
+             * defined) would desynchronise the stream - refuse cleanly. */
+            if (JpegScanNs != ns) {
+                JpegProgFree();
+                return -1;
             }
             {
                 unsigned ss = q[0], se = q[1], ahal = q[2];
@@ -3664,17 +4029,75 @@ static int DecodeJpeg(const unsigned char *data, int size,
                         /*
                          *  h=1 (all 1x1: `408ECD`) then subsampled Y-hs=2
                          *  (422/420 paired: `408FB3`); disjoint gates, fitted
-                         *  tables shared (see JpegMakeTables).  Returns 0 on
-                         *  success; anything else (progressive, 1-comp
-                         *  restart gate, high-freq restart) falls to -1.
+                         *  tables shared (see JpegMakeTables).  Output only on
+                         *  full interleaved scans (Ns==NComp); subset scans
+                         *  decode their comps correctly (dumps) but have no
+                         *  complete image - refuse.  Returns 0 on success;
+                         *  anything else (progressive, 1-comp restart gate,
+                         *  high-freq restart, subset) falls to -1.
                          */
-                        if (JpegOutput444(pixels, pitch, width, height,
-                                          xorigin, yorigin) == 0)
-                            return 0;
-                        if (JpegOutputSub(pixels, pitch, width, height,
-                                          xorigin, yorigin) == 0)
-                            return 0;
+                        if (JpegScanNs == JpegNComp) {
+                            if (JpegOutput444(pixels, pitch, width, height,
+                                              xorigin, yorigin) == 0)
+                                return 0;
+                            if (JpegOutputSub(pixels, pitch, width, height,
+                                              xorigin, yorigin) == 0)
+                                return 0;
+                        }
                     }
+                } else {
+                    /* Progressive scan (SOF2): Ss/Se bands, Ah/Al successive
+                     * approximation.  Merges into Block buffers (allocated on
+                     * the first such scan, reused after - like `v195`), then
+                     * continues to the next DHT/SOS/EOI (no `break`). */
+                    unsigned Ah = (ahal >> 4) & 15, Al = ahal & 15;
+
+                    if (ss > 63 || se > 63 || ss > se || Ah > 13 || Al > 13) {
+                        JpegProgFree();
+                        return -1;
+                    }
+                    /* DRI+progressive: the original never allocates there
+                     * (`!v195` false) - refuse outright, header-based. */
+                    if (JpegRestart != 0) {
+                        JpegProgFree();
+                        return -1;
+                    }
+                    if (!JpegProgActive) {
+                        unsigned hmax = 1, vmax = 1, t;
+                        unsigned mcux, mcuy, total = 0, acc = 0;
+
+                        for (t = 0; t < JpegNComp; t++) {
+                            if (JpegComps[t].hsamp > hmax)
+                                hmax = JpegComps[t].hsamp;
+                            if (JpegComps[t].vsamp > vmax)
+                                vmax = JpegComps[t].vsamp;
+                        }
+                        mcux = (JpegWidth + 8 * hmax - 1) / (8 * hmax);
+                        mcuy = (JpegHeight + 8 * vmax - 1) / (8 * vmax);
+                        for (t = 0; t < JpegNComp; t++) {
+                            JpegProgBase[t] = acc;
+                            acc += mcux * mcuy *
+                                   JpegComps[t].hsamp * JpegComps[t].vsamp;
+                        }
+                        total = acc;
+                        if (total == 0 || ((total << 7) >> 7) != total) {
+                            JpegProgFree();
+                            return -1;
+                        }
+                        JpegProg = (short *)malloc(total << 7);
+                        if (!JpegProg)
+                            return -1;
+                        {
+                            unsigned b;
+
+                            for (b = 0; b < total * 64; b++)
+                                JpegProg[b] = 0;
+                        }
+                        JpegProgBlocks = total;
+                        JpegProgActive = 1;
+                    }
+                    p = JpegDecodeProgScan(scan, end, ss, se, Ah, Al);
+                    continue;
                 }
             }
             break;
@@ -3687,8 +4110,10 @@ static int DecodeJpeg(const unsigned char *data, int size,
         /* Markers outside 0xC0..0xDD (APPn, COM, ..) fall to the default
          * arm, which skips by the length - 0x40B245 `ja def_40B25B`. */
 
-        if (seglen < 2 || p + seglen - 2 > end)
+        if (seglen < 2 || p + seglen - 2 > end) {
+            JpegProgFree();
             return -1;
+        }
 
         if (marker >= 0xC0 && marker <= 0xC2) {
             /* SOF0/1/2: precision, height, width, components */
@@ -3754,6 +4179,12 @@ static int DecodeJpeg(const unsigned char *data, int size,
         }
     }
 
+    /* EOI with progressive buffers live: dequantise/IDCT/output, free,
+     * return its result.  Otherwise (sequential failed, empty) refuse. */
+    if (JpegProgActive) {
+        return JpegProgFinish(pixels, pitch, width, height,
+                              xorigin, yorigin);
+    }
     return -1;                              /* entropy body not yet */
 }
 
