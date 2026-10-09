@@ -3639,14 +3639,16 @@ static const unsigned char *JpegDecodeProgScan(const unsigned char *scan,
 if (k > (int)Se)
                                             break;
                                         /* New coefficient in a
-                                         * refinement scan (860-868): read
-                                         * `size` raw bits, sign-extend,
-                                         * store `<< Al`.  The bit count
-                                         * matters - omitting it
-                                         * desynchronises the scan and
-                                         * swallows the EOI. */
-                                        blk[k] = (short)(JpegExtend(&bit, size)
-                                                         << Al);
+                                         * refinement scan: read exactly
+                                         * ONE bit (787-808), not `size`
+                                         * bits - the bit picks +/-
+                                         * (1<<Al) via the v198/v199 pair,
+                                         * stored at 903-904.  Reading
+                                         * `size` bits here desynchronises
+                                         * the scan and swallows the EOI. */
+                                        blk[k] = JpegRawBit(&bit)
+                                            ? (short)(1 << Al)
+                                            : (short)(-(1 << Al));
                                         k++;
                                     }
                                 }

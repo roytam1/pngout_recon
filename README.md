@@ -2545,21 +2545,27 @@ Two traversal/semantics details were pinned against the original binary on
   not the 8 a padded MCU rect gives - and the listing agrees, indexing
   `((x+cnt)>>shift) + nbx*((y+cnt)>>shift)`. Getting this wrong scatters
   edge-block coefficients into the wrong slots.
-- **Refinement is sign-directed and bit-exact in count.** An existing nonzero
-  refined by one bit adds `+(1<<Al)` when positive and `-(1<<Al)` when
-  negative (the `v198`/`v199` word pair selected by `v<0`, listing 890/937);
-  a coefficient newly appearing in a refinement scan reads `size` raw bits,
-  sign-extends them and stores `<<Al` (860-868). Both halves are required:
-  positive-only adds leave scans 6-8 at worst 3, and dropping the new-value
-  bit read desynchronises the scan so it overruns into the EOI marker.
+- **Refinement is sign-directed, and a new coefficient costs exactly one bit.**
+  An existing nonzero refined by one bit adds `+(1<<Al)` when positive and
+  `-(1<<Al)` when negative (the `v198`/`v199` word pair selected by `v<0`,
+  listing 890/937). A coefficient newly appearing in a *refinement* scan reads
+  a **single** bit that selects `+(1<<Al)` vs `-(1<<Al)` (787-808) and stores
+  it at 903-904 - it does **not** read `size` bits as the standard would.
+  Both details are load-bearing: positive-only adds leave scans 6-8 at worst 3,
+  and reading `size` bits there desynchronises the scan so it overruns into the
+  EOI marker (the truncated-scan comparison then fails outright rather than
+  reporting a small delta).
 
 Against the original binary, per-scan prefixes (truncated after each scan)
 are now **bit-exact for scans 1-8** (worst 0 each, previously 17-21 from
 scan 2 on), and scans 9-10 sit at worst 9/10 spread across the frame rather
-than concentrated on the clipped edges. Remaining scan 9-10 residual is in
-the fine AC refinement bands, not in traversal. C-vs-IM interior stays
-within the bound 30 in `run_jpeg_progressive`. Per-scan `jpeg: pscan` dumps
-were temporary (reverted); final `jpeg: pblk` stays (like `blk`/`dbl`/`idct`).
+than concentrated on the clipped edges. The merged coefficients were also
+diffed block-by-block against an independent Python merge: they now agree
+exactly except in the two blocks that scans 9-10 refine further, so the
+remaining residual sits in the fine AC refinement bands rather than in
+traversal. C-vs-IM interior stays within the bound 30 in
+`run_jpeg_progressive`. Per-scan `jpeg: pscan` dumps were temporary
+(reverted); final `jpeg: pblk` stays (like `blk`/`dbl`/`idct`).
 
 #### Linear `v4` fails at MCU boundaries; per-MCU bases required
 
