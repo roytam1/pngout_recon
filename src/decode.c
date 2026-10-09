@@ -3381,9 +3381,12 @@ static int JpegOutputSub(unsigned char *pixels, int pitch,
  * order) rather than the original's flat per-comp v201 pointers - same
  * (comp,block,coef) values, directly indexable.  Coefficients are zigzag-k
  * (Ss/Se are zigzag positions), dequantised with `JpegZigzag[t]` like the
- * sequential path.  Refinement of negatives adds 0 (dead-negative,
- * `*(&v198+2*(v<0))` high half) exactly like the listing - faithful, not a
- * bug to fix (bounded ~1-2 levels, inside prog bounds). */
+ * sequential path.  Refinement adds bit Al sign-directed via the `v198`/`v199`
+ * word pair (`*(&v198+2*(v<0))`), and a coefficient newly appearing in a
+ * refinement scan reads `size` raw bits, sign-extends, stores `<<Al`
+ * (860-868).  Both are load-bearing: positive-only adds leave scans 6-8 at
+ * worst 3, and skipping the new-value bit read desynchronises the scan so it
+ * overruns into the EOI marker. */
 static short *JpegProg = NULL;
 static unsigned JpegProgBase[4];
 static unsigned JpegProgBlocks = 0;
@@ -3435,6 +3438,7 @@ static const unsigned char *JpegDecodeProgScan(const unsigned char *scan,
     JpegBit bit;
     int pred[4] = {0, 0, 0, 0};
     unsigned hmax = 1, vmax = 1, t;
+    unsigned JProgNx, JProgNy;
     unsigned mcux, mcuy, mx, my;
     int eobrun = 0;
 
@@ -3453,8 +3457,30 @@ static const unsigned char *JpegDecodeProgScan(const unsigned char *scan,
     bit.nbits = 0;
     bit.marker_hit = 0;
 
-    for (my = 0; my < mcuy; my++) {
-        for (mx = 0; mx < mcux; mx++) {
+/* Interleaved scans (Ns>1) walk MCU order (my, mx, then the per-MCU
+ * by/bx sub-grid).  Single-component scans instead walk that component's own
+ * block grid row-major over its real sample extent (nbx = ceil(cw/8),
+ * nby = ceil(ch/8), cw/ch from width*hs/hmax), which for non-MCU-multiple
+ * sizes is NOT MCU order: a 17x9 4:2:0 luma band visits 3x2=6 blocks, not 8.
+ * This matches the listing, whose buffer index is
+ * `((x+cnt)>>shift) + nbx*((y+cnt)>>shift)` over the component's own block
+ * grid rather than a padded MCU rect.  Without it, edge-block coefficients
+ * land in the wrong slots (C-vs-original worst 17-21 vs 3-8 now).  `mx`/`my`
+ * hold the grid cell here and are divided down to MCU/sub-block position so
+ * both orders share one body. */
+    if (JpegScanNs == 1) {
+        unsigned ci = JpegScanOrder[0];
+        unsigned hs = JpegComps[ci].hsamp;
+        unsigned vs = JpegComps[ci].vsamp;
+        unsigned cw = (JpegWidth * hs + hmax - 1) / hmax;
+        unsigned ch = (JpegHeight * vs + vmax - 1) / vmax;
+
+        JProgNx = (cw + 7) / 8;
+        JProgNy = (ch + 7) / 8;
+    }
+
+    for (my = 0; my < (JpegScanNs > 1 ? mcuy : JProgNy); my++) {
+        for (mx = 0; mx < (JpegScanNs > 1 ? mcux : JProgNx); mx++) {
             for (t = 0; t < JpegScanNs; t++) {
                 unsigned ci = JpegScanOrder[t];
                 unsigned hs = JpegComps[ci].hsamp;
@@ -3463,13 +3489,25 @@ static const unsigned char *JpegDecodeProgScan(const unsigned char *scan,
                 JpegHuff *dh = &JpegHuffs[JpegComps[ci].dc_sel & 3];
                 JpegHuff *ah = &JpegHuffs[4 + (JpegComps[ci].ac_sel & 3)];
 
-                for (by = 0; by < vs; by++) {
-                    for (bx = 0; bx < hs; bx++) {
-                        unsigned mcu = my * mcux + mx;
-                        short *blk = JpegProg +
-                                     (JpegProgBase[ci] +
-                                      mcu * hs * vs + by * hs + bx) * 64;
-                        int k;
+                /* single-component scans visit exactly one block per grid
+                 * cell, so the by/bx sub-loops collapse to one pass and the
+                 * cell index is translated to MCU + sub-block position */
+                for (by = 0; by < (JpegScanNs > 1 ? vs : 1u); by++) {
+                    for (bx = 0; bx < (JpegScanNs > 1 ? hs : 1u); bx++) {
+                        unsigned px_ = mx, py_ = my;
+
+                        if (JpegScanNs == 1) {
+                            px_ /= hs;
+                            py_ /= vs;
+                            bx = mx % hs;
+                            by = my % vs;
+                        }
+                        {
+                            unsigned mcu = py_ * mcux + px_;
+                            short *blk = JpegProg +
+                                         (JpegProgBase[ci] +
+                                          mcu * hs * vs + by * hs + bx) * 64;
+                            int k;
 
                         if (Ss == 0) {
                             /* DC scan: first (Ah==0) decodes diffs (reduced
@@ -3496,15 +3534,16 @@ static const unsigned char *JpegDecodeProgScan(const unsigned char *scan,
                                 if (Ah == 0) {
                                     eobrun--;
                                 } else {
-                                    /* LABEL_198: refine existing nonzero
-                                     * (1 bit each, add iff >0), no new. */
+                                    /* LABEL_198: refine existing
+                                     * nonzero (1 bit each, sign-directed add
+                                     * per `v198`/`v199` word pair), no new. */
                                     for (k = (Ss < 1) ? 1 : (int)Ss;
                                          k <= (int)Se; k++) {
                                         if (blk[k]) {
-                                            if (JpegRawBit(&bit) &&
-                                                blk[k] > 0)
+                                            if (JpegRawBit(&bit))
                                                 blk[k] = (short)(blk[k] +
-                                                                 (1 << Al));
+                                                    (blk[k] > 0 ? (1 << Al) :
+                                                                  -(1 << Al)));
                                         }
                                     }
                                     eobrun--;
@@ -3568,11 +3607,12 @@ static const unsigned char *JpegDecodeProgScan(const unsigned char *scan,
                                             for (kk = k; kk <= (int)Se;
                                                  kk++) {
                                                 if (blk[kk]) {
-                                                    if (JpegRawBit(&bit) &&
-                                                        blk[kk] > 0)
+                                                    if (JpegRawBit(&bit))
                                                         blk[kk] =
                                                             (short)(blk[kk] +
-                                                                    (1 << Al));
+                                                            (blk[kk] > 0 ?
+                                                             (1 << Al) :
+                                                             -(1 << Al)));
                                                 }
                                             }
                                             break;
@@ -3580,14 +3620,15 @@ static const unsigned char *JpegDecodeProgScan(const unsigned char *scan,
                                     } else {
                                         /* Position-wise run skip (871-902):
                                          * existing nonzero refined (1 bit,
-                                         * add iff >0), zeros count down. */
+                                         * sign-directed), zeros count down. */
                                         while (k <= (int)Se) {
                                             if (blk[k]) {
-                                                if (JpegRawBit(&bit) &&
-                                                    blk[k] > 0)
+                                                if (JpegRawBit(&bit))
                                                     blk[k] =
                                                         (short)(blk[k] +
-                                                                (1 << Al));
+                                                        (blk[k] > 0 ?
+                                                         (1 << Al) :
+                                                         -(1 << Al)));
                                             } else {
                                                 run--;
                                                 if (run < 0)
@@ -3595,12 +3636,17 @@ static const unsigned char *JpegDecodeProgScan(const unsigned char *scan,
                                             }
                                             k++;
                                         }
-                                        if (k > (int)Se)
+if (k > (int)Se)
                                             break;
-                                        if (JpegRawBit(&bit))
-                                            blk[k] = (short)(1 << Al);
-                                        else
-                                            blk[k] = (short)(-(1 << Al));
+                                        /* New coefficient in a
+                                         * refinement scan (860-868): read
+                                         * `size` raw bits, sign-extend,
+                                         * store `<< Al`.  The bit count
+                                         * matters - omitting it
+                                         * desynchronises the scan and
+                                         * swallows the EOI. */
+                                        blk[k] = (short)(JpegExtend(&bit, size)
+                                                         << Al);
                                         k++;
                                     }
                                 }
@@ -3608,6 +3654,7 @@ static const unsigned char *JpegDecodeProgScan(const unsigned char *scan,
                         }
                     }
                 }
+                    }
             }
         }
     }

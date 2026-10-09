@@ -2530,18 +2530,36 @@ zeroed, per-comp bases, freed at EOI/failure - like `v58<<7`/`v9`) with
 successive approximation faithfully: first scans store `value<<Al`,
 refinements set/add bit Al, EOB runs skip (`JpegEobRun` 1,3,7,... =
 `dword_410158`, verified r=1 covering 3 following with tail padding),
-new-nonzero position-wise run-skip with sign bit, dead-negative refine
-(`+high16 = +0`, matches listing 890/937 - negatives stay coarse, bounded
-~2, inside prog bounds). DRI+progressive refused outright (original never
-allocates there: `!v195`). At EOI `JpegProgFinish` dequantises (same
-zigzag-t pattern), IDCTs into `JpegIdctBuf`, and outputs via the wired
-444/Sub paths (prog file is 420), then frees. C-vs-IM: interior 26,
-x=16/y=8 partial-MCU padding excluded from tight (corner-class edges,
-one at 190); bound 30 in `run_jpeg_progressive` (now asserts pixels +
-pngout PNG write, not refusal). C-vs-Python merge: DC exact, AC small
-diffs (refine nuances, snowball-bounded by the pixel bound). Per-scan
-`jpeg: pscan` dumps were temporary (reverted); final `jpeg: pblk` stays
-(like `blk`/`dbl`/`idct`).
+new-nonzero position-wise run-skip. DRI+progressive refused outright
+(original never allocates there: `!v195`). At EOI `JpegProgFinish`
+dequantises (same zigzag-t pattern), IDCTs into `JpegIdctBuf`, and outputs
+via the wired 444/Sub paths (prog file is 420), then frees.
+
+Two traversal/semantics details were pinned against the original binary on
+`dt_j_prog.jpg` and are load-bearing:
+
+- **Block order depends on component count.** Interleaved scans (`Ns>1`) walk
+  MCU order; single-component scans walk that component's *own* block grid
+  row-major over its real sample extent (`nbx=ceil(cw/8)`, `nby=ceil(ch/8)`,
+  `cw=ceil(width*hs/hmax)`). For a 17x9 4:2:0 luma band that is 3x2=6 blocks,
+  not the 8 a padded MCU rect gives - and the listing agrees, indexing
+  `((x+cnt)>>shift) + nbx*((y+cnt)>>shift)`. Getting this wrong scatters
+  edge-block coefficients into the wrong slots.
+- **Refinement is sign-directed and bit-exact in count.** An existing nonzero
+  refined by one bit adds `+(1<<Al)` when positive and `-(1<<Al)` when
+  negative (the `v198`/`v199` word pair selected by `v<0`, listing 890/937);
+  a coefficient newly appearing in a refinement scan reads `size` raw bits,
+  sign-extends them and stores `<<Al` (860-868). Both halves are required:
+  positive-only adds leave scans 6-8 at worst 3, and dropping the new-value
+  bit read desynchronises the scan so it overruns into the EOI marker.
+
+Against the original binary, per-scan prefixes (truncated after each scan)
+are now **bit-exact for scans 1-8** (worst 0 each, previously 17-21 from
+scan 2 on), and scans 9-10 sit at worst 9/10 spread across the frame rather
+than concentrated on the clipped edges. Remaining scan 9-10 residual is in
+the fine AC refinement bands, not in traversal. C-vs-IM interior stays
+within the bound 30 in `run_jpeg_progressive`. Per-scan `jpeg: pscan` dumps
+were temporary (reverted); final `jpeg: pblk` stays (like `blk`/`dbl`/`idct`).
 
 #### Linear `v4` fails at MCU boundaries; per-MCU bases required
 
