@@ -2388,7 +2388,8 @@ fitting, is the defined next step. Output stays unwired (`DecodeJpeg`
 returns -1; `dumpdec` refuses JPEG) so the probe never emits the silent
 garbage; `JpegOutput444` runs only under `JPEGDEBUG` for dumps. Grey+restart
 (`dt_j_grey_grey_2_8`) refuses cleanly (single-component restart bit-reader
-edge, separate from tables). Structure (per-MCU blocks, equation, store,
+edge, separate from tables - since fixed via slow-fallback L2 recovery, see
+wired section; historical note). Structure (per-MCU blocks, equation, store,
 clipping, floor-to-even indices) verified by the in-range rows; values need
 re-derivation to complete.
 
@@ -2460,16 +2461,18 @@ vs ImageMagick. This is PNGOUT's actual limitation, not a transcription
 slip (DC-only restart is bit-identical, proving framing/predictors right);
 fidelity demands the EOB, not a refuse. A bit-at-a-time fallback that
 refused dry (tried first) diverged - reverted. Grey+restart single-component
-(`dt_j_grey_grey_2_8`) still refuses cleanly (separate bit-reader edge).
+(`dt_j_grey_grey_2_8`) still refuses cleanly (separate bit-reader edge -
+since fixed, decodes tight; historical note).
 
 #### JPEG h=1 output wired: fitted functional tables, pixel-verified, known gaps
 
-`JpegOutput444` returns 0 and `dumpdec` accepts JPEG: 27/33 corpus files
-decode (23 to pixels, 4 decode-only), 6 refuse cleanly (`DecodeImage
-refused`: progressive (buffered path missing), single-component restart
-(header-gated `JpegRestart && NComp==1`: flat/ramp/grey restart-1comp
-degrade 50/refuse vs 3-comp exact-or-bounded), high-contrast restart
-(checker 444/grey/422 restart-2 refuse). Subsampled Y-hs=2 (422/420) is
+`JpegOutput444` returns 0 and `dumpdec` accepts JPEG: 30/33 corpus files
+decode (26 to pixels, 4 decode-only), 3 refuse cleanly (`DecodeImage
+refused`: high-contrast restart only - checker 444/grey/422 restart-2).
+Single-component restart framing is fixed (gate removed): flat/ramp/grey
+1-comp restart all decode tight (5/6/6, matching non-restart - the old 50
+was stale linear tables, and coefficients verify bit-exact (all DC=7)).
+Progressive is wired too (next subsection). Subsampled Y-hs=2 (422/420) is
 wired via `JpegOutputSub`: the listing `408FD5` paired loop shares one
 chroma sample per luma pair (`sar ecx,1` - point replication, no filter),
 same four tables + T0/T1/T2 equation per pixel (second Y loaded
@@ -2480,8 +2483,9 @@ values needed: flat422/420 exact (0 incl. restart), grey422/420 6,
 ramp420 7, ramp422 8/13 (restart same, no extra degradation).
 `--jpeg` asserts C-vs-ImageMagick
 pixels (not refusal): flat444 0/0 (exact incl. restart), grey444 6/6,
-ramp444 7/13 non-restart and 17 restart, flatgrey 5/17-corner-pad,
-rampgrey 6, greygrey 6/6/85-corner-white-pad, checkergrey 6/133-edge -
+ramp444 7/13 non-restart and 17 restart, flatgrey 5/17-corner-pad and 5
+restart, rampgrey 6/6 restart, greygrey 6/6/85-corner-white-pad and 6
+restart, checkergrey 6/133-edge -
 bounds in `run_jpeg` (interior <=7-12, edges <=20 pad, corner <100,
 checker-grey 140, restart-444 <=25). `checker_444_0_8` decodes (correct
 size, no crash) with no pixel bound - and stays that way: misaligned
@@ -2506,7 +2510,7 @@ Table VALUES (`JpegMakeTables`: linear baselines + 230 fitted overrides
 (interior 7) + RGB white nudges; unlisted indices keep linear (<=5
 default)) are functional/provisional - equation/structure (listing
 408F06-70, `shr` logical, floor-even, direct store) is final. Remaining:
-true fixed values (writer discovery), 1-comp-restart framing. (Checker
+true fixed values (writer discovery). (Checker
 extremes deliberately excluded - structurally beyond
 fixed tables, see above; not a gap to close.)
 

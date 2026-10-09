@@ -3395,14 +3395,6 @@ static int JpegOutput444(unsigned char *pixels, int pitch,
 
     if (JpegNComp != 1 && JpegNComp != 3)
         return -1;
-    /* Single-component restart (DRI + 1-comp SOS) is gated to a clean
-     * refusal: the resync/DC path degrades (flat-grey restart off by 50)
-     * or fails outright (grey+restart bit-reader edge), and the original
-     * slow-fallback EOB semantics that rescue 3-comp tails do not cover
-     * the 1-comp framing.  Header-based (DRI interval + SOF count), not
-     * content-based.  3-comp restart decodes (EOB tails, faithful). */
-    if (JpegRestart != 0 && JpegNComp == 1)
-        return -1;
     for (ci = 0; ci < JpegNComp; ci++) {
         if (JpegComps[ci].hsamp != 1 || JpegComps[ci].vsamp != 1)
             return -1;

@@ -1755,6 +1755,9 @@ def run_jpeg(case):
         ("flat", "grey", 0, 8): 20,
         ("ramp", "grey", 0, 8): 12,
         ("grey", "grey", 0, 8): 12,
+        ("flat", "grey", 2, 8): 20,
+        ("ramp", "grey", 2, 8): 12,
+        ("grey", "grey", 2, 8): 12,
         ("checker", "grey", 0, 8): 140,
         ("flat", "422", 0, 8): 5, ("flat", "422", 2, 8): 5,
         ("flat", "420", 0, 8): 5, ("flat", "420", 2, 8): 5,
@@ -1801,7 +1804,8 @@ def run_jpeg(case):
                     b = (v[0], v[0], v[0]) if len(v) == 1 else tuple(v[:3])
                     a = px[yy * w + xx]
                     e = max(abs(p - q) for p, q in zip(a, b))
-                    if xx == 16 and yy == 8 and key == ("grey", "grey", 0, 8):
+                    if xx == 16 and yy == 8 and key in (
+                            ("grey", "grey", 0, 8), ("grey", "grey", 2, 8)):
                         if e >= 100:
                             return "%-22s corner differs by %d" % (name, e)
                         continue
