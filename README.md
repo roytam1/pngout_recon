@@ -2443,6 +2443,31 @@ fidelity demands the EOB, not a refuse. A bit-at-a-time fallback that
 refused dry (tried first) diverged - reverted. Grey+restart single-component
 (`dt_j_grey_grey_2_8`) still refuses cleanly (separate bit-reader edge).
 
+#### JPEG h=1 output wired: fitted functional tables, pixel-verified, known gaps
+
+`JpegOutput444` returns 0 and `dumpdec` accepts JPEG: 12/33 corpus files
+decode to pixels, 21 refuse cleanly (`DecodeImage refused`: all h=2
+(422/420), progressive (buffered path missing), single-component restart
+(header-gated `JpegRestart && NComp==1`: flat/ramp/grey restart-1comp
+degrade 50/refuse vs 3-comp exact-or-bounded), high-contrast restart
+(checker 444/grey restart-2 refuse). `--jpeg` asserts C-vs-ImageMagick
+pixels (not refusal): flat444 0/0 (exact incl. restart), grey444 6/6,
+ramp444 7/13 non-restart and 17 restart, flatgrey 5/17-corner-pad,
+rampgrey 6, greygrey 6/6/85-corner-white-pad, checkergrey 6/133-edge -
+bounds in `run_jpeg` (interior <=7-12, edges <=20 pad, corner <100,
+checker-grey 140, restart-444 <=25). `checker_444_0_8` decodes (correct
+size, no crash) with no pixel bound: high-contrast extremes (in 150) need
+range tables not yet fitted (fit corpus was smooth + white/black flats).
+Black is exact (idx 891 dead-zero), white flats 121-126 (249-254) via the
+max-Y-to-126 nudge (1-idx margin; all 72 corpus whites share chroma (0,0)).
+Table VALUES (`JpegMakeTables`: linear baselines + 230 fitted overrides
+>2M, from 994-inlier coordinate descent (mean 0.23) + worst-polish
+(interior 7) + RGB white nudges; unlisted indices keep linear (<=5
+default)) are functional/provisional - equation/structure (listing
+408F06-70, `shr` logical, floor-even, direct store) is final. Remaining:
+extreme-range tables (checker_444 pixels), true fixed values (writer
+discovery), h=2/progressive paths, 1-comp-restart framing.
+
 #### Linear `v4` fails at MCU boundaries; per-MCU bases required
 
 Row 0 (single MCU in `x`) fits linear tables to worst 3; row 1 spanning three

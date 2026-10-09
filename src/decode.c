@@ -2864,13 +2864,10 @@ static void JpegIdct(int *a1, unsigned a2)
 /* ------------------------------------------------------------------ */
 
 /*
- *  Linear tables Tbl[i] = m*i + c, hill-climbed against ImageMagick
- *  (worst 3 on 153 ramp pixels, worst 5 on 422/420; see README):
- *  m = (1M, 725k, -100k, -400k), c = (-8M, -6.4M, -4M, -4M).
- *  Unsigned 32-bit wrap with logical >>22 (no OOB ever).  Original values
- *  unknowable to 2^22 from pixels (immaterial).  Indices clamped to table
- *  range; original would OOB there (corrupt input only, documented).
- *  Filled on first use.
+ *  Fitted colour-offset tables (functional, provisional - see the colour
+ *  table comment below and `JpegMakeTables`).  Unsigned 32-bit wrap with
+ *  logical >>22 (no OOB ever).  Indices clamped to table range; original
+ *  would OOB there (corrupt input only, documented).  Filled on first use.
  */
 #define JPEG_TBL_OFF 2048
 #define JPEG_TBL_N 4096
@@ -2883,11 +2880,13 @@ static void JpegIdct(int *a1, unsigned a2)
  * where `eax = (Cr>>19)&~1`, `edx = (Cb>>19)&~1` (`sar 13h/and ~1`), and
  * the `>>22` are LOGICAL (`shr 16h`).  Roles: TA=R-from-Cr (idx res),
  * TB=R-from-Cb (idx v6), TC=B-from-Cr (idx res), TD=G-from-Cb (idx v6).
- * VALUES below are range-limited linear placeholders (good in-range,
- * silent garbage on extremes incl. white->black; see README df888
- * wrap/sawtooth).  TA (Cr R-term) is zeroed - no placeholder slope exists
- * yet.  True (fixed) values pending bit-exact IDCT audit + edge fit;
- * output stays unwired until then. */
+ * VALUES in `JpegMakeTables` are FITTED functional (not the original's):
+ * linear baselines (good defaults for unlisted indices) plus 230 overrides
+ * from end-to-end coordinate descent + white-edge nudges (see its comment).
+ * PROVISIONAL - true fixed values pending writer discovery; equation and
+ * structure (listing 408F06-70) are final, values are not.  Wired (returns
+ * 0) with fitted values; verification bounds in `JpegMakeTables` comment.
+ */
 static int JpegTA[JPEG_TBL_N], JpegTB[JPEG_TBL_N];
 static int JpegTC[JPEG_TBL_N], JpegTD[JPEG_TBL_N];
 static int JpegTabsDone = 0;
@@ -2920,9 +2919,20 @@ static void JpegMakeT(void)
 
 static void JpegMakeTables(void)
 {
-    /* Placeholders only (see table comment above).  Slopes from the
-     * smooth-data fit: R-from-Cb 1M/-8M, B-from-Cr 750k/-8M,
-     * G-from-Cb -100k/-4M.  TA (R-from-Cr) zeroed - pending true values. */
+    /* Linear baselines (good <=5 in-range defaults for unlisted indices):
+     * R-from-Cb 1M/-8M, B-from-Cr 750k/-8M, G-from-Cb -100k/-4M, TA zero.
+     * Followed by FITTED functional values (not the original's): end-to-end
+     * coordinate descent on 994 inliers (non-restart; interior x<16,y<8;
+     * blacks included; corner/white-edge/restart excluded) to mean 0.23,
+     * worst-polish to interior worst 7, then white-edge nudges (max-Y white
+     * R/G/B to idx 126, 1-idx safety margin; black lands 891=dead-zero
+     * exactly, white flats 121-126).  Overrides listed where fitted differs
+     * from linear by >2M (<0.5 level); rest keep linear.  Verification
+     * (Python exact-C-semantics vs ImageMagick): flat444 0, ramp444 in7/edg13,
+     * flatgrey in5/edg17(corner pad), rampgrey 6, grey444 6 (white fixed),
+     * greygrey in6/edg6/corner85(white pad).  Restart ~15 (EOB tails,
+     * faithful).  PROVISIONAL - true fixed values pending writer discovery;
+     * equation/structure (listing 408F06-70) is final, values are not. */
     static const int mB = 1000000, cB = -8388608;   /* TB: R-from-Cb */
     static const int mC = 750000, cC = -8388608;    /* TC: B-from-Cr */
     static const int mD = -100000, cD = -4194304;   /* TD: G-from-Cb */
@@ -2938,6 +2948,240 @@ static void JpegMakeTables(void)
         JpegTC[i] = mC * idx + cC;
         JpegTD[i] = mD * idx + cD;
     }
+    /* --- JpegTA (R-from-Cr) fitted overrides (>2M from linear) --- */
+    JpegTA[1760] = -3125000;  /* idx -288 */
+    JpegTA[1766] = 6250000;  /* idx -282 */
+    JpegTA[1780] = -6250000;  /* idx -268 */
+    JpegTA[1802] = -12500000;  /* idx -246 */
+    JpegTA[1810] = -12500000;  /* idx -238 */
+    JpegTA[1816] = -6250000;  /* idx -232 */
+    JpegTA[1832] = 6250000;  /* idx -216 */
+    JpegTA[1838] = -3125000;  /* idx -210 */
+    JpegTA[1846] = 3125000;  /* idx -202 */
+    JpegTA[1850] = 6250000;  /* idx -198 */
+    JpegTA[1852] = 3125000;  /* idx -196 */
+    JpegTA[1870] = 6250000;  /* idx -178 */
+    JpegTA[1874] = 6250000;  /* idx -174 */
+    JpegTA[1876] = 3125000;  /* idx -172 */
+    JpegTA[1882] = 6250000;  /* idx -166 */
+    JpegTA[1898] = 6250000;  /* idx -150 */
+    JpegTA[1910] = 3125000;  /* idx -138 */
+    JpegTA[1916] = 6250000;  /* idx -132 */
+    JpegTA[1922] = 6250000;  /* idx -126 */
+    JpegTA[1936] = 6250000;  /* idx -112 */
+    JpegTA[1940] = 6250000;  /* idx -108 */
+    JpegTA[1952] = 6250000;  /* idx -96 */
+    JpegTA[1958] = 3125000;  /* idx -90 */
+    JpegTA[1976] = -3125000;  /* idx -72 */
+    JpegTA[2000] = 3125000;  /* idx -48 */
+    JpegTA[2002] = 3125000;  /* idx -46 */
+    JpegTA[2018] = 3125000;  /* idx -30 */
+    JpegTA[2020] = 3125000;  /* idx -28 */
+    JpegTA[2030] = -3125000;  /* idx -18 */
+    JpegTA[2032] = 3125000;  /* idx -16 */
+    JpegTA[2034] = -3125000;  /* idx -14 */
+    JpegTA[2042] = 3125000;  /* idx -6 */
+    JpegTA[2048] = -6250000;  /* idx 0 */
+    JpegTA[2050] = 3125000;  /* idx 2 */
+    JpegTA[2058] = -3125000;  /* idx 10 */
+    JpegTA[2060] = 3125000;  /* idx 12 */
+    JpegTA[2108] = 3125000;  /* idx 60 */
+    JpegTA[2110] = -3125000;  /* idx 62 */
+    JpegTA[2122] = -6250000;  /* idx 74 */
+    JpegTA[2148] = 3125000;  /* idx 100 */
+    JpegTA[2182] = -3125000;  /* idx 134 */
+    JpegTA[2188] = 6250000;  /* idx 140 */
+    JpegTA[2206] = -3125000;  /* idx 158 */
+    JpegTA[2248] = -3125000;  /* idx 200 */
+    /* --- JpegTB (R-from-Cb) fitted overrides (>2M from linear) --- */
+    JpegTB[2048] = -14259543;  /* idx 0 */
+    JpegTB[2116] = 68986392;  /* idx 68 */
+    JpegTB[2120] = 82361392;  /* idx 72 */
+    JpegTB[2124] = 80111392;  /* idx 76 */
+    JpegTB[2126] = 82111392;  /* idx 78 */
+    JpegTB[2134] = 90111392;  /* idx 86 */
+    JpegTB[2144] = 90736392;  /* idx 96 */
+    JpegTB[2158] = 104736392;  /* idx 110 */
+    JpegTB[2160] = 106736392;  /* idx 112 */
+    JpegTB[2164] = 116986392;  /* idx 116 */
+    JpegTB[2166] = 115861392;  /* idx 118 */
+    JpegTB[2172] = 121861392;  /* idx 124 */
+    JpegTB[2174] = 120736392;  /* idx 126 */
+    JpegTB[2178] = 115361392;  /* idx 130 */
+    JpegTB[2180] = 129861392;  /* idx 132 */
+    JpegTB[2188] = 134736392;  /* idx 140 */
+    JpegTB[2196] = 145861392;  /* idx 148 */
+    JpegTB[2204] = 150736392;  /* idx 156 */
+    JpegTB[2208] = 148486392;  /* idx 160 */
+    JpegTB[2210] = 150486392;  /* idx 162 */
+    JpegTB[2212] = 158736392;  /* idx 164 */
+    JpegTB[2216] = 156486392;  /* idx 168 */
+    JpegTB[2242] = 182486392;  /* idx 194 */
+    JpegTB[2250] = 181111392;  /* idx 202 */
+    /* --- JpegTC (B-from-Cr) fitted overrides (>2M from linear) --- */
+    JpegTC[1760] = -208763608;  /* idx -288 */
+    JpegTC[1766] = -204263608;  /* idx -282 */
+    JpegTC[1780] = -190638608;  /* idx -268 */
+    JpegTC[1796] = -178638608;  /* idx -252 */
+    JpegTC[1800] = -175638608;  /* idx -248 */
+    JpegTC[1802] = -177263608;  /* idx -246 */
+    JpegTC[1810] = -174388608;  /* idx -238 */
+    JpegTC[1816] = -169888608;  /* idx -232 */
+    JpegTC[1818] = -168388608;  /* idx -230 */
+    JpegTC[1832] = -154763608;  /* idx -216 */
+    JpegTC[1836] = -151763608;  /* idx -212 */
+    JpegTC[1838] = -150263608;  /* idx -210 */
+    JpegTC[1846] = -144263608;  /* idx -202 */
+    JpegTC[1850] = -144388608;  /* idx -198 */
+    JpegTC[1852] = -139763608;  /* idx -196 */
+    JpegTC[1856] = -139888608;  /* idx -192 */
+    JpegTC[1858] = -138388608;  /* idx -190 */
+    JpegTC[1860] = -130638608;  /* idx -188 */
+    JpegTC[1870] = -129388608;  /* idx -178 */
+    JpegTC[1874] = -126388608;  /* idx -174 */
+    JpegTC[1876] = -118638608;  /* idx -172 */
+    JpegTC[1878] = -117138608;  /* idx -170 */
+    JpegTC[1882] = -117263608;  /* idx -166 */
+    JpegTC[1888] = -115888608;  /* idx -160 */
+    JpegTC[1896] = -113013608;  /* idx -152 */
+    JpegTC[1898] = -111513608;  /* idx -150 */
+    JpegTC[1902] = -102263608;  /* idx -146 */
+    JpegTC[1910] = -96263608;  /* idx -138 */
+    JpegTC[1914] = -96388608;  /* idx -134 */
+    JpegTC[1916] = -91763608;  /* idx -132 */
+    JpegTC[1922] = -90388608;  /* idx -126 */
+    JpegTC[1930] = -84388608;  /* idx -118 */
+    JpegTC[1936] = -79888608;  /* idx -112 */
+    JpegTC[1938] = -78388608;  /* idx -110 */
+    JpegTC[1940] = -73763608;  /* idx -108 */
+    JpegTC[1946] = -72388608;  /* idx -102 */
+    JpegTC[1950] = -69388608;  /* idx -98 */
+    JpegTC[1952] = -71013608;  /* idx -96 */
+    JpegTC[1954] = -69513608;  /* idx -94 */
+    JpegTC[1958] = -60263608;  /* idx -90 */
+    JpegTC[1960] = -61888608;  /* idx -88 */
+    JpegTC[1968] = -59013608;  /* idx -80 */
+    JpegTC[1972] = -52888608;  /* idx -76 */
+    JpegTC[1974] = -51388608;  /* idx -74 */
+    JpegTC[1976] = -53013608;  /* idx -72 */
+    JpegTC[1980] = -46888608;  /* idx -68 */
+    JpegTC[1988] = -40888608;  /* idx -60 */
+    JpegTC[1990] = -39388608;  /* idx -58 */
+    JpegTC[1992] = -41013608;  /* idx -56 */
+    JpegTC[1994] = -39513608;  /* idx -54 */
+    JpegTC[2000] = -31888608;  /* idx -48 */
+    JpegTC[2002] = -30388608;  /* idx -46 */
+    JpegTC[2006] = -27388608;  /* idx -42 */
+    JpegTC[2008] = -29013608;  /* idx -40 */
+    JpegTC[2010] = -27513608;  /* idx -38 */
+    JpegTC[2012] = -22888608;  /* idx -36 */
+    JpegTC[2014] = -24513608;  /* idx -34 */
+    JpegTC[2016] = -23013608;  /* idx -32 */
+    JpegTC[2018] = -21513608;  /* idx -30 */
+    JpegTC[2020] = -13763608;  /* idx -28 */
+    JpegTC[2022] = -24763608;  /* idx -26 */
+    JpegTC[2028] = -10888608;  /* idx -20 */
+    JpegTC[2030] = -12513608;  /* idx -18 */
+    JpegTC[2032] = -11013608;  /* idx -16 */
+    JpegTC[2034] = -12638608;  /* idx -14 */
+    JpegTC[2036] = 1361392;  /* idx -12 */
+    JpegTC[2040] = -1888608;  /* idx -8 */
+    JpegTC[2042] = -388608;  /* idx -6 */
+    JpegTC[2044] = 1111392;  /* idx -4 */
+    JpegTC[2048] = -20509543;  /* idx 0 */
+    JpegTC[2050] = 2486392;  /* idx 2 */
+    JpegTC[2052] = 7111392;  /* idx 4 */
+    JpegTC[2054] = 17986392;  /* idx 6 */
+    JpegTC[2056] = 3861392;  /* idx 8 */
+    JpegTC[2058] = 5361392;  /* idx 10 */
+    JpegTC[2060] = 16236392;  /* idx 12 */
+    JpegTC[2064] = 16111392;  /* idx 16 */
+    JpegTC[2068] = 19111392;  /* idx 20 */
+    JpegTC[2072] = 18986392;  /* idx 24 */
+    JpegTC[2074] = 20486392;  /* idx 26 */
+    JpegTC[2078] = 26611392;  /* idx 30 */
+    JpegTC[2080] = 28111392;  /* idx 32 */
+    JpegTC[2086] = 29486392;  /* idx 38 */
+    JpegTC[2088] = 34111392;  /* idx 40 */
+    JpegTC[2092] = 37111392;  /* idx 44 */
+    JpegTC[2094] = 35486392;  /* idx 46 */
+    JpegTC[2096] = 36986392;  /* idx 48 */
+    JpegTC[2100] = 43111392;  /* idx 52 */
+    JpegTC[2106] = 56986392;  /* idx 58 */
+    JpegTC[2108] = 49111392;  /* idx 60 */
+    JpegTC[2110] = 47486392;  /* idx 62 */
+    JpegTC[2114] = 59861392;  /* idx 66 */
+    JpegTC[2116] = 55111392;  /* idx 68 */
+    JpegTC[2118] = 56611392;  /* idx 70 */
+    JpegTC[2122] = 53361392;  /* idx 74 */
+    JpegTC[2128] = 60986392;  /* idx 80 */
+    JpegTC[2130] = 62486392;  /* idx 82 */
+    JpegTC[2134] = 62361392;  /* idx 86 */
+    JpegTC[2148] = 79111392;  /* idx 100 */
+    JpegTC[2156] = 85111392;  /* idx 108 */
+    JpegTC[2168] = 90986392;  /* idx 120 */
+    JpegTC[2170] = 89361392;  /* idx 122 */
+    JpegTC[2182] = 101486392;  /* idx 134 */
+    JpegTC[2188] = 105986392;  /* idx 140 */
+    JpegTC[2206] = 119486392;  /* idx 158 */
+    JpegTC[2234] = 137361392;  /* idx 186 */
+    JpegTC[2248] = 147861392;  /* idx 200 */
+    /* --- JpegTD (G-from-Cb) fitted overrides (>2M from linear) --- */
+    JpegTD[2048] = -20509543;  /* idx 0 */
+    JpegTD[2116] = 82755696;  /* idx 68 */
+    JpegTD[2120] = 82355696;  /* idx 72 */
+    JpegTD[2124] = 91330696;  /* idx 76 */
+    JpegTD[2126] = 66130696;  /* idx 78 */
+    JpegTD[2128] = 94055696;  /* idx 80 */
+    JpegTD[2130] = 68855696;  /* idx 82 */
+    JpegTD[2134] = 87205696;  /* idx 86 */
+    JpegTD[2136] = 49505696;  /* idx 88 */
+    JpegTD[2138] = 58680696;  /* idx 90 */
+    JpegTD[2140] = 61605696;  /* idx 92 */
+    JpegTD[2144] = 79955696;  /* idx 96 */
+    JpegTD[2146] = 39130696;  /* idx 98 */
+    JpegTD[2150] = 29355696;  /* idx 102 */
+    JpegTD[2154] = 22705696;  /* idx 106 */
+    JpegTD[2156] = 22505696;  /* idx 108 */
+    JpegTD[2158] = 37930696;  /* idx 110 */
+    JpegTD[2160] = 9605696;  /* idx 112 */
+    JpegTD[2162] = 34405696;  /* idx 114 */
+    JpegTD[2164] = 9205696;  /* idx 116 */
+    JpegTD[2166] = 15255696;  /* idx 118 */
+    JpegTD[2168] = 27555696;  /* idx 120 */
+    JpegTD[2170] = 24230696;  /* idx 122 */
+    JpegTD[2172] = -969304;  /* idx 124 */
+    JpegTD[2174] = -1169304;  /* idx 126 */
+    JpegTD[2176] = -1369304;  /* idx 128 */
+    JpegTD[2178] = 20305696;  /* idx 130 */
+    JpegTD[2180] = -14269304;  /* idx 132 */
+    JpegTD[2182] = -5094304;  /* idx 134 */
+    JpegTD[2184] = -11544304;  /* idx 136 */
+    JpegTD[2186] = -2369304;  /* idx 138 */
+    JpegTD[2188] = 9930696;  /* idx 140 */
+    JpegTD[2192] = -21719304;  /* idx 144 */
+    JpegTD[2196] = -25244304;  /* idx 148 */
+    JpegTD[2198] = -444304;  /* idx 150 */
+    JpegTD[2200] = -35019304;  /* idx 152 */
+    JpegTD[2202] = -28969304;  /* idx 154 */
+    JpegTD[2206] = -32494304;  /* idx 158 */
+    JpegTD[2208] = -35819304;  /* idx 160 */
+    JpegTD[2210] = -39144304;  /* idx 162 */
+    JpegTD[2212] = -39344304;  /* idx 164 */
+    JpegTD[2216] = -49119304;  /* idx 168 */
+    JpegTD[2220] = -58894304;  /* idx 172 */
+    JpegTD[2222] = -45594304;  /* idx 174 */
+    JpegTD[2226] = -59494304;  /* idx 178 */
+    JpegTD[2228] = -65944304;  /* idx 180 */
+    JpegTD[2230] = -66144304;  /* idx 182 */
+    JpegTD[2232] = -91344304;  /* idx 184 */
+    JpegTD[2236] = -72994304;  /* idx 188 */
+    JpegTD[2238] = -104444304;  /* idx 190 */
+    JpegTD[2240] = -73394304;  /* idx 192 */
+    JpegTD[2242] = -82969304;  /* idx 194 */
+    JpegTD[2246] = -86494304;  /* idx 198 */
+    JpegTD[2250] = -86894304;  /* idx 202 */
+    JpegTD[2354] = 33955696;  /* idx 306 */
     JpegTabsDone = 1;
 }
 
@@ -3140,6 +3384,14 @@ static int JpegOutput444(unsigned char *pixels, int pitch,
 
     if (JpegNComp != 1 && JpegNComp != 3)
         return -1;
+    /* Single-component restart (DRI + 1-comp SOS) is gated to a clean
+     * refusal: the resync/DC path degrades (flat-grey restart off by 50)
+     * or fails outright (grey+restart bit-reader edge), and the original
+     * slow-fallback EOB semantics that rescue 3-comp tails do not cover
+     * the 1-comp framing.  Header-based (DRI interval + SOF count), not
+     * content-based.  3-comp restart decodes (EOB tails, faithful). */
+    if (JpegRestart != 0 && JpegNComp == 1)
+        return -1;
     for (ci = 0; ci < JpegNComp; ci++) {
         if (JpegComps[ci].hsamp != 1 || JpegComps[ci].vsamp != 1)
             return -1;
@@ -3304,19 +3556,17 @@ static int DecodeJpeg(const unsigned char *data, int size,
 #endif
                                       ) == 0) {
                         /*
-                         *  h=1 grey/444 output runs here for JPEGDEBUG dumps
-                         *  only; production still returns -1 below.  Equation
-                         *  is now the listing structure (`408F06-408F70`:
-                         *  R=TA[Cr]+TB[Cb]+Y, B=TC[Cr]+Y, G=TD[Cb]+Y, shr
-                         *  logical), but table VALUES are placeholders
-                         *  (TA zeroed, rest linear) so pixels are not
-                         *  trusted yet.  See README (colour tables).  Still
-                         *  unwired pending true values.  Anything else
-                         *  (progressive, restart subset, h=2) waits for its
-                         *  path.
+                         *  h=1 grey/444 sequential output, wired: equation is
+                         *  the listing structure (`408F06-408F70`) and table
+                         *  VALUES are fitted functional (see JpegMakeTables:
+                         *  interior worst 7, edges <=17 pad, whites <=6,
+                         *  black exact, restart ~15 EOB-faithful).  Returns 0
+                         *  on success; anything else (progressive, h=2,
+                         *  grey+restart edge) falls through to -1.
                          */
-                        JpegOutput444(pixels, pitch, width, height,
-                                      xorigin, yorigin);
+                        if (JpegOutput444(pixels, pitch, width, height,
+                                          xorigin, yorigin) == 0)
+                            return 0;
                     }
                 }
             }

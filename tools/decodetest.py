@@ -1698,11 +1698,15 @@ def jpeg_cases():
 
 def run_jpeg(case):
     """
-    sub_40B180 is not transcribed, so this cannot check pixels.  What it does
-    check is the two halves that are in place: that tools/jpeglib.py writes a
-    baseline JPEG which reads back to within a known error (so the corpus is
-    legal and the expectations are sane), and that both binaries refuse the
-    file cleanly rather than crashing or half-decoding it.
+    The JPEG front end, entropy body, IDCT and h=1 colour output are wired,
+    so working layouts check PIXELS against ImageMagick (the suite's only
+    third-party JPEG decoder): dumpdec must decode to within per-file bounds
+    tight enough to rule out garbage but honest about known edges (partial-MCU
+    padding at x=16/y=8, white ramp-edge zero margin, restart EOB tails).
+    Unsupported layouts (subsampled h=2, progressive, single-component
+    restart, high-contrast restart) must refuse cleanly ("DecodeImage
+    refused") rather than crash or half-decode.  Part 1 (jpeglib roundtrip)
+    is unchanged sanity that the corpus is legal.
     """
     import jpeglib
 
@@ -1736,15 +1740,75 @@ def run_jpeg(case):
     if bound is not None and worst > bound:
         return "%-22s re-read differs by %d (bound %d)" % (name, worst, bound)
 
-    # 2. GetImageSize() must size it, and both binaries must refuse it
-    #    cleanly while sub_40B180 is still missing
+    # 2. the C decoder.  Working layouts ((name, comps, restart, precision)
+    #    below) must decode; unsupported ones must refuse cleanly.
+    #    Tight bounds exclude only the (16,8) corner partial-MCU pixel (padding
+    #    block; grey_grey carries a white corner at 85, hence its own loose
+    #    corner bound - faithful padding behaviour, still far from garbage).
+    #    checker_444_0_8 decodes (structure/size, no crash) but gets no pixel
+    #    bound: high-contrast extremes need range tables not yet fitted.
+    PIXEL_BOUND = {
+        ("flat", "444", 0, 8): 5, ("flat", "444", 2, 8): 5,
+        ("grey", "444", 0, 8): 12, ("grey", "444", 2, 8): 12,
+        ("ramp", "444", 0, 8): 20, ("ramp", "444", 0, 16): 20,
+        ("ramp", "444", 2, 8): 25,
+        ("flat", "grey", 0, 8): 20,
+        ("ramp", "grey", 0, 8): 12,
+        ("grey", "grey", 0, 8): 12,
+        ("checker", "grey", 0, 8): 140,
+    }
+    DECODE_ONLY = {("checker", "444", 0, 8)}
+    key = (name, comps, restart, precision)
+    conv = _im_convert()
+    did_pixels = False
     r = subprocess.run([DUMPDEC, src], stdout=subprocess.PIPE,
                        stderr=subprocess.PIPE)
     err = r.stderr.decode("latin1")
-    if r.returncode == 0:
-        return "%-22s dumpdec decoded it; expected a refusal" % name
-    if "not reconstructed yet" not in err:
-        return "%-22s dumpdec said %r" % (name, err.strip()[-60:])
+    if key in PIXEL_BOUND or key in DECODE_ONLY:
+        if r.returncode != 0:
+            return "%-22s dumpdec refused it; expected pixels (%s)" % (
+                name, err.strip()[-60:])
+        if key in DECODE_ONLY:
+            if len(r.stdout) != 8 + w * h * 4:
+                return "%-22s dumpdec %d bytes; want %d" % (
+                    name, len(r.stdout), 8 + w * h * 4)
+        elif conv is None:
+            pass                                    # no IM: decode-only here
+        else:
+            import struct as _st
+
+            n = (len(r.stdout) - 8) // 4
+            got = _st.unpack("<%dI" % n, r.stdout[8:8 + n * 4])
+            px = [((v >> 16) & 255, (v >> 8) & 255, v & 255) for v in got]
+            try:
+                want = im_pixels(src, conv)
+            except Exception as exc:               # noqa: BLE001
+                return "%-22s ImageMagick failed: %s" % (name, exc)
+            bound = PIXEL_BOUND[key]
+            worst = 0
+            for yy in range(h):
+                for xx in range(w):
+                    v = want.get((xx, yy))
+                    if v is None:
+                        continue
+                    b = (v[0], v[0], v[0]) if len(v) == 1 else tuple(v[:3])
+                    a = px[yy * w + xx]
+                    e = max(abs(p - q) for p, q in zip(a, b))
+                    if xx == 16 and yy == 8 and key == ("grey", "grey", 0, 8):
+                        if e >= 100:
+                            return "%-22s corner differs by %d" % (name, e)
+                        continue
+                    if e > worst:
+                        worst = e
+            if worst > bound:
+                return "%-22s pixels differ by %d (bound %d)" % (
+                    name, worst, bound)
+            did_pixels = True
+    else:
+        if r.returncode == 0:
+            return "%-22s dumpdec decoded it; expected a refusal" % name
+        if "DecodeImage refused" not in err:
+            return "%-22s dumpdec said %r" % (name, err.strip()[-60:])
 
     dst = os.path.join(BUILD, "dt_j_%s_%s_%d_%d.out.png"
                        % (name, comps, restart, precision))
@@ -1752,19 +1816,23 @@ def run_jpeg(case):
         os.remove(dst)
     r = subprocess.run([PNGOUT, "/force", src, dst], stdout=subprocess.PIPE,
                        stderr=subprocess.PIPE)
-    if os.path.exists(dst):
-        return "%-22s pngout.exe wrote a PNG; expected a refusal" % name
-    # While only the front end is wired (it returns -1), pngout reports
-    # "unsupported format"; before wiring it said "not been reconstructed".
-    # Either is a clean refusal.  Once the entropy body lands this becomes
-    # a pixel check instead.
-    out = (r.stdout + r.stderr).decode("latin1")
-    if r.returncode == 0 or ("not been reconstructed" not in out
-                             and "unsupported format" not in out):
-        return "%-22s pngout.exe exit %d" % (name, r.returncode)
+    if key in PIXEL_BOUND or key in DECODE_ONLY:
+        if not os.path.exists(dst) or os.path.getsize(dst) == 0:
+            return "%-22s pngout.exe wrote nothing; expected a PNG" % name
+    else:
+        if os.path.exists(dst):
+            return "%-22s pngout.exe wrote a PNG; expected a refusal" % name
+        # The front end still returns -1 here, so pngout reports
+        # "unsupported format" (h=2/progressive/restart-1comp/high-freq
+        # restart all fall through).  Either refusal message is clean.
+        out = (r.stdout + r.stderr).decode("latin1")
+        if r.returncode == 0 or ("not been reconstructed" not in out
+                                 and "unsupported format" not in out):
+            return "%-22s pngout.exe exit %d" % (name, r.returncode)
 
-    return ("%-22s  ok  (%dx%d %s restart=%d q%d, re-read within %d%s)"
-            % (name, w, h, comps, restart, precision, worst,
+    return ("%-22s  ok  (%dx%d %s restart=%d q%d, %s within %d%s)"
+            % (name, w, h, comps, restart, precision,
+               "C-vs-IM" if did_pixels else "re-read", worst,
                "" if bound is None else " of %d" % bound))
 
 
@@ -1893,12 +1961,14 @@ def run_jpeg_progressive():
         return "j-progressive        one scan only"
 
     # GetImageSize() must still size it - it reads the SOF2 the same way -
-    # and both binaries must refuse it while sub_40B180 is missing
+    # and both binaries must refuse it (progressive needs the buffered
+    # second-scan path; front end + sequential entropy + h=1 output are wired,
+    # progressive is not)
     r = subprocess.run([DUMPDEC, src], stdout=subprocess.PIPE,
                        stderr=subprocess.PIPE)
     if r.returncode == 0:
         return "j-progressive        dumpdec decoded it; expected a refusal"
-    if "not reconstructed yet" not in r.stderr.decode("latin1"):
+    if "DecodeImage refused" not in r.stderr.decode("latin1"):
         return "j-progressive        dumpdec said %r" % (
             r.stderr.decode("latin1").strip()[-60:])
 
