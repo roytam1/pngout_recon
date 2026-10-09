@@ -982,7 +982,7 @@ jumps, not a switch, after four globals are cleared (`unk_190A820`,
 | `89 'P'` | inline at `0x409680` | **PNG** |
 | `FF D8` | `sub_40B180` | **JPEG** |
 | `'G' 'I' 'F'` | `sub_40CA70` | **GIF** |
-| `19 91` + bpp 8 | chunk at `0x40D150` | 8bpp palettised, unidentified |
+| `19 91` + bpp 8 | chunk at `0x40D150` | original Animator PIC/CEL (non-Pro) |
 | `'B' 'M'` | `sub_40D560` | **BMP** |
 | `0A 05 01 08` | `sub_40DAC0` | **PCX** |
 | `'DDS '` + hdr size 124 | `sub_40DD80` | **DDS** |
@@ -1703,8 +1703,15 @@ pal[i] = 4 * (((((p[0] - 64) << 8) + p[1]) << 8) + p[2]);   /* p advances by 3 *
 ```
 
 The `<< 2` at the end and the `- 64` on the first channel are both in the
-original. PNGOUT's own help text does not list this format either, so it stays
-named `FMT_PAL8`.
+original. This is the original (1989, non-Pro) Autodesk Animator PIC/CEL
+format: magic `0x9119`, width/height words at +2/+4, depth 8 and compress 0
+as single bytes at +10/+11 (exactly the dispatch test, confirmed against
+`sub_409560` line 114), 32-byte header, 256×3-byte 0-63 palette at +0x20,
+then uncompressed row-major indices. PNGOUT's own help text does not list
+this format either, so the code name stays `FMT_PAL8` (the original's
+format code 4). Animator *Pro* variants are different files and are
+refused: Pro PIC has magic `0x9500` with a 64-byte chunked header, Pro CEL
+is a FLC (`AF12`/`AF11`) - none match the `19 91` test.
 
 **Transcribed** as `DecodePal8()` in `src/decode.c`, about sixty instructions
 from `0x40D150` to `0x40D243`, and `DecodeImage()`'s dispatch in `sub_409560`
@@ -1717,8 +1724,8 @@ The whole function is:
 
 ```c
 byte_190A824 = 3;  byte_190A825 = 8;  dword_190A820 = 0x100;
-if (width  == 0) return -1;
-if (height == 0) return -1;
+if (width  <= 0) return -1;   /* signed `jg` in the listing, not == 0 */
+if (height <= 0) return -1;
 for (i = 0; i < 256; i++, p += 3)
     dword_190A420[i] = (((((p[0] - 0x40) << 8) + p[1]) << 8) + p[2]) << 2;
 for (row = roworigin; row < height; row++)
@@ -1744,6 +1751,18 @@ Two details worth writing down:
 the wrap above and a single-colour image. The expected values have to be
 computed with the same 32 bit wrap (`pal8_expected()` in the script), or the
 comparison is against Python's arbitrary-precision arithmetic and means nothing.
+
+Two real Animator files verify the path end to end (both untracked workarea
+material, not committed): `abydos.aa.cel` (800×600 CEL, placement 0,0,
+datasize exactly 800×600) decodes to 800×600 coltype 3 with the palette
+applied (black runs, red/orange and blue ramps hitting `0xFC` maxima, grey
+ramp `0x2C`-`0xFC`), and `main1.pic` (320×200 classic PIC size, datasize
+exactly 64000) decodes to 320×200 opening on a grey field (`0xE4`, i.e.
+palette `(57,57,57)`). The real PNGOUT binary accepts `main1.pic`,
+corroborating the route. CEL placement (`xcoord`/`ycoord` at +6/+8) is
+ignored - the listing reads only +2/+4 in the guards and palette/pixel
+loops, so everything decodes at the origin clipped to width/height; both
+real files are 0,0.
 
 Reaching a working round trip turned up three real defects in the *encoder*
 side, all in code that no previous test could reach, because until this format

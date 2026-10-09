@@ -1061,9 +1061,9 @@ static int DecodePal8(const unsigned char *data, unsigned char *pixels,
     OutBitDepth = 8;                /* byte_190A825 */
     unk_190A820 = 256;              /* dword_190A820 */
 
-    if (*(const unsigned short *)(data + 2) == 0)
+    if (*(const short *)(data + 2) <= 0)
         return -1;
-    if (*(const unsigned short *)(data + 4) == 0)
+    if (*(const short *)(data + 4) <= 0)
         return -1;
 
     p = data + 0x20;
