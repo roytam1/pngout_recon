@@ -2545,56 +2545,45 @@ Two traversal/semantics details were pinned against the original binary on
   not the 8 a padded MCU rect gives - and the listing agrees, indexing
   `((x+cnt)>>shift) + nbx*((y+cnt)>>shift)`. Getting this wrong scatters
   edge-block coefficients into the wrong slots.
-- **Refinement is sign-directed, a new coefficient costs one bit, its stored
-  value is the symbol's `size`, and the in-loop refine bit sits one position
-  lower.** An existing nonzero refined by one bit adds `+(1<<Al)` when positive
-  and `-(1<<Al)` when negative (the `v198`/`v199` word pair selected by `v<0`
-  — confirmed live by `0040BEDA test ax,ax / setl dl` on the 16-bit
-  coefficient, listing 890/937). A coefficient newly appearing in a
-  *refinement* scan reads a **single** bit (787-808) - not `size` bits as the
-  standard would - and that bit's value is then **discarded**: `v109` is reused,
-  the run-skip loop overwrites it with `v169` (which holds `size`, set at 782),
-  and 903-904 stores *that*. The bit is still consumed even though its value
-  never reaches the coefficient; with `Al=0` and `size=1` both readings
-  coincide at +1, which is why this only shows up on the `Al=0` refine scans.
-  Separately, the listing has **two** raw-bit readers differing by one index
-  order: the sign read masks at the current count then decrements
-  (0040BE4B/0040BE52), while the AC-refine read **decrements first** and masks
-  `dword_410158[esi]` = 2^n against the lower bit (0040BECE). Only the
-  run-skip loop's refine bit uses the latter; `LABEL_198` and the EOB-run drain
-  use the former, and switching them too regresses scans 6-8 back to worst 5-6.
-  All four details are load-bearing: positive-only adds leave scans 6-8 at
-  worst 3, reading `size` bits desynchronises the scan into the EOI marker,
-  honouring the discarded sign bit costs worst 5, and the shared-bit order
-  costs scan 9 its exactness.
+- **Refinement is sign-directed and reads the sign bit first.** An existing
+  nonzero refined by one bit adds `+(1<<Al)` when positive and `-(1<<Al)` when
+  negative (the `v198`/`v199` word pair selected by `v<0` — confirmed live by
+  `0040BEDA test ax,ax / setl dl` on the 16-bit coefficient, listing 890/937).
+  A coefficient newly appearing in a *refinement* scan reads its sign bit
+  **first** (787-808) as `+`/`-(1<<Al)`, *then* the position-wise run skip
+  (871-902) refines existing nonzeros while counting zeros down, and the
+  landing position stores the sign-selected value (903-904) — not `size` bits
+  as the standard would, and not a post-loop bit. All three details are
+  load-bearing: positive-only adds leave scans 6-8 at worst 3, reading `size`
+  bits desynchronises the scan into the EOI marker, and reading the sign bit
+  after the run skip (even while discarding its value) shifts every refine bit
+  by one.
 
 Against the original binary, per-scan prefixes (truncated after each scan)
 are now **bit-exact for scans 1-9** (worst 0 each, previously 17-21 from
-scan 2 on); the whole file sits at **worst 3**, down from 21.
+scan 2 on); the whole file sits at **worst 2**, down from 21.
 
-The last residual is scan 10 alone, worst 3. It is **not** in the progressive
-merge, and that is now proved rather than inferred:
+The last residual is scan 10 alone, worst 2 on eight pixels confined to the
+partial bottom row (y=8, x=8..15); rows 0-7 are fully exact. It is **not** in
+the progressive merge:
 
-- An independent listing-faithful Python merge reproduces all ten C prefixes
-  exactly: `[0,0,0,0,0,0,0,0,0,3]`.
+- An independent listing-faithful Python merge reproduces C's scan-10 prefix
+  and the `A={(0,15),(1,-2),(2,+1)}, B={(0,19),(2,+1)}` scan-9 state exactly.
 - C's fixed-point IDCT and a float-IDCT forward model agree **bit-for-bit**
   (worst 0) on this file's coefficients, so the model is a faithful stand-in
   and a search through it is equivalent to searching C.
 - Exhaustive search over that space — every luma refine/new-coefficient
   combination, all 8! luma block permutations, every Y/Cb/Cr DC offset in
   -3..+3, and structural variants (AC shifted ±1, DC zeroed, band cleared) —
-  has a **floor of 3**. Structural variants are far worse (46/71/37/39), so
-  the merge itself is right.
+  cannot drive the error below 2. Structural variants are far worse
+  (46/71/37/39), so the merge itself is right.
 
-The residual is a smooth, row-constant ±3 low-frequency offset (15 of 17 pixels
-in a row share one value; row 0 is uniformly (2,2,2), rows 2-3 uniformly
-negative, rows 4-5 positive). That is the signature of the IDCT's row-pass
-rounding, not of coefficient error — and it is invisible on scans 1-9 only
-because that band's coefficients stay inside the rounding range. Resolving it
-means auditing `JpegIdct`'s fixed-point shift constants against the listing,
-which is independent of the entropy-decoder work above. C-vs-IM interior stays
-within the bound 30 in `run_jpeg_progressive`. Per-scan `jpeg: pscan` dumps were
-temporary (reverted); final `jpeg: pblk` stays (like `blk`/`dbl`/`idct`).
+The remaining 2 lives in the bottom partial block row, where only y=8 of the
+block's 8 rows is visible — consistent with IDCT rounding on the clipped edge
+rather than coefficient error, and independent of the entropy-decoder work
+above. C-vs-IM interior stays within the bound 30 in `run_jpeg_progressive`.
+Per-scan `jpeg: pscan` dumps were temporary (reverted); final `jpeg: pblk`
+stays (like `blk`/`dbl`/`idct`).
 
 #### Linear `v4` fails at MCU boundaries; per-MCU bases required
 

@@ -3383,10 +3383,12 @@ static int JpegOutputSub(unsigned char *pixels, int pitch,
  * (Ss/Se are zigzag positions), dequantised with `JpegZigzag[t]` like the
  * sequential path.  Refinement adds bit Al sign-directed via the `v198`/`v199`
  * word pair (`*(&v198+2*(v<0))`), and a coefficient newly appearing in a
- * refinement scan reads `size` raw bits, sign-extends, stores `<<Al`
- * (860-868).  Both are load-bearing: positive-only adds leave scans 6-8 at
- * worst 3, and skipping the new-value bit read desynchronises the scan so it
- * overruns into the EOI marker. */
+ * refinement scan reads its sign bit FIRST (787-808) as +/-(1<<Al), then the
+ * position-wise run skip (871-902) refines existing nonzeros, and the landing
+ * position stores the sign-selected value (903-904).  All three are
+ * load-bearing: positive-only adds leave scans 6-8 at worst 3, reading the
+ * sign after the run skip (or reading `size` bits) desynchronises the scan, and
+ * storing `size` instead of the sign-selected value costs the Al=0 scans. */
 static short *JpegProg = NULL;
 static unsigned JpegProgBase[4];
 static unsigned JpegProgBlocks = 0;
@@ -3415,26 +3417,7 @@ static void JpegProgFree(void)
 
 /* One refinement raw bit, dry-at-marker counts as 0 (`test ebx,esi/jz` in
  * `sub_40C700`-style slow reads; valid scans always have the bit, corrupt
- * ones complete with 0 instead of crashing/OOB).
- *
- * `skip` implements the AC-refine reader's index order.  The listing has two
- * raw-bit readers that differ by one: the coefficient-sign read masks at the
- * current bit count and *then* decrements (0040BE4B/0040BE52), while the AC
- * refine read decrements first and masks the lower bit (0040BECE), against
- * `dword_410158` = 2^n rather than the DC path's constant `dword_410154`
- * mask.  Reading the refine bit from the same end as the sign bit refines a
- * coefficient the original leaves alone (scan 9's Cb k1: -3 instead of -2). */
-static int JpegRawBitSkip(JpegBit *b, int skip)
-{
-    int bit = 0;
-
-    JpegRefill(b, skip + 1);
-    if (b->nbits > skip)
-        bit = (b->reg >> ((b->nbits - 1) - skip)) & 1;
-    b->nbits -= (b->nbits > skip) ? 1 : 0;
-    return bit;
-}
-
+ * ones complete with 0 instead of crashing/OOB). */
 static int JpegRawBit(JpegBit *b)
 {
     int bit = 0;
@@ -3637,14 +3620,21 @@ static const unsigned char *JpegDecodeProgScan(const unsigned char *scan,
                                             break;
                                         }
                                     } else {
-                                        /* Position-wise run skip (871-902):
-                                         * existing nonzero refined (1 bit,
-                                         * sign-directed, masked by
-                                         * dword_410158 = 2^n), zeros count
-                                         * down and break at run < 0. */
+                                        /* Refine value symbol (Ah>0, size!=0).
+                                         * The sign bit is read FIRST
+                                         * (787-808) into v109/v169 as
+                                         * +/-(1<<Al); then the position-wise
+                                         * run skip (871-902) refines existing
+                                         * nonzeros with normal raw bits while
+                                         * counting zeros down; the landing
+                                         * position stores the sign-selected
+                                         * value (903-904). */
+                                        int newval = JpegRawBit(&bit)
+                                            ? (1 << Al) : -(1 << Al);
+
                                         while (k <= (int)Se) {
                                             if (blk[k]) {
-                                                if (JpegRawBitSkip(&bit, 1))
+                                                if (JpegRawBit(&bit))
                                                     blk[k] =
                                                         (short)(blk[k] +
                                                         (blk[k] > 0 ?
@@ -3657,22 +3647,9 @@ static const unsigned char *JpegDecodeProgScan(const unsigned char *scan,
                                             }
                                             k++;
                                         }
-if (k > (int)Se)
+                                        if (k > (int)Se)
                                             break;
-                                        /* New coefficient in a refinement
-                                         * scan.  `v109` is REUSED: the sign
-                                         * bit read at 787-808 set it to
-                                         * +/-(1<<Al), but a successful
-                                         * refine bit inside the run-skip
-                                         * loop overwrites it with `v169`,
-                                         * which holds the symbol's SIZE
-                                         * (set at 782) - and 903-904 stores
-                                         * that, not the sign-selected value.
-                                         * The sign bit is still consumed even
-                                         * when its value is discarded, so
-                                         * read it before storing. */
-                                        JpegRawBit(&bit);
-                                        blk[k] = (short)size;
+                                        blk[k] = (short)newval;
                                         k++;
                                     }
                                 }
