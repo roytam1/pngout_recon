@@ -2545,27 +2545,39 @@ Two traversal/semantics details were pinned against the original binary on
   not the 8 a padded MCU rect gives - and the listing agrees, indexing
   `((x+cnt)>>shift) + nbx*((y+cnt)>>shift)`. Getting this wrong scatters
   edge-block coefficients into the wrong slots.
-- **Refinement is sign-directed, and a new coefficient costs exactly one bit.**
-  An existing nonzero refined by one bit adds `+(1<<Al)` when positive and
-  `-(1<<Al)` when negative (the `v198`/`v199` word pair selected by `v<0`,
-  listing 890/937). A coefficient newly appearing in a *refinement* scan reads
-  a **single** bit that selects `+(1<<Al)` vs `-(1<<Al)` (787-808) and stores
-  it at 903-904 - it does **not** read `size` bits as the standard would.
-  Both details are load-bearing: positive-only adds leave scans 6-8 at worst 3,
-  and reading `size` bits there desynchronises the scan so it overruns into the
-  EOI marker (the truncated-scan comparison then fails outright rather than
-  reporting a small delta).
+- **Refinement is sign-directed, a new coefficient costs one bit, and its
+  stored value is the symbol's `size`.** An existing nonzero refined by one bit
+  adds `+(1<<Al)` when positive and `-(1<<Al)` when negative (the `v198`/`v199`
+  word pair selected by `v<0`, listing 890/937). A coefficient newly appearing
+  in a *refinement* scan reads a **single** bit (787-808) - not `size` bits as
+  the standard would - and that bit's value is then **discarded**: `v109` is
+  reused, the run-skip loop overwrites it with `v169` (which holds `size`, set
+  at 782), and 903-904 stores *that* (`if (v109) v82[v101] = v109`). The bit
+  is still consumed even though its value never reaches the coefficient. With
+  `Al=0` and `size=1` the discarded sign-selected value and `size` coincide at
+  +1, which is why this is only observable on the `Al=0` refinement scans.
+  All three details are load-bearing: positive-only adds leave scans 6-8 at
+  worst 3, reading `size` bits desynchronises the scan into the EOI marker, and
+  honouring the discarded sign bit costs worst 5 (9→3 on scan 9).
 
 Against the original binary, per-scan prefixes (truncated after each scan)
 are now **bit-exact for scans 1-8** (worst 0 each, previously 17-21 from
-scan 2 on), and scans 9-10 sit at worst 9/10 spread across the frame rather
-than concentrated on the clipped edges. The merged coefficients were also
-diffed block-by-block against an independent Python merge: they now agree
-exactly except in the two blocks that scans 9-10 refine further, so the
-remaining residual sits in the fine AC refinement bands rather than in
-traversal. C-vs-IM interior stays within the bound 30 in
-`run_jpeg_progressive`. Per-scan `jpeg: pscan` dumps were temporary
-(reverted); final `jpeg: pblk` stays (like `blk`/`dbl`/`idct`).
+scan 2 on) and scans 9-10 sit at **worst 3/5** (was 9/10), so the whole file
+is at worst 5 against the original, down from 21.
+
+The remaining scan-9 residual is one coefficient: for Cb block A the original
+leaves `k1` unrefined at -2 while we refine it to -3. Search over the Cb
+blocks shows `A={(0,15),(1,-2),(2,+1)}, B={(0,19),(2,+1)}` reproduces the
+original's scan-9 output *exactly*, so the block positions and both new
+coefficients are right and only that one refine bit differs. Its Huffman
+symbol is unambiguously `run=0,size=1` (2-bit code, bits 0-1 of `A6 BF`), and
+the listing's run-skip loop tests the existing coefficient before decrementing
+run, so a static read says `k1` *should* be refined. Reconciling that with the
+binary is the open item - the candidates are the refine mask polarity
+(`dword_410158`, powers of two, vs the `dword_410154` the DC path uses) or
+the `v109`/`v169` aliasing at 891/903-904. C-vs-IM interior stays within the
+bound 30 in `run_jpeg_progressive`. Per-scan `jpeg: pscan` dumps were
+temporary (reverted); final `jpeg: pblk` stays (like `blk`/`dbl`/`idct`).
 
 #### Linear `v4` fails at MCU boundaries; per-MCU bases required
 
