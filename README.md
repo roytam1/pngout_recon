@@ -2560,30 +2560,25 @@ Two traversal/semantics details were pinned against the original binary on
   by one.
 
 Against the original binary, per-scan prefixes (truncated after each scan)
-are now **bit-exact for scans 1-9** (worst 0 each, previously 17-21 from
-scan 2 on); the whole file sits at **worst 2**, down from 21.
+are now **bit-exact for all ten scans** (worst 0 each, previously 17-21 from
+scan 2 on); the whole file sits at **worst 0**, down from 21.
 
-The last residual is scan 10 alone, worst 2 on eight pixels confined to the
-partial bottom row (y=8, x=8..15); rows 0-7 are fully exact. It is **not** in
-the progressive merge:
+The last fix was the EOBRUN table and its counting: `dword_410158` holds
+powers of two (`2^r` for run `r`), and the count covers the *current* block
+too — `LABEL_198`/`239` decrement `v170` for the block that emitted the symbol
+(draining it first in refine mode), so following-block skips are
+`base+extra-1`. The old `{1,3,7,...}` table without the decrement overskipped
+by two blocks; earlier scans stayed exact only because the overshoot landed on
+dry tail blocks. Scan 10's `EOBRUN1+0` then swallowed the last block's new
+coefficient instead of decoding it. The tell was bit-level: the scan leaves 7
+trailing bits containing zeros, which cannot be padding (JPEG pads with ones),
+so they must decode as real symbols.
 
-- An independent listing-faithful Python merge reproduces C's scan-10 prefix
-  and the `A={(0,15),(1,-2),(2,+1)}, B={(0,19),(2,+1)}` scan-9 state exactly.
-- C's fixed-point IDCT and a float-IDCT forward model agree **bit-for-bit**
-  (worst 0) on this file's coefficients, so the model is a faithful stand-in
-  and a search through it is equivalent to searching C.
-- Exhaustive search over that space — every luma refine/new-coefficient
-  combination, all 8! luma block permutations, every Y/Cb/Cr DC offset in
-  -3..+3, and structural variants (AC shifted ±1, DC zeroed, band cleared) —
-  cannot drive the error below 2. Structural variants are far worse
-  (46/71/37/39), so the merge itself is right.
-
-The remaining 2 lives in the bottom partial block row, where only y=8 of the
-block's 8 rows is visible — consistent with IDCT rounding on the clipped edge
-rather than coefficient error, and independent of the entropy-decoder work
-above. C-vs-IM interior stays within the bound 30 in `run_jpeg_progressive`.
-Per-scan `jpeg: pscan` dumps were temporary (reverted); final `jpeg: pblk`
-stays (like `blk`/`dbl`/`idct`).
+An independent listing-faithful Python merge reproduces all ten C prefixes
+exactly, and C's merged coefficients match it block-for-block. C-vs-IM
+interior stays within the bound 30 in `run_jpeg_progressive`. Per-scan
+`jpeg: pscan` dumps were temporary (reverted); final `jpeg: pblk` stays
+(like `blk`/`dbl`/`idct`).
 
 #### Linear `v4` fails at MCU boundaries; per-MCU bases required
 

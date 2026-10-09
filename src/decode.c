@@ -3393,17 +3393,14 @@ static short *JpegProg = NULL;
 static unsigned JpegProgBase[4];
 static unsigned JpegProgBlocks = 0;
 static int JpegProgActive = 0;
-/* `dword_410158` EOB run bases: following-skipped blocks for run r.
- * Verified r=1 exact (scan2 hand-decode: EOBn at MCU1-b0 covering b1-b3,
- * tail (1,1) padding) and r=2 with data after (49x9 two-tone progressive:
- * flat-half exact (4), ramp-half sane (boundary 25, corner 202 padding);
- * misalignment would garbage/refuse, so base+extra alignment held for
- * runs 1-2 in first and refine scans, multiple bands). Runs>2 (15+
- * following) untested - needs bigger images (all corpus scans <=12 blocks,
- * max run 7); overshoot is safe (bounded MCU loops, skipped blocks consume
- * no bits) and the doubling pattern is structural. */
+/* `dword_410158` EOB run bases: powers of two, 2^r for run r.  The run
+ * count covers the CURRENT block too: LABEL_198/239 decrement v170 for the
+ * block that emitted the symbol (draining it first in refine mode), so the
+ * following-block skips are base+extra-1.  Getting either half wrong
+ * overskips real blocks; scan 10's EOBRUN1+0 then swallows the last block's
+ * new coefficient instead of decoding it. */
 static const int JpegEobRun[15] =
-{1,3,7,15,31,63,127,255,511,1023,2047,4095,8191,16383,32767};
+{1,2,4,8,16,32,64,128,256,512,1024,2048,4096,8192,16384};
 
 static void JpegProgFree(void)
 {
@@ -3571,6 +3568,9 @@ static const unsigned char *JpegDecodeProgScan(const unsigned char *scan,
                                                     extra = (extra << 1) |
                                                         JpegRawBit(&bit);
                                                 eobrun += extra;
+                                                /* LABEL_239 counts the
+                                                 * current block too. */
+                                                eobrun--;
                                             }
                                             break;
                                         }
@@ -3605,6 +3605,10 @@ static const unsigned char *JpegDecodeProgScan(const unsigned char *scan,
                                                     extra = (extra << 1) |
                                                         JpegRawBit(&bit);
                                                 eobrun += extra;
+                                                /* LABEL_198 counts the
+                                                 * current block too (after
+                                                 * draining it below). */
+                                                eobrun--;
                                             }
                                             for (kk = k; kk <= (int)Se;
                                                  kk++) {
