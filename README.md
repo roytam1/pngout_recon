@@ -2595,12 +2595,12 @@ C-vs-IM interior sits at 6 against the bound 10 in `run_jpeg_progressive`
 Per-scan `jpeg: pscan` dumps were temporary (reverted); final `jpeg: pblk`
 stays (like `blk`/`dbl`/`idct`).
 
-Known size cap, shared with the sequential path: `JpegIdctBuf` holds 256
-MCUs, so images over 256 MCUs (e.g. 257x129 grey, 561 MCUs) refuse cleanly
-at the output stage rather than decoding. The entropy decode itself has no
-size limit (a 129x65 progressive file with 153 MCUs is bit-exact); only the
-fixed output buffer needs enlarging or streaming to lift the cap, which is a
-separate piece of work from the entropy decoder.
+No fixed MCU cap: `JpegIdctBuf` is sized per image (`JpegIdctEnsure`, freed
+at the next decode like `JpegProg`), so the old fixed-256 refusal for images
+over ~256x256 is gone for both paths — verified bit-exact on a 257x129
+single-component file (561 MCUs) the old code refused outright. A
+single-component file carrying subsampling factors (grey with 2x2, as some
+encoders write) takes the subsampled output path with neutral chroma.
 
 #### Linear `v4` fails at MCU boundaries; per-MCU bases required
 

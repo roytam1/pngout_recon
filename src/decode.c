@@ -2983,10 +2983,54 @@ static int JpegTabLookup(int *t, int idx)
     return t[j];
 }
 
-/* IDCT block buffer: [mcu][comp][block][64], MCU-major decode order. */
-#define JPEG_MAX_MCU 256
-static int JpegIdctBuf[JPEG_MAX_MCU][4][4][64];
+/* IDCT block buffer: [mcu][comp][block][64], MCU-major decode order.
+ * Sized per image (the original has no fixed MCU cap); the old fixed 256
+ * refused anything over ~256x256 outright.  Indexing is unchanged, only the
+ * backing store grows via JpegIdctEnsure before any store. */
+static int (*JpegIdctBuf)[4][4][64];
+static unsigned JpegIdctCap = 0;
 static unsigned JpegIdctMCUs = 0;
+/* Ensure room for n MCUs, zeroed; frees and reallocates when growing.
+ * Returns 0 on success, -1 on overflow or malloc failure (refuse cleanly).
+ * Freed at the next DecodeImage entry (stale cleanup, same pattern as
+ * JpegProgFree), so no per-return-path auditing is needed. */
+static int JpegIdctEnsure(unsigned n)
+{
+    unsigned __int64 bytes;
+
+    if (n == 0)
+        return -1;
+    bytes = (unsigned __int64)n * 4 * 4 * 64 * sizeof(int);
+    if (bytes != (size_t)bytes)
+        return -1;
+    if (JpegIdctCap < n) {
+        int (*nb)[4][4][64];
+
+        free(JpegIdctBuf);
+        JpegIdctBuf = NULL;
+        JpegIdctCap = 0;
+        nb = (int (*)[4][4][64])malloc((size_t)bytes);
+        if (!nb)
+            return -1;
+        {
+            unsigned i, total = n * 4 * 4 * 64;
+
+            for (i = 0; i < total; i++)
+                (&(*nb)[0][0][0])[i] = 0;
+        }
+        JpegIdctBuf = nb;
+        JpegIdctCap = n;
+    }
+    return 0;
+}
+static void JpegIdctFree(void)
+{
+    if (JpegIdctBuf) {
+        free(JpegIdctBuf);
+        JpegIdctBuf = NULL;
+        JpegIdctCap = 0;
+    }
+}
 static int JpegDecodeSeq(const unsigned char *scan, const unsigned char *end,
                          unsigned w, unsigned h,
 #ifdef JPEGDEBUG
@@ -3016,7 +3060,7 @@ static int JpegDecodeSeq(const unsigned char *scan, const unsigned char *end,
     }
     mcux = (w + 8 * hmax - 1) / (8 * hmax);
     mcuy = (h + 8 * vmax - 1) / (8 * vmax);
-    if (mcux * mcuy > JPEG_MAX_MCU || JpegNComp > 4)
+    if (JpegNComp > 4 || JpegIdctEnsure(mcux * mcuy))
         return -1;
     JpegIdctMCUs = mcux * mcuy;
 
@@ -3128,7 +3172,8 @@ static int JpegDecodeSeq(const unsigned char *scan, const unsigned char *end,
                                 unsigned blk = by * JpegComps[ci].hsamp + bx;
                                 int t2;
 
-                                if (mcu < JPEG_MAX_MCU && blk < 4) {
+                                if (JpegIdctBuf && mcu < JpegIdctCap &&
+                                    blk < 4) {
                                     for (t2 = 0; t2 < 64; t2++)
                                         JpegIdctBuf[mcu][ci][blk][t2] = dbl[t2];
                                 }
@@ -3183,7 +3228,7 @@ static int JpegOutput444(unsigned char *pixels, int pitch,
     }
     mcux = (JpegWidth + 8 * hmax - 1) / (8 * hmax);
     mcuy = (JpegHeight + 8 * vmax - 1) / (8 * vmax);
-    if (mcux * mcuy > JPEG_MAX_MCU)
+    if (!JpegIdctBuf || mcux * mcuy > JpegIdctCap)
         return -1;
 
     for (my = 0; my < mcuy; my++) {
@@ -3268,13 +3313,15 @@ static int JpegOutput444(unsigned char *pixels, int pitch,
  * is the same four tables + T0/T1/T2 with logical `shr 22` (the h=2 body at
  * `408FF0` repeats the h=1 computation per pixel of the pair, only the Y
  * differing - second Y loaded dest-relative, i.e. the next luma sample).
- * Gate: 3 components, Y hs=2, chroma 1x1, Y vs 1|2.  Same exact tables;
- * bit-exact vs the original binary on the corpus (see JpegMakeTables).
- * 1-comp restart gate does not apply (NComp==3 here); 3-comp restart EOB
+ * Gate: 1 or 3 components, Y hs=2, chroma 1x1 (if present), Y vs 1|2.  Same
+ * exact tables; bit-exact vs the original binary on the corpus (see
+ * JpegMakeTables).  Single-component input (grey with subsampling factors,
+ * as some encoders write) takes the same Y geometry with neutral chroma.
+ * 1-comp restart gate does not apply here; 3-comp restart EOB
  * tails carry over (bounded, faithful). */
 static int JpegOutputSub(unsigned char *pixels, int pitch,
-                          unsigned width, unsigned height,
-                          int xorigin, int yorigin)
+                           unsigned width, unsigned height,
+                           int xorigin, int yorigin)
 {
     unsigned mx, my, bx, by, x, y;
     unsigned mcux, mcuy, hmax = 2, vmax, ci;
@@ -3282,27 +3329,27 @@ static int JpegOutputSub(unsigned char *pixels, int pitch,
     JpegMakeTables();
     JpegMakeT();
 
-    if (JpegNComp != 3)
+    if (JpegNComp != 1 && JpegNComp != 3)
         return -1;
     if (JpegComps[0].hsamp != 2)
         return -1;
     vmax = JpegComps[0].vsamp;
     if (vmax != 1 && vmax != 2)
         return -1;
-    for (ci = 1; ci < 3; ci++) {
+    for (ci = 1; ci < JpegNComp; ci++) {
         if (JpegComps[ci].hsamp != 1 || JpegComps[ci].vsamp != 1)
             return -1;
     }
     mcux = (JpegWidth + 8 * hmax - 1) / (8 * hmax);
     mcuy = (JpegHeight + 8 * vmax - 1) / (8 * vmax);
-    if (mcux * mcuy > JPEG_MAX_MCU)
+    if (!JpegIdctBuf || mcux * mcuy > JpegIdctCap)
         return -1;
 
     for (my = 0; my < mcuy; my++) {
         for (mx = 0; mx < mcux; mx++) {
             unsigned mcu = my * mcux + mx;
-            int *Cbblk = JpegIdctBuf[mcu][1][0];
-            int *Crblk = JpegIdctBuf[mcu][2][0];
+            int *Cbblk = (JpegNComp > 1) ? JpegIdctBuf[mcu][1][0] : 0;
+            int *Crblk = (JpegNComp > 1) ? JpegIdctBuf[mcu][2][0] : 0;
 
             for (by = 0; by < vmax; by++) {
                 for (bx = 0; bx < 2; bx++) {
@@ -3327,8 +3374,8 @@ static int JpegOutputSub(unsigned char *pixels, int pitch,
                                 dy >= (int)height)
                                 continue;
                             Y = Yblk[pos];
-                            Cb = Cbblk[cpos];
-                            Cr = Crblk[cpos];
+                            Cb = Cbblk ? Cbblk[cpos] : 0;
+                            Cr = Crblk ? Crblk[cpos] : 0;
                             v6 = (Cb >> 19) & ~1;
                             res = (Cr >> 19) & ~1;
                             A = JpegTabLookup(JpegTA, res);
@@ -3740,7 +3787,7 @@ static int JpegProgFinish(unsigned char *pixels, int pitch,
                             dbl[zz] = (int)dq;
                         }
                         JpegIdct(dbl, 0xFF);
-                        if (m2 < JPEG_MAX_MCU && b2 < 4) {
+                        if (JpegIdctBuf && m2 < JpegIdctCap && b2 < 4) {
                             for (t2 = 0; t2 < 64; t2++)
                                 JpegIdctBuf[m2][ci][b2][t2] = dbl[t2];
                         }
@@ -3796,6 +3843,7 @@ static int DecodeJpeg(const unsigned char *data, int size,
     end = data + size;
     JpegRestart = 0;
     JpegProgFree();                     /* stale buffers from a prior image */
+    JpegIdctFree();
 
     for (;;) {
         /* skip fill bytes */
@@ -3921,6 +3969,10 @@ static int DecodeJpeg(const unsigned char *data, int size,
                         }
                         total = acc;
                         if (total == 0 || ((total << 7) >> 7) != total) {
+                            JpegProgFree();
+                            return -1;
+                        }
+                        if (JpegIdctEnsure(mcux * mcuy)) {
                             JpegProgFree();
                             return -1;
                         }
