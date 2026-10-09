@@ -1688,8 +1688,10 @@ int main(void)
         Image = &img;
         CheckEscHook = NULL;
 
-        /* the planner works on LinBuf's data area */
+        /* the planner reads SplitBuf (trials.c's sink buffer in main);
+         * point it at the test data (LinBufData is unused by PlanBlocks) */
         LinBufData = data;
+        SplitBuf = data;
 
         /* a solid block of one byte has nothing worth cutting */
         for (i = 0; i < 512; i++) data[i] = 0x33;
