@@ -3733,19 +3733,6 @@ static const unsigned char *JpegDecodeProgScan(const unsigned char *scan,
                                     int rs = JpegHuffSym(ah, &bit);
                                     int run = (rs >> 4) & 15;
                                     int size = rs & 15;
-#ifdef JPEGDEBUG
-                                    /* TEMP prog scan4 audit (revert) */
-                                    {
-                                        static int na = 0;
-
-                                        if (ci == 1 && mx == 0 && my == 0 &&
-                                            na < 2) {
-                                            fprintf(stderr, "jpeg: s4ac rs=%d run=%d size=%d p=%ld nbits=%d\n",
-                                                    rs, run, size, (long)(bit.p - scan), bit.nbits);
-                                            na++;
-                                        }
-                                    }
-#endif
 
                                     if (size == 0) {
                                         if (run == 15) {
