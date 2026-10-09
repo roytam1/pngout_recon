@@ -2695,8 +2695,19 @@ static int JpegHuffSlow(JpegHuff *t, JpegBit *b, int *sym)
     int code = 0, len;
 
     for (len = 1; len <= 16; len++) {
+        int bit = 0;
+
+        /* `sub_40C700` reads bit-at-a-time (`test ebx,esi/jz`: a missing
+         * bit (dry at a marker) counts as 0, it never refuses).  Refill
+         * stops before markers, so short of one there may be no bit to
+         * take - count 0 and continue, exactly like the original.  Valid
+         * scans always have the bits each symbol needs; dry only happens
+         * past the last real symbol (padding), where the walk correctly
+         * falls out at length 16/symbol 0 (EOB). */
         JpegRefill(b, 1);
-        code = (code << 1) | ((b->reg >> (--b->nbits)) & 1);
+        if (b->nbits > 0)
+            bit = (b->reg >> (--b->nbits)) & 1;
+        code = (code << 1) | bit;
         if (code < t->first[len - 1]) {
             *sym = t->syms[t->base[len - 1] + code];
             return len;
@@ -2711,7 +2722,15 @@ static int JpegHuffSym(JpegHuff *t, JpegBit *b)
     int peek, sym, len;
 
     JpegRefill(b, 10);
-    peek = (b->reg >> (b->nbits - 10)) & 0x3FF;
+    /* The original peeks 10 bits unconditionally (`(reg>>(nbits-10))&0x3FF`
+     * per the `v200` fast tables `18EA0A8/18F20A8`, built by sequential
+     * span-packing at `40B4E4` (identical to canonical prefix layout, so
+     * the in-struct `fastlen/fastsym` reproduce it exactly).  Short of a
+     * marker (restart tail) fewer than 10 bits are buffered; x86 masks
+     * the negative shift count to 5 bits (`&31`), yielding peek 0/1 -
+     * i.e. a deterministic EOB - not garbage.  Mask explicitly (defined
+     * behaviour, bit-identical to VC6/x86) instead of branching. */
+    peek = (int)((b->reg >> ((b->nbits - 10) & 31)) & 0x3FF);
     if (peek < t->nfast) {
         len = t->fastlen[peek];
         sym = t->fastsym[peek];
@@ -3004,9 +3023,9 @@ static int JpegDecodeSeq(const unsigned char *scan, const unsigned char *end,
                 for (by = 0; by < vs && ok; by++) {
                     for (bx = 0; bx < hs && ok; bx++) {
                         int coef[64] = {0};
-                        int sym = JpegHuffSym(dh, &bit);
-                        int diff, k;
+                        int sym, diff, k;
 
+                        sym = JpegHuffSym(dh, &bit);
                         if (sym < 0 || sym > 11) {
                             ok = 0;
                             break;

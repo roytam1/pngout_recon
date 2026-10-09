@@ -2398,8 +2398,9 @@ margin: +/-1 index flips 255<->0). IDCT audit PASSES (see next): `Y` is
 exact, so the scatter is real (IM variance, restart blocks, 1-comp/3-comp
 split) - not IDCT noise. Defined next step: true (fixed) table values via
 non-restart clustering + joint edge assignment (white needs `0xFF070C99`
-at `(0,0)` while darks need a value ~84 idx away; restart blocks need
-their coefficient path fixed first).
+at `(0,0)` while darks need a value ~84 idx away; restart coefficients are
+faithful as-is (EOB tails per original, see Huffman section) - no path fix
+needed, only looser pixel bounds when wiring).
 
 #### IDCT audit: `JpegIdct` bit-exact vs listing on 90 real blocks, 0 mismatches
 
@@ -2417,6 +2418,30 @@ exact; the white-edge error is purely table-offset precision (ramp-edge
 zero margin), not an IDCT rounding slip. Restart files exercise the same
 IDCT (covered by structure); their coefficient path is separately suspect
 (worst 15-16 vs 5) and stays the defined follow-up with the table values.
+
+#### Huffman fidelity: fast tables real, slow count-thresholds, restart tails EOB (original bug-for-bug)
+
+`sub_40C700` reads symbols bit-at-a-time (no fast peek), but the DHT path
+(`40B4E4`) DOES build 10-bit fast tables (`18EA0A8` lengths / `18F20A8`
+symbols, 1024 per slot) by sequential span-packing - identical to canonical
+prefix layout (verified 0 diffs on all 1024 chroma-AC entries), so the
+in-struct `fastlen/fastsym` reproduce it exactly. The slow thresholds
+(`18D9FB4`, stored at `40B47A`) are cumulative COUNTS, and overlong/dry
+falls out at length 16/symbol 0 (`40C745`) - so slow decodes L1/L2 (EOB)
+but never L3+ (code value exceeds the count); `JpegHuffSlow` matches this
+exactly (dry-at-marker counts as 0 via `test ebx,esi/jz`, never refuses).
+Consequence (original behaviour, reproduced): a block whose AC lies within
+9 bits before a restart marker (e.g. `ramp_444_2_8` MCU3-Cr, true `0x02`)
+reads EOB - the 10-bit peek underflows (`(reg>>(nbits-10))`, x86 masks
+negative counts to 5 bits giving peek 0/1, masked explicitly `&31` for
+defined behaviour) and slow walks past the L3 code into length-16/symbol-0.
+Restart therefore decodes complete (all 18 blocks, RST cycling/byte-align/
+pred-resets verified) with EOB tails - wrong tail AC, pixels degraded ~15
+vs ImageMagick. This is PNGOUT's actual limitation, not a transcription
+slip (DC-only restart is bit-identical, proving framing/predictors right);
+fidelity demands the EOB, not a refuse. A bit-at-a-time fallback that
+refused dry (tried first) diverged - reverted. Grey+restart single-component
+(`dt_j_grey_grey_2_8`) still refuses cleanly (separate bit-reader edge).
 
 #### Linear `v4` fails at MCU boundaries; per-MCU bases required
 
