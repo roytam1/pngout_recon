@@ -3060,6 +3060,15 @@ static int JpegDecodeSeq(const unsigned char *scan, const unsigned char *end,
 
                                 dbl[zz] = (int)dq;
                             }
+#ifdef JPEGDEBUG
+                            if (dump) {
+                                fprintf(stderr, "jpeg: dbl c%u mx%u my%u bx%u by%u =",
+                                        ci, mx, my, bx, by);
+                                for (t = 0; t < 64; t++)
+                                    fprintf(stderr, " %d", dbl[t]);
+                                fprintf(stderr, "\n");
+                            }
+#endif
                             JpegIdct(dbl, 0xFF);
                             {
                                 unsigned mcu = my * mcux + mx;

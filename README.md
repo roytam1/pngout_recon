@@ -2394,10 +2394,29 @@ spread90 4.8 idx vs 49+ for any other scale). White (`Y=549M`, chroma
 exactly 0) needs `0xFF070C99` but gets `0xFF5050F8` - one index too high
 (128=black instead of 127=white); no single-table move fixes it without
 breaking another 255-violator (whack-a-mole at ramp edges, which have zero
-margin: +/-1 index flips 255<->0). Defined next step: bit-exact IDCT audit
-(DC-only white block through `sub_40C790` vs listing - a rounding slip
-would show exactly as mids-fine/edges-catastrophic), then true (fixed)
-table values.
+margin: +/-1 index flips 255<->0). IDCT audit PASSES (see next): `Y` is
+exact, so the scatter is real (IM variance, restart blocks, 1-comp/3-comp
+split) - not IDCT noise. Defined next step: true (fixed) table values via
+non-restart clustering + joint edge assignment (white needs `0xFF070C99`
+at `(0,0)` while darks need a value ~84 idx away; restart blocks need
+their coefficient path fixed first).
+
+#### IDCT audit: `JpegIdct` bit-exact vs listing on 90 real blocks, 0 mismatches
+
+A literal Python transliteration of `sub_40C790` (row pass with bitmask,
+column pass, `imul` high-32 via `mov eax,edx`, `sar`/`shl`, 32-bit wrap -
+including the subtlety that `shl eax,2`/`lea ebp,[eax*4]` scale the
+multiply HIGH, not the multiplicand) transforms exact pre-IDCT `dbl`
+inputs (new `jpeg: dbl` dump under `JPEGDEBUG`, since the C DQT tables are
+pre-scaled `<<19` and raw-Q simulation undershoots 400000x) and matches
+`jd.exe` post-IDCT dumps bit-for-bit on 90 blocks (DC-only flats,
+gradients, all components, 7 non-restart files): 0 mismatched values,
+worst abs diff 0. DC-only is exact (flat `2^24` passes through), so is
+every AC rotation. `Y`/`Cb`/`Cr` feeding the colour equation are therefore
+exact; the white-edge error is purely table-offset precision (ramp-edge
+zero margin), not an IDCT rounding slip. Restart files exercise the same
+IDCT (covered by structure); their coefficient path is separately suspect
+(worst 15-16 vs 5) and stays the defined follow-up with the table values.
 
 #### Linear `v4` fails at MCU boundaries; per-MCU bases required
 
