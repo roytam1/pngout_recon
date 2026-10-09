@@ -2572,16 +2572,29 @@ Against the original binary, per-scan prefixes (truncated after each scan)
 are now **bit-exact for scans 1-9** (worst 0 each, previously 17-21 from
 scan 2 on); the whole file sits at **worst 3**, down from 21.
 
-The last residual is scan 10 alone, worst 3 on two pixels, both in the
-clipped-edge region (x>=8, y>=7). It is **not** in the progressive merge: an
-independent listing-faithful Python merge reproduces all ten C prefixes
-exactly ([0,0,0,0,0,0,0,0,0,3]), and an exhaustive search over every Y
-coefficient in the two blocks scan 10 writes cannot drive the error below 3.
-So the difference lives downstream of the coefficient merge — IDCT fixed-point
-rounding or the colour tables, reached only by this scan's specific
-high-frequency pattern. C-vs-IM interior stays within the bound 30 in
-`run_jpeg_progressive`. Per-scan `jpeg: pscan` dumps were temporary (reverted);
-final `jpeg: pblk` stays (like `blk`/`dbl`/`idct`).
+The last residual is scan 10 alone, worst 3. It is **not** in the progressive
+merge, and that is now proved rather than inferred:
+
+- An independent listing-faithful Python merge reproduces all ten C prefixes
+  exactly: `[0,0,0,0,0,0,0,0,0,3]`.
+- C's fixed-point IDCT and a float-IDCT forward model agree **bit-for-bit**
+  (worst 0) on this file's coefficients, so the model is a faithful stand-in
+  and a search through it is equivalent to searching C.
+- Exhaustive search over that space — every luma refine/new-coefficient
+  combination, all 8! luma block permutations, every Y/Cb/Cr DC offset in
+  -3..+3, and structural variants (AC shifted ±1, DC zeroed, band cleared) —
+  has a **floor of 3**. Structural variants are far worse (46/71/37/39), so
+  the merge itself is right.
+
+The residual is a smooth, row-constant ±3 low-frequency offset (15 of 17 pixels
+in a row share one value; row 0 is uniformly (2,2,2), rows 2-3 uniformly
+negative, rows 4-5 positive). That is the signature of the IDCT's row-pass
+rounding, not of coefficient error — and it is invisible on scans 1-9 only
+because that band's coefficients stay inside the rounding range. Resolving it
+means auditing `JpegIdct`'s fixed-point shift constants against the listing,
+which is independent of the entropy-decoder work above. C-vs-IM interior stays
+within the bound 30 in `run_jpeg_progressive`. Per-scan `jpeg: pscan` dumps were
+temporary (reverted); final `jpeg: pblk` stays (like `blk`/`dbl`/`idct`).
 
 #### Linear `v4` fails at MCU boundaries; per-MCU bases required
 
