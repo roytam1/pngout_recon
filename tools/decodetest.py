@@ -1710,8 +1710,10 @@ def run_jpeg(case):
     conversion/filtering distance from the original (not our error), so
     high-contrast subsampled cases carry loose bounds (IM upsamples with a
     filter, the original point-replicates).  Unsupported layouts
-    (subsampled h=2, progressive, single-component restart) must refuse
+    (subsampled h=2, single-component restart) must refuse
     cleanly ("DecodeImage refused") rather than crash or half-decode.
+    (Progressive used to be in that list; it now decodes - see
+    run_jpeg_progressive.)
     Part 1 (jpeglib roundtrip) is unchanged sanity that the corpus is legal.
     """
     import jpeglib

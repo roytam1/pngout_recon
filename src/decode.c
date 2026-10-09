@@ -3593,7 +3593,30 @@ static const unsigned char *JpegDecodeProgScan(const unsigned char *scan,
 
                                     if (size == 0) {
                                         if (run == 15) {
-                                            k += 16;
+                                            /* ZRL in a refinement scan falls
+                                             * past 810 (v108<15 false) into
+                                             * the 871 run-skip with run=15:
+                                             * existing nonzeros across the 16
+                                             * skipped positions are refined
+                                             * in passing, and v109=size=0
+                                             * stores nothing at 903. */
+                                            while (k <= (int)Se) {
+                                                if (blk[k]) {
+                                                    if (JpegRawBit(&bit))
+                                                        blk[k] =
+                                                            (short)(blk[k] +
+                                                            (blk[k] > 0 ?
+                                                             (1 << Al) :
+                                                             -(1 << Al)));
+                                                } else {
+                                                    run--;
+                                                    if (run < 0)
+                                                        break;
+                                                }
+                                                k++;
+                                            }
+                                            k++;
+                                            continue;
                                         } else {
                                             int kk;
 

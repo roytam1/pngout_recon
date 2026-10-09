@@ -2576,11 +2576,18 @@ trailing bits containing zeros, which cannot be padding (JPEG pads with ones),
 so they must decode as real symbols.
 
 An independent listing-faithful Python merge reproduces all ten C prefixes
-exactly, and C's merged coefficients match it block-for-block. C-vs-IM
-interior sits at 6 against the bound 10 in `run_jpeg_progressive` (the bound
-measures IM's own distance from the original, not our error). Per-scan
-`jpeg: pscan` dumps were temporary (reverted); final `jpeg: pblk` stays
-(like `blk`/`dbl`/`idct`).
+exactly, and C's merged coefficients match it block-for-block. A second,
+larger progressive file (129x65, exercising EOBRUN runs 2-3 and ZRLs the
+corpus never reaches) is also bit-exact end to end, which caught one more
+listing detail: ZRL (`run=15,size=0`) in a *refinement* scan falls past the
+`v108<15` EOBRUN arm into the 871 run-skip with `run=15`, so existing nonzeros
+across the 16 skipped positions are refined in passing (and `v109=size=0`
+stores nothing at 903) — a bare `k+=16` desynchronises everything downstream.
+First-scan ZRL stays a free skip (no prior coefficients exist to refine).
+C-vs-IM interior sits at 6 against the bound 10 in `run_jpeg_progressive`
+(the bound measures IM's own distance from the original, not our error).
+Per-scan `jpeg: pscan` dumps were temporary (reverted); final `jpeg: pblk`
+stays (like `blk`/`dbl`/`idct`).
 
 #### Linear `v4` fails at MCU boundaries; per-MCU bases required
 
