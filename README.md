@@ -2456,8 +2456,21 @@ ramp444 7/13 non-restart and 17 restart, flatgrey 5/17-corner-pad,
 rampgrey 6, greygrey 6/6/85-corner-white-pad, checkergrey 6/133-edge -
 bounds in `run_jpeg` (interior <=7-12, edges <=20 pad, corner <100,
 checker-grey 140, restart-444 <=25). `checker_444_0_8` decodes (correct
-size, no crash) with no pixel bound: high-contrast extremes (in 150) need
-range tables not yet fitted (fit corpus was smooth + white/black flats).
+size, no crash) with no pixel bound - and stays that way: misaligned
+luma/chroma edges are structurally beyond fixed tables, not merely
+unfitted. Proof: checker white (6,4) (want R 255, `Y=495M`, `cri=134`
+frozen-smooth, `cbi=-596` extreme) needs `TA[134]+TB[-596]=38M` (idx 127),
+but `TB[-596]` sharers (same Cb, luma edges crossing chroma flats - the
+checker R/G/B patterns step at `x//3` vs `x//5` vs `x//2`, so same chroma
+carries Y varying ±300M) need values ±72 idx apart - no single entry
+serves them (extreme-only descent stalls at mean 28-39/worst 255 despite
+187 free entries for 153 pixels). The listing structure sums separable 1D
+tables with no Y-term, so the ORIGINAL shares this limitation (smooth and
+luma/chroma-aligned content exact - flat444 0; shadows/isoluminant edges
+in photos likewise approximate in PNGOUT itself; JPEG input was always
+best-effort graphics-focused). Smooth-exact tables are therefore FROZEN
+(checker values deliberately not merged - they would distort aligned
+content); checker_444 stays decode-only permanently.
 Black is exact (idx 891 dead-zero), white flats 121-126 (249-254) via the
 max-Y-to-126 nudge (1-idx margin; all 72 corpus whites share chroma (0,0)).
 Table VALUES (`JpegMakeTables`: linear baselines + 230 fitted overrides
@@ -2465,8 +2478,9 @@ Table VALUES (`JpegMakeTables`: linear baselines + 230 fitted overrides
 (interior 7) + RGB white nudges; unlisted indices keep linear (<=5
 default)) are functional/provisional - equation/structure (listing
 408F06-70, `shr` logical, floor-even, direct store) is final. Remaining:
-extreme-range tables (checker_444 pixels), true fixed values (writer
-discovery), h=2/progressive paths, 1-comp-restart framing.
+true fixed values (writer discovery), h=2/progressive paths, 1-comp-restart
+framing. (Checker extremes deliberately excluded - structurally beyond
+fixed tables, see above; not a gap to close.)
 
 #### Linear `v4` fails at MCU boundaries; per-MCU bases required
 
