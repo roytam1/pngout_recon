@@ -2588,7 +2588,8 @@ stores nothing at 903) — a bare `k+=16` desynchronises everything downstream.
 First-scan ZRL stays a free skip (no prior coefficients exist to refine).
 Further variants all decode bit-exact on first try with no code changes
 (444 sampling, single-component grey, exact-multiple 32x16 with no padding
-blocks, single-MCU 16x16), confirming the grid/traversal logic generalises
+blocks, single-MCU 16x16, 422 sampling, dense q95, hand-crafted
+non-interleaved-DC scans), confirming the grid/traversal logic generalises
 rather than being fitted to the two main files.
 C-vs-IM interior sits at 6 against the bound 10 in `run_jpeg_progressive`
 (the bound measures IM's own distance from the original, not our error).
