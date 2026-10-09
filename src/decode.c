@@ -2891,9 +2891,13 @@ static void JpegIdct(int *a1, unsigned a2)
  * VALUES in `JpegMakeTables` are FITTED functional (not the original's):
  * linear baselines (good defaults for unlisted indices) plus 230 overrides
  * from end-to-end coordinate descent + white-edge nudges (see its comment).
- * PROVISIONAL - true fixed values pending writer discovery; equation and
- * structure (listing 408F06-70) are final, values are not.  Wired (returns
- * 0) with fitted values; verification bounds in `JpegMakeTables` comment.
+ * Linear 8-param retest (correct structure, mean 3.6) still fails white-G
+ * (worst 255: linear slopes miss ramp edges by >1 idx, zero margin there),
+ * so per-index values are required at edges; smooth bulk alone would be
+ * linear-adequate.  PROVISIONAL - true fixed values pending writer
+ * discovery; equation and structure (listing 408F06-70) are final, values
+ * are not.  Wired (returns 0) with fitted values; verification bounds in
+ * `JpegMakeTables` comment.
  */
 static int JpegTA[JPEG_TBL_N], JpegTB[JPEG_TBL_N];
 static int JpegTC[JPEG_TBL_N], JpegTD[JPEG_TBL_N];
