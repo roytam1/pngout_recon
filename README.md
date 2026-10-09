@@ -2590,7 +2590,10 @@ Further variants all decode bit-exact on first try with no code changes
 (444 sampling, single-component grey, exact-multiple 32x16 with no padding
 blocks, single-MCU 16x16, 422 sampling, dense q95, hand-crafted
 non-interleaved-DC scans), confirming the grid/traversal logic generalises
-rather than being fitted to the two main files.
+rather than being fitted to the two main files. A 17-file fuzz matrix
+(33x17 and 64x48 across 420/444/422 samplings, q50/75/95, ramp/flat/noise
+content) is likewise all bit-exact, covering EOBRUN lengths, ZRL density,
+band occupancy, and grid geometries well beyond the hand-picked files.
 C-vs-IM interior sits at 6 against the bound 10 in `run_jpeg_progressive`
 (the bound measures IM's own distance from the original, not our error).
 Per-scan `jpeg: pscan` dumps were temporary (reverted); final `jpeg: pblk`
