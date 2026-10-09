@@ -2528,9 +2528,10 @@ to Al=0 - all ending Al=0, full precision, lossless merge) decodes via
 `JpegDecodeProgScan` into malloc'd flat `Block` buffers (128B = 64 shorts,
 zeroed, per-comp bases, freed at EOI/failure - like `v58<<7`/`v9`) with
 successive approximation faithfully: first scans store `value<<Al`,
-refinements set/add bit Al, EOB runs skip (`JpegEobRun` 1,3,7,... =
-`dword_410158`, verified r=1 covering 3 following with tail padding),
-new-nonzero position-wise run-skip. DRI+progressive refused outright
+refinements set/add bit Al, EOB runs skip (`JpegEobRun` powers of two =
+`dword_410158`, covering the current block too so following skips are
+base+extra-1), new-nonzero position-wise run-skip with sign bit first.
+DRI+progressive refused outright
 (original never allocates there: `!v195`). At EOI `JpegProgFinish`
 dequantises (same zigzag-t pattern), IDCTs into `JpegIdctBuf`, and outputs
 via the wired 444/Sub paths (prog file is 420), then frees.
@@ -2576,7 +2577,8 @@ so they must decode as real symbols.
 
 An independent listing-faithful Python merge reproduces all ten C prefixes
 exactly, and C's merged coefficients match it block-for-block. C-vs-IM
-interior stays within the bound 30 in `run_jpeg_progressive`. Per-scan
+interior sits at 6 against the bound 10 in `run_jpeg_progressive` (the bound
+measures IM's own distance from the original, not our error). Per-scan
 `jpeg: pscan` dumps were temporary (reverted); final `jpeg: pblk` stays
 (like `blk`/`dbl`/`idct`).
 
@@ -3279,9 +3281,8 @@ distance, not our error).
 
 Verification against the original 2015 binary (temp-only
 `pngout_orig.exe`, 33 sequential+checker files plus prog): C-vs-original
-worst 0 on all 33 (3825+1224 pixels). Progressive decodes (bound 30 vs
-IM holds) but differs from the original by worst 21 - the open
-follow-up; everything sequential is exact.
+worst 0 on all 33 (3825+1224 pixels), and the progressive file is now also
+bit-exact (worst 0 on all ten scan prefixes as well as the full decode).
 
 ### `sub_40DD80`, DDS (format code 7)
 
