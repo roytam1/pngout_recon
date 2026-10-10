@@ -2622,38 +2622,54 @@ Measured, with the originals regenerated to be sure the fixtures exist:
 | `varB_seq_big.jpg` | baseline 16x16, DC 11/6/13/12 + AC ±1 | `prec=1`, `STD_Q+256` | 40 / 256 |
 | `varB_seq_small.jpg` | identical coefficients | `prec=0`, `STD_Q` | 0 / 256 |
 
-What is established:
+What is established (corrected and extended after deeper probing):
 
 - **It is not the progressive merge.** `varB_seq_big.jpg` is a single-scan
   baseline SOF0 file with the same coefficients and the same 40-pixel
-  signature, so the entropy/merge layer is not involved.
+  signature, so the entropy/merge layer is not involved. An 8x8 single-block
+  file with DC=13 + AC=1 diverges by itself (32/64), so it is per-block, not
+  inter-block (predictor/grid) either.
 - **It is not 16-bit DQT parsing.** The same 16-bit *encoding* with values
-  ≤ 255 is bit-exact (`nidc16small`), and raising the high byte on the DC
-  alone, or the AC alone, is also bit-exact. Both must be raised together.
-- **It is not DC-only transfer.** `varA_dc.jpg` and the DC-only sweep over
-  D/Q values up to 1000 are exact; an AC coefficient is required.
-- **It is not IDCT overflow.** For the diverging blocks the dequantised
-  coefficients are ~1.7e9 and ~1.9e8, and every IDCT intermediate stays inside
-  `int` range. Re-running the IDCT with wrap-around, saturation and full
-  64-bit intermediates produces byte-identical output in all three modes.
-- **The IDCT is a faithful transcription.** `sub_40C790` was re-read
-  instruction by instruction (`40C7A5-40CA60`), including the multiply-high
-  (`imul [mem]` → `edx`, which matches `(unsigned __int64)(K * diff) >> 32`
-  because both take the high half of the same two's-complement product), the
-  `shl eax,2` / `lea [eax*4]` scaling, and the *association order* of the
-  multi-term sums, which the decompiler's C had normalised
-  (`((e1-e3)-e7)+e5` in the original versus `(e5+e1)-e3-e7` in `JpegIdct`).
-  A register-for-register Python transcription using the original's
-  associations reproduces C's pixels exactly, so that difference is not it
-  either - it is invisible here only because nothing overflows.
+  ≤ 255 is bit-exact (`nidc16small`). Same coefficients with an 8-bit table
+  are exact (`varB_seq_small`, and DC=13 + AC=1 with `prec=0` shows the
+  identical ramp in both builds).
+- **It is not AC-specific.** DC-alone with a large dequantised value also
+  diverges: DC=15, no AC (`Y` = 2139095040, index 510) gives C black versus
+  original white on all 256 pixels. DC=11/12/13 with no AC are exact (all
+  white either way), and a DC-only sweep to Q=1000 is exact.
+- **It is the colour-index bucket, not the path.** The divergence happens
+  exactly when C's colour index `(Y + tables) >> 22` lands in `[448, 896)`
+  (the `T0 = 0` black region): there C emits black and the original emits
+  white. When the index lands in `[127, 448)` (white), `[0, 128)` (linear
+  ramp) or `[896, 1024)` (upper ramp), the builds agree — including
+  informative greys at index 952 and 1020 (DC=28/30, exact) and full ramps
+  with DC=0 + AC of any size 1..4 (exact).
+- **It is sign-symmetric and position-independent.** AC of +1 and −1 are both
+  suppressed the same way; AC at zigzag positions 1..5 (natural 1/8/16/9/2)
+  all diverge with the original all-white.
+- **It is not IDCT overflow.** For the diverging sparse blocks (DC + one AC
+  at natural position 1) every row-pass output fits in `int`, and each column
+  has a single nonzero, so no intermediate overflows. Wrap / saturate /
+  64-bit IDCT modes agree byte-for-byte with C. A register-for-register
+  Python transcription of `sub_40C790` using the original's exact sum
+  associations (which the decompiler had normalised) also reproduces C
+  exactly.
+- **Large AC coincides again.** With DC=13, encoded AC 8 and 12 match fully
+  (including wrapped informative pixels); AC 16 diverges again. So it is not
+  a monotone AC-magnitude effect — it is whatever puts the index in or out
+  of `[448, 896)`.
 - **DQT scaling and dequantisation match the listing.** `40B5F8-40B63F`
   (`shl eax,13h`; `imul [var_1B8]`; `shrd eax,edx,18h` per axis) is what
   `JpegDQT` does, and the output dequant loop at `40C081` is a 32-bit
-  `imul` whose low half is what `(int)(__int64)dq` keeps.
+  `imul` whose low half is what `(int)(__int64)dq` keeps. `JpegQuant[0]`
+  was read back exactly (142606336) from DC=1/2 outputs.
 
-The visible effect is a linear luma ramp whose 448-entry boundary in the
-`T0/T1/T2` colour tables lands one pixel away from the original's, i.e. the
-two builds disagree on IDCT outputs of order 2e9.
+In short: for identical coefficients, tables, IDCT arithmetic and colour
+tables, the original's effective `Y` (IDCT output) must differ from C's
+exactly when C's index would fall in `[448, 896)`. No stage checked so far
+(Huffman/extend, DQT parse/scale, dequant multiply, IDCT ops and order,
+colour tables/index) contains a value-dependent branch that explains it;
+the output function (`sub_408D80`) has no clamps, only shifts and bounds.
 
 One real fidelity gap found during this audit *has* been closed: the original
 keeps the DQT scaling intermediate in the dword `var_1B0` and its `shl eax,13h`
