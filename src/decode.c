@@ -798,7 +798,14 @@ static int DecodePng(const unsigned char *data, int size, unsigned char *pixels,
         const unsigned char *tag = p + 4;
         const unsigned char *body = p + 8;
 
-        if (body + (int)len > end)
+        /*
+         *  In 64 bits, so a corrupt length can neither wrap the advance
+         *  below `end` nor defeat the check with its sign: `(int)len`
+         *  goes negative past 2 GB and `body + len + 4` wraps the address
+         *  space on 32 bits, which is how a one-byte mutation faulted.
+         *  Valid chunks always fit, so they walk exactly as before.
+         */
+        if ((unsigned __int64)len + 12 > (unsigned __int64)(end - p))
             break;
 
         if (tag[0] == 'I' && tag[1] == 'H' && tag[2] == 'D' && tag[3] == 'R') {
@@ -888,6 +895,10 @@ static int DecodePng(const unsigned char *data, int size, unsigned char *pixels,
                    && tag[3] == 'E') {
             int n = (int)len / 3;
 
+            /* `Pal` holds 256 entries; a longer PLTE is corrupt, and the
+             * original's unbounded walk runs off its own table there. */
+            if (n > 256)
+                n = 256;
             PalCount = n;
             for (i = n - 1; i >= 0; i--)
                 Pal[i] = (int)((Swap32(*(const unsigned *)(body + 3 * i)) >> 8)
@@ -1129,12 +1140,20 @@ static int DecodePcx(const unsigned char *data, int size, unsigned char *pixels,
                      int pitch, unsigned int width, unsigned int height,
                      int xorigin, int yorigin)
 {
-    const unsigned char *src;
+    const unsigned char *src, *end;
     int w, h, nplanes, bytesperline;
 int rowend, rowlimit, colstart, startcol, newh, colend4, row, col;
     int plane;
 
     if (*(const unsigned int *)data != 0x0801050Au)
+        return -1;
+
+    /*
+     *  The header fields below live at +0x41/+0x42, and the RLE stream at
+     *  +0x80; refuse a file too short to hold them rather than reading
+     *  past it.  Every valid PCX carries at least its 128 byte header.
+     */
+    if (size < 0x44)
         return -1;
 
     w = (short)(*(const short *)(data + 8) - *(const short *)(data + 4)) + 1;
@@ -1148,10 +1167,17 @@ int rowend, rowlimit, colstart, startcol, newh, colend4, row, col;
     bytesperline = (short)*(const unsigned short *)(data + 0x42);
 
     src = data + 0x80;
+    end = data + size;
 
     if (nplanes == 0) {
-        const unsigned char *p = data + size - 0x300;
+        const unsigned char *p;
         int i;
+
+        /* the 256 entry palette is read from the end of the file, so the
+         * file has to hold all 768 bytes of it */
+        if (size < 0x300)
+            return -1;
+        p = data + size - 0x300;
 
         for (i = 0; i < 256; i++, p += 3)
             Pal[i] = (((int)p[0] - 0x100) << 16) + ((int)p[1] << 8) + p[2];
@@ -1198,6 +1224,15 @@ if (nplanes == 3) {
 
     colstart = xorigin * 4;                        /* 0x40DC5E */
     newh     = h + yorigin;                         /* var_4 at 0x40DC1D */
+    /*
+     *  The widened store width has to fit the caller's row: `colend4` bytes
+     *  go out per row into a `pitch` stride, so a file whose bytesPerLine
+     *  trick widens past it is corrupt, not wide.  (Valid files never widen
+     *  past the pitch; the wide-`bytesPerLine` corpus case stays inside it.)
+     */
+    if ((unsigned __int64)(unsigned int)width * 4 >
+        (unsigned __int64)(unsigned int)pitch)
+        return -1;
     colend4  = (int)width * 4;                      /* 0x40DC50 */
     rowlimit *= 4;                                  /* 0x40DC55 */
     startcol = (nplanes - 1) + colstart;            /* 0x40DC6D */
@@ -1217,12 +1252,19 @@ if (nplanes == 3) {
          *  0x40DC7A / 0x40DD01: one run.  A byte below 0xC0 is a literal with
          *  a count of one; at or above it, `& 0x3F` repeats of the byte after.
          *  A count of zero advances to the next scanline writing nothing.
+         *  The stream is bounded by the file: a truncated file runs dry
+         *  instead of reading past it (valid files always have the bytes
+         *  their runs need, so this changes nothing they do).
          */
         for (;;) {
+            if (src >= end)
+                return -1;
             if (*src < 0xC0) {
                 count = 1;
                 value = *src++;
             } else {
+                if (src + 2 > end)
+                    return -1;
                 count = *src++ & 0x3F;
                 value = *src++;
             }
@@ -1604,10 +1646,20 @@ static int DecodeBmp(const unsigned char *data, int size, unsigned char *pixels,
                      int xorigin, int yorigin)
 {
     const unsigned char *pixeldata, *row;
+    unsigned int off;
     int hdrsize, w, h, bpp, compression, stride, ydir, rows;
     int y, col, xcount, dcol, drow;
     BmpMasks bm;
-    (void)size;
+
+    /*
+     *  sub_40D560 takes no length argument, so the original trusts every
+     *  offset it reads; this build is handed `size` and refuses a file
+     *  whose headers or pixel data run past it rather than reading heap
+     *  garbage or faulting.  No valid file points past EOF, so nothing the
+     *  original decodes is turned away.
+     */
+    if (size < 26)
+        return -1;
 
     hdrsize = *(const short *)(data + 0x0E);
     if (hdrsize == 12) {
@@ -1618,6 +1670,8 @@ static int DecodeBmp(const unsigned char *data, int size, unsigned char *pixels,
         bpp = *(const unsigned short *)(data + 0x18);
         compression = 0;
     } else {
+        if (size < 34)
+            return -1;
         if (*(const unsigned short *)(data + 0x1A) != 1)
             return -1;
         w = *(const int *)(data + 0x12);
@@ -1633,7 +1687,27 @@ static int DecodeBmp(const unsigned char *data, int size, unsigned char *pixels,
     if (compression != 0 && compression != 3)
         return -1;
 
-    pixeldata = data + *(const unsigned int *)(data + 0x0A);
+    off = *(const unsigned int *)(data + 0x0A);
+    if (off > (unsigned int)size)
+        return -1;
+    pixeldata = data + off;
+
+    {
+        /* 0x40D7CA stride and the 0x40D7EC/0x40D7E4 row range, in 64 bits:
+         * `w * bpp` overflows an int for a corrupt header, and the rows
+         * must lie inside the file either way the destination walks. */
+        unsigned __int64 stride64 =
+            (((unsigned __int64)(unsigned int)w * (unsigned int)bpp + 31)
+             >> 3) & ~(unsigned __int64)3;
+        unsigned __int64 rows64 = (h < 0) ?
+            (unsigned __int64)(-(signed __int64)h) : (unsigned __int64)h;
+
+        if (rows64 == 0 ||
+            rows64 > ((unsigned __int64)size - off) / stride64)
+            return -1;
+        stride = (int)stride64;
+        rows = (int)rows64;
+    }
 
     /* ---- the colour type, the palette and the channel masks ---- */
 
@@ -1656,8 +1730,11 @@ if (bpp < 16) {
         }
 
         /* the original has no cap here; 256 is only here so that a file with
-         * more palette than a PLTE can hold cannot run off the ramp */
-        while (p < pixeldata && n < 256) {
+         * more palette than a PLTE can hold cannot run off the ramp.  Reads
+         * stay inside the file: the walk stops at `pixeldata`, which is
+         * inside it, and a ragged tail below one entry is left alone. */
+        while (p < pixeldata && p + (size_t)stride <= data + (size_t)size &&
+               n < 256) {
             unsigned int e;
 
             memcpy(&e, p, (size_t)stride);
@@ -1686,11 +1763,21 @@ if (bpp < 16) {
         }
 
 if (compression == 3) {
-            /* 0x40D6EF: `lea edx, [esi+ebp+0Eh]`, again past the file header */
-            const unsigned int *m =
-                (const unsigned int *)(data + 14 + hdrsize +
-                                       *(const int *)(data + 0x36));
+            /*
+             *  0x40D6EF: `lea edx, [esi+ebp+0Eh]` - the three masks sit right
+             *  after the header and are read in place (`add edx, 4` per mask),
+             *  i.e. at file offset 14 + biSize, which the writer calls +0x36.
+             *  (An earlier revision of this file added the dword there as an
+             *  offset instead of reading at it; no corpus file takes this arm
+             *  - the 16 bit case is BI_RGB - so nothing caught it.)
+             */
+            long moff = 14L + hdrsize;
+            const unsigned int *m;
             int k;
+
+            if (moff < 0 || moff + 12 > size)
+                return -1;
+            m = (const unsigned int *)(data + moff);
 
             for (k = 0; k < 3; k++) {
                 unsigned int v = m[k];
@@ -1707,17 +1794,15 @@ if (compression == 3) {
         BmpMakeMasks(&bm, counts, shifts);
     }
 
-    /* ---- 0x40D7C4: the stride, the direction and the two row pointers ---- */
+    /* ---- 0x40D7C4: the stride, the direction and the two row pointers ----
+     * (`stride`/`rows` were fixed up above, in 64 bits, against `size`). */
 
-    stride = ((w * bpp + 31) >> 3) & ~3;
     if (h < 0) {
         ydir = -1;                     /* top-down */
-        rows = -h;
         row = pixeldata;
         drow = 1;
     } else {
         ydir = 1;                      /* bottom-up */
-        rows = h;
         row = pixeldata + (size_t)(rows - 1) * stride;
         drow = -1;
     }

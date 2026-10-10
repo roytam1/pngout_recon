@@ -1837,7 +1837,8 @@ runs to `height + yorigin` in rows and lets the store clip.
 
 `tools\decodetest.py --pcx` and `--pcx-roundtrip` check four cases each way,
 including one whose `bytesPerLine` is wider than the image, which is what
-exercises that comparison.
+exercises that comparison. The widened width is still bounded by the caller's
+pitch - a corrupt file that widens past it faulted (see **Robustness**).
 
 ### `sub_40D250`, Targa (format code 8)
 
@@ -1956,8 +1957,15 @@ ecx`, with no negation — so a top-down file gives a negative height, and
 to `malloc`, which fails: *"Out of memory"*. The top-down branch above is
 faithful to the listing and unreachable through `main()`.
 
-`tools\decodetest.py --bmp` and `--bmp-roundtrip` check six cases, both header
-shapes and 8, 16, 24 and 32 bits.
+`tools\decodetest.py --bmp` and `--bmp-roundtrip` check seven cases, both header
+shapes and 8, 16, 24 and 32 bits, plus BI_BITFIELDS with RGB565 masks - the
+only path that reads the mask table, at file offset 14 + biSize
+(`lea edx, [esi+ebp+0Eh]` at `0x40D6EF`, `add edx, 4` per mask). The
+reconstruction used to add the dword there as an offset instead of reading
+at it; no corpus file takes the arm (the 16 bit case is BI_RGB), so nothing
+caught it, and a bitfields file crashed outright. The seventh case pins it,
+with the count logic exercised too - RGB555 masks would decode exactly like
+the BI_RGB path, RGB565 does not.
 
 ### `sub_40CA70`, GIF (format code 3)
 
@@ -3511,8 +3519,8 @@ python tools\decodetest.py --pcx         three plane PCX, 4 cases
 python tools\decodetest.py --pcx-roundtrip   the same four through pngout.exe
 python tools\decodetest.py --targa      Targa, 12 cases
 python tools\decodetest.py --targa-roundtrip  the same twelve through pngout.exe
-python tools\decodetest.py --bmp        BMP, 6 cases
-python tools\decodetest.py --bmp-roundtrip   the same six through pngout.exe
+python tools\decodetest.py --bmp        BMP, 7 cases
+python tools\decodetest.py --bmp-roundtrip   the same seven through pngout.exe
 python tools\decodetest.py --gif        GIF, 12 cases
 python tools\decodetest.py --gif-roundtrip   the same twelve through pngout.exe
 python tools\decodetest.py --jpeg       JPEG, 34 cases (see below)
@@ -3580,6 +3588,34 @@ shapes that matter for the internal layout: `alpha_ramp` gives one see-through
 row in the middle of an opaque picture, and `grey_few` is greyscale plus alpha
 with few enough colours that `SuggestColType()` answers with a palette, which is
 the only way a type 4 image survives a round trip (see **The pixel expansion**).
+
+### Robustness: corrupt input refuses, never faults
+
+The original's decoders take no length argument and trust every offset they
+read, so corrupt headers fault it the same way they faulted this build: 15
+access violations across 615 truncation/mutation runs through `dumpdec.exe`
+(12 BMP, 1 PCX, 2 PNG, 0 elsewhere, 0 hangs). All are fixed, with bounds that
+only files pointing past EOF can trip, so nothing the original decodes is
+turned away:
+
+* **BMP** (`DecodeBmp`): the pixel-data offset and the whole row interval are
+  validated against `size` in 64 bits (`w * bpp` overflows an int for a corrupt
+  header); the palette walk and the BI_BITFIELDS mask window likewise. Found
+  by offsets and dimensions mutated huge.
+* **PCX** (`DecodePcx`): the store width after the `bytesPerLine` widening
+  must fit the caller's pitch (a narrow file with a wide stride wrote past
+  every row); the RLE loop stops at end of file; short headers refused.
+  Found by `xmax` 12 → 0 with the stride left at 12.
+* **PNG** (`DecodePng`, `GetImageSize`): chunk lengths are compared in 64 bits
+  - `(int)len` goes negative past 2 GB and defeats the check, and `body + len
+  + 4` wraps the address space on 32 bits. PLTE entries are capped at the 256
+  `Pal` holds. Found by one-byte mutations to huge lengths.
+* **`GetImageSize`** minimums: BMP needs 24 bytes for core dims, 28 for info;
+  DDS needs 20 for its dimensions (the shared guard was 16).
+
+Re-run: the 615-case truncation/mutation sweep from this record (a scratch
+script, not committed) comes back 0 crashes, 0 hangs, with every valid file
+still decoding.
 
 ### tools\pngcheck.cmd - round-trip verification
 

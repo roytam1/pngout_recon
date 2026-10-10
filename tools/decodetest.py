@@ -1126,8 +1126,13 @@ def write_bmp(path, w, h, pixels, bpp=24, core=False, compression=0):
         elif bpp == 16:
             for x in range(w):
                 pr, pg, pb, _pa = pixels[y][x]
-                r += struct.pack("<H", ((pr >> 3) << 10) | ((pg >> 3) << 5) |
-                                    (pb >> 3))
+                if compression == 3:
+                    # BI_BITFIELDS with RGB565 masks (see below): 5, 6, 5
+                    r += struct.pack("<H", ((pr >> 3) << 11) |
+                                     ((pg >> 2) << 5) | (pb >> 3))
+                else:
+                    r += struct.pack("<H", ((pr >> 3) << 10) |
+                                     ((pg >> 3) << 5) | (pb >> 3))
         elif bpp == 8:
             for x in range(w):
                 r.append(pixels[y][x][0] & 0xFF)
@@ -1151,7 +1156,10 @@ def write_bmp(path, w, h, pixels, bpp=24, core=False, compression=0):
     for pr, pg, pb in pal:
         palbytes += bytes([pb, pg, pr]) if core else bytes([pb, pg, pr, 0])
     if compression == 3:
-        masks = (0x7C00, 0x03E0, 0x001F) if bpp == 16 else \
+        # BI_BITFIELDS masks, right after the header where 0x40D6EF reads
+        # them (`lea edx, [esi+ebp+0Eh]`).  RGB565, so the count logic gets
+        # exercised too - RGB555 would decode exactly like the BI_RGB path.
+        masks = (0xF800, 0x07E0, 0x001F) if bpp == 16 else \
                 (0x00FF0000, 0x0000FF00, 0x000000FF)
         palbytes += b"".join(struct.pack("<I", m) for m in masks)
 
@@ -1169,7 +1177,7 @@ def write_bmp(path, w, h, pixels, bpp=24, core=False, compression=0):
     return path
 
 
-def bmp_expected(px, bpp, pal):
+def bmp_expected(px, bpp, pal, compression=0):
     """What sub_40D560 makes of one pixel, as an internal 0xAARRGGBB dword."""
     r, g, b, a = px
     if bpp == 32:
@@ -1177,6 +1185,13 @@ def bmp_expected(px, bpp, pal):
     if bpp == 24:
         return (b, g, r, 255)
     if bpp == 16:
+        if compression == 3:
+            # BI_BITFIELDS with RGB565 masks: R shift 11 count 5, G shift 5
+            # count 6, B shift 0 count 5, through BmpMakeMasks - so R and B
+            # come out `v << 3` and G `(v << 5) & 0xFC00`, i.e. `g6 << 2`.
+            r5, g6, b5 = (r >> 3) & 31, (g >> 2) & 63, (b >> 3) & 31
+            return ((b5 << 3) & 0xFF, (g6 << 2) & 0xFF, (r5 << 3) & 0xFF,
+                    255)
         # RGB565 with no scaling at all: each channel is its 5 bits `v << 3`,
         # so R and B reach 0xF8 and G, five bits at position 6, tops out at
         # 0x78.  The alpha byte comes from the borrow out of the - 0x1000000.
@@ -1194,9 +1209,9 @@ def bmp_expected(px, bpp, pal):
 
 def run_bmp(case):
     """The same comparison as run(), for BMP."""
-    name, w, h, pixels, bpp, core = case
+    name, w, h, pixels, bpp, core, compression = case
     src = os.path.join(BUILD, "dt_%s.bmp" % name)
-    write_bmp(src, w, h, pixels, bpp, core)
+    write_bmp(src, w, h, pixels, bpp, core, compression)
     pal = bmp_palette(pixels, w, h, bpp) if bpp <= 8 else []
     try:
         gw, gh, got = dump(src)
@@ -1208,7 +1223,7 @@ def run_bmp(case):
     first = None
     for y in range(h):
         for x in range(w):
-            px = bmp_expected(pixels[y][x], bpp, pal)
+            px = bmp_expected(pixels[y][x], bpp, pal, compression)
             if got[y][x] != px:
                 bad += 1
                 if first is None:
@@ -1220,10 +1235,10 @@ def run_bmp(case):
 
 def roundtrip_bmp(case):
     """The same file through pngout.exe and back out of the PNG it writes."""
-    name, w, h, pixels, bpp, core = case
+    name, w, h, pixels, bpp, core, compression = case
     src = os.path.join(BUILD, "dt_%s.bmp" % name)
     dst = os.path.join(BUILD, "dt_%s.bmp.out.png" % name)
-    write_bmp(src, w, h, pixels, bpp, core)
+    write_bmp(src, w, h, pixels, bpp, core, compression)
     pal = bmp_palette(pixels, w, h, bpp) if bpp <= 8 else []
     if os.path.exists(dst):
         os.remove(dst)
@@ -1242,7 +1257,7 @@ def roundtrip_bmp(case):
     first = None
     for y in range(h):
         for x in range(w):
-            px = bmp_expected(pixels[y][x], bpp, pal)
+            px = bmp_expected(pixels[y][x], bpp, pal, compression)
             want = (px[2], px[1], px[0], px[3])
             if tuple(got["rows"][y][x]) != want:
                 bad += 1
@@ -1284,7 +1299,8 @@ def targa_cases():
 
 
 def bmp_cases():
-    """BMP: both header shapes, every depth the original decodes."""
+    """BMP: both header shapes, every depth the original decodes, plus
+    BI_BITFIELDS (the only path that reads the channel masks)."""
     w, h = 9, 5
     p24 = [[((x * 23 + y * 11) & 0xFF, (x * 17 + y * 41) & 0xFF,
              (x * 7 + y * 61) & 0xFF, 255) for x in range(w)] for y in range(h)]
@@ -1296,12 +1312,15 @@ def bmp_cases():
             for x in range(w)] for y in range(h)]
     p8 = [[((x + y) % 16, 0, 0, 255) for x in range(w)] for y in range(h)]
     return [
-        ("b-rgb24", w, h, p24, 24, False),
-        ("b-rgb24-core", w, h, p24, 24, True),
-        ("b-rgba32", w, h, p32, 32, False),
-        ("b-rgb16", w, h, p16, 16, False),
-        ("b-pal8", w, h, p8, 8, False),
-        ("b-pal8-core", w, h, p8, 8, True),
+        ("b-rgb24", w, h, p24, 24, False, 0),
+        ("b-rgb24-core", w, h, p24, 24, True, 0),
+        ("b-rgba32", w, h, p32, 32, False, 0),
+        ("b-rgb16", w, h, p16, 16, False, 0),
+        # BI_BITFIELDS with RGB565 masks: the only case that reads the mask
+        # table at +0x36, so the only one that sees a wrong address there
+        ("b-bitfields", w, h, p16, 16, False, 3),
+        ("b-pal8", w, h, p8, 8, False, 0),
+        ("b-pal8-core", w, h, p8, 8, True, 0),
     ]
 
 

@@ -288,7 +288,11 @@ while ((unsigned int)(p - fileimg) < (unsigned int)(filesize - 16)) {
                     *height = (int)Swap32(*(unsigned int *)(p + 12));
                     return FMT_PNG;
                 }
+                /* in 64 bits: a corrupt length must end the walk, not wrap
+                 * the cursor below `end` into unmapped memory */
                 len = Swap32(*(unsigned int *)p);
+                if ((unsigned __int64)len + 12 > (unsigned __int64)(end - p))
+                    break;
                 p += len + 12;
             }
         return FMT_NONE;
@@ -332,14 +336,17 @@ while ((unsigned int)(p - fileimg) < (unsigned int)(filesize - 16)) {
     }
 
     /* ---------------- BMP ---------------- */
+    /* core reads to +22 (24 bytes), info to +26 (28 bytes) */
     if (fileimg[0] == 'B' && fileimg[1] == 'M') {
-        if (*(unsigned short *)(fileimg + 14) == 12 &&
+        if (filesize >= 24 &&
+            *(unsigned short *)(fileimg + 14) == 12 &&
             *(unsigned short *)(fileimg + 22) == 1) {       /* BITMAPCOREHEADER */
             *width  = *(unsigned short *)(fileimg + 18);
             *height = *(unsigned short *)(fileimg + 20);
             return FMT_BMP;
         }
-        if (*(unsigned short *)(fileimg + 26) == 1) {       /* biPlanes */
+        if (filesize >= 28 &&
+            *(unsigned short *)(fileimg + 26) == 1) {       /* biPlanes */
             *width  = *(int *)(fileimg + 18);
             *height = *(int *)(fileimg + 22);
             return FMT_BMP;
@@ -355,7 +362,9 @@ while ((unsigned int)(p - fileimg) < (unsigned int)(filesize - 16)) {
     }
 
     /* ---------------- DDS ---------------- */
-    if (*(unsigned int *)fileimg == 0x20534444u &&
+    /* width/height at +16/+12 need 20 bytes */
+    if (filesize >= 20 &&
+        *(unsigned int *)fileimg == 0x20534444u &&
         *(unsigned int *)(fileimg + 4) == 124u) {
         *width  = *(int *)(fileimg + 16);
         *height = *(int *)(fileimg + 12);
