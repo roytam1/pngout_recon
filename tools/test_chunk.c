@@ -2144,13 +2144,18 @@ int main(void)
         }
 
         /* the record's own lengths were replaced by the mirror, and the cost
-           is how far each one moved times how often the symbol occurred */
+           is how far each one moved times how often the symbol occurred -
+           OLD minus NEW, `sub ebx, edx` at 0x407147 (`ebx` holds the old
+           length, `edx` the new one).  The sign is load-bearing: a positive
+           RowCost is what `jg loc_4049AC` at 0x404957 tests to keep the trial
+           loop going, so it is a *saving*, and lengths that got longer make
+           it negative. */
         want = 0;
         for (i = 0; i < ROW_SAMPLE_MAX; i++)
-            want += (LensScratch[i] - oldlens[i]) * samples[i];
+            want += (oldlens[i] - LensScratch[i]) * samples[i];
         check("the cost moved by the length change times the frequency",
               RowCost, want);
-        check("and it is not free", RowCost > 0, 1);
+        check("and longer codes cost, not save", RowCost < 0, 1);
 
         /* the four samples neither build covers keep the mirror */
         for (i = 0; i < ROW_SAMPLE_MAX; i++)
@@ -2201,6 +2206,14 @@ int main(void)
         RowIndex = 0;
         RowCount = 1;                 /* so AdvanceRow() stops after it     */
         /*
+         *  EmitBlock() opens the IDAT by reserving four bytes at ChunkStart
+         *  for the length and patching them at the end, so the reserved bytes
+         *  have to be there for the patch to land on them: with nothing there
+         *  the write falls past what has been emitted, and the IEND that goes
+         *  out afterwards overwrites it.
+         */
+        OutCount = ChunkStart + 4;
+        /*
          *  FinishBlock() flushes the LZ coder first, which is what leaves the
          *  Adler-32 sum in AdlerSum - so this test has to hand it an empty
          *  window and a scan position already at the write position, or the
@@ -2220,11 +2233,15 @@ int main(void)
         i = OutCount - 4;         /* just before the length field went out */
 
         /* five bits went out, then padding, then the Adler-32 and the block
-           CRC.  The IDAT length is *not* among them: it is patched back into
-           the chunk header at ChunkStart, where it was reserved. */
+           CRC, and finally the IEND the original stages whole at 0x407679
+           (`push 0Ch / push offset dword_412E78`, then 0, "IEND", the fixed
+           CRC, then `call sub_4052D0`).  The IDAT length is *not* among them:
+           it is patched back into the chunk header at ChunkStart, where it was
+           reserved - and it is patched *before* the IEND goes out, which is
+           why the expected value below has to discount it. */
         check("the block closed", OutCount > n, 1);
-        check("the trailer is the adler and the block crc",
-              OutCount - n, 1 + 4 + 4);
+        check("the trailer is the adler, the block crc and IEND",
+              OutCount - n, 1 + 4 + 4 + 12);
 
         before = out + n;
         check("the padding is the rest of the byte", (before[0] >> 5) & 7,
@@ -2247,9 +2264,11 @@ int main(void)
             unsigned int len = (unsigned)lp[0] << 24 | lp[1] << 16 |
                                lp[2] << 8 | lp[3];
 
-            /* the length does not count itself, nor the CRC */
+            /* the length does not count itself, nor the CRC - and it was
+               patched before the trailing chunks and the IEND went out, so
+               those twelve bytes are not part of it either */
             check("the IDAT length counts what was written",
-                  len, (unsigned)(OutCount - ChunkStart - 12));
+                  len, (unsigned)(OutCount - ChunkStart - 12 - 12));
         }
 
         /* the chunks after the image data go out whole */
@@ -2270,9 +2289,9 @@ int main(void)
             FinishBlock();
             /* the block's own trailer goes out first - it has no padding
                this time, and the IDAT length is patched at ChunkStart rather
-               than emitted here - and then the chunk, whole */
+               than emitted here - then the chunk, whole, and finally the IEND */
             check("a trailing chunk goes out whole", OutCount - n,
-                  4 + 4 + 13);
+                  4 + 4 + 13 + 12);
             check("and it comes out unchanged",
                   memcmp(out + n + 8, tail, 13), 0);
         }

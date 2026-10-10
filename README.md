@@ -779,8 +779,13 @@ Closing means: count the block in the record, emit the code the row needs,
 * the copy back runs over all 320 entries, so the four neither build covers
   keep whatever the mirror held — faithful, and harmless.
 * the running cost (`0x18CBEEC`) is
-  `Σ (new length − old length) × frequency`, i.e. how much worse this row's code
-  got. That number is what the filter trials compare.
+  `Σ (old length − new length) × frequency` (`sub ebx, edx` at `0x407147`,
+  old minus new - not the tempting reverse), i.e. how many bits the rebuild
+  saved. Positive means the code got better, and `RowCost > 0` (`jg` at
+  `0x404957`) is what keeps the trial loop searching. Read with the sign
+  flipped the loop ends after the first trial and the build emits
+  trial-0-grade compression on every image. That number is what the filter
+  trials compare.
 
 The tail is straight-line: `RowIndex++`, and if there is a row left,
 `BuildDistanceSlots()`, one bit saying whether this is the last row, a two bit
@@ -3651,6 +3656,52 @@ feed except 4, every filter, every strategy, all three `SeedBlockTables()`
 presets and both block splitting modes.
 
 ### Known defects
+
+Four, all found by running the reconstruction and the original binary over the
+same photograph (`2296x3606`, RGBA in, `/b0`) and comparing sizes and timings.
+
+* **Fixed - `AdvanceRow()` had the cost sign backwards, so the optimiser never
+  iterated.** `sub_407147` is `mov ebx, [eax]` / `sub ebx, edx` - the *old*
+  length minus the new one - and `0x404957` is `jg loc_4049AC` on it, so a
+  positive cost means the rebuild saved bits and the trial loop should keep
+  going. Transcribed as new-minus-old the cost is negative on the first row,
+  the loop takes `jle loc_404959` and stops after trial 0 forever, and every
+  image came out at trial-0 grade. On the test photograph that is 862,794
+  bytes against the original's 585,161.
+* **Fixed - the snapshot and restore copied the wrong slots.** Both walk 320
+  *dwords* per block and take the low byte (`0x403A70`, `0x404110`,
+  `0x404990`, `0x404B07`); a 320-byte `memcpy` takes every byte of the first
+  80 dwords instead, so the fingerprint and the restore were both garbage.
+* **Fixed - a losing trial did not regenerate the best one.** When a repeat
+  came out worse than the best, `0x404B1E` restores the best filters and
+  palette, sets `dword_180BA80` and loops *back* to `loc_4036D0` to rebuild
+  the best trial's bytes - `Image->outbuf` still holds the worse trial's. It
+  broke out instead, so the best size and the emitted bytes disagreed.
+* **Fixed - the compressed path wrote no IEND.** `0x407679` stages twelve bytes
+  - zero length, `"IEND"`, the fixed CRC `826042AEh` - and writes them with one
+  `sub_4052D0`. Nothing here did, so every compressed PNG ended at the IDAT
+  CRC. Round trips still passed, because zlib stops at the end of the IDAT and
+  never looks past it; only a large file - one IDAT rather than several - shows
+  the missing tail. `WriteStored()` already wrote it.
+
+With all four, the reconstruction is **1,598,722 bytes against the original's
+1,598,860** on that photograph (138 bytes *smaller*), and the two agree
+byte-for-byte on a 640x480 one.
+
+**Open: it is about 7x slower than the original** (858s against 144s on that
+photograph). The work is deterministic and identical on every trial - 24.84M
+positions, 6.84G hash-chain steps (275 per position) and 4.56G `LzXtreme`
+iterations (183 per position) - but trial 1 takes 27s and trials 2 onwards
+261s each. The step is `dword_180BA84`, the step-table cursor: it grows
+2.2M -> 4.1M -> 6.1M -> 8.0M entries as the codes improve, so the 16 MB
+step table goes from ~4 MB touched (L3) to fully touched, and every
+`LzXtreme` iteration does one random `StepTable[MatchStart[q] + len]` read.
+4.56G reads at DRAM latency accounts for the 261s almost exactly. Since the
+loop body, the chain walk, the hash and the per-trial `sub_4058A0` reset have
+all been checked instruction by instruction against the listing and against
+the call graph (`sub_405150` calls `sub_4058A0` once, as here), what is left is
+to find why the original's cursor grows far more slowly - the one region not
+yet compared line by line is the stepping and retry at `0x406A78`-`0x406B9A`.
 
 `tools\pngcheck.cmd` found eleven. All are fixed; the round trip is clean over
 all 30 cases. The last four were found together and are worth reading together,

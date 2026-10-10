@@ -163,6 +163,9 @@ static void LzXtreme(int pos, int savedCost, int cap, int maxlen, int dist)
     next = 0;
 
     for (len = 3; ; ) {
+#ifdef LZSTATS
+        LzStatXtreme++;
+#endif
         /*
          *  loc_406920: a distance is only *recorded* the first time this
          *  length is reached, so the step table has one entry per (position,
@@ -295,6 +298,10 @@ static void LzXtreme(int pos, int savedCost, int cap, int maxlen, int dist)
 
 void (*LzTraceHook)(int, int, int, int, int, int);
 
+#ifdef LZSTATS
+unsigned __int64 LzStatChain, LzStatXtreme, LzStatPos, LzStatEmit;
+#endif
+
 /*
  *  The two hooks `FinishBlock()` and `FilterByte()` go through.  In the
  *  original these are jumps, not calls: `FilterByte()` jumps into loc_4075B0
@@ -339,6 +346,9 @@ int LzCode(const unsigned char *data, int len)
     while (LzScan < limit) {
         pos = LzScan;
         runEnd = RunEnd;
+#ifdef LZSTATS
+        LzStatPos++;
+#endif
 
         savedCost = MatchCost[pos & LZ_COSTMASK];
         MatchCost[pos & LZ_COSTMASK] = 0x7FFFFFFF;
@@ -388,6 +398,9 @@ int LzCode(const unsigned char *data, int len)
 
         /* ---- 0x406740: walk the hash chain while the 3 low bytes agree ---- */
         for (;;) {
+#ifdef LZSTATS
+            LzStatChain++;
+#endif
             if (((LzDword(pos - dist) ^ (unsigned)word) & 0xFFFFFF) == 0)
                 break;
             prev = (int)(unsigned short)DistSlot[prev];
@@ -446,7 +459,7 @@ int LzCode(const unsigned char *data, int len)
 
         PrevMark = MatchCount;
         PrevReach = MatchReach[start];
-        DistSlot[start] = (int)(unsigned short)HashHead[hash];
+        DistSlot[start] = HashHead[hash];
         HashHead[hash] = start;
 
     literal:
@@ -521,7 +534,7 @@ int LzCode(const unsigned char *data, int len)
                 }
 
                 q = pos & LZ_STEPMASK;
-                DistSlot[q] = (int)(unsigned short)HashHead[h];
+                DistSlot[q] = HashHead[h];
                 HashHead[h] = q;
                 pos++;
                 LzScan = pos;

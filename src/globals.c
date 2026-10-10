@@ -177,8 +177,8 @@ int      DistTablesDone;                /* 0x18CBEF0 */
    other 511. */
 int      MatchCost[512];               /* 0x412678 */
 int      MatchLimit;                   /* 0x412668 */
-int      HashHead[4096];                /* 0x412EC0, used as shorts */
-int      DistSlot[32768];               /* 0x41CEC8, used as shorts */
+unsigned short HashHead[4096];         /* 0x412EC0: the original is word_412EC0 */
+unsigned short DistSlot[32768];        /* 0x41CEC8: the original is word_41CEC8 */
 int      MatchArea[0x8000];             /* 0x6B4968, the LZ work area */
 
 /* the /b block list, 0x42F364: five fields per block record */

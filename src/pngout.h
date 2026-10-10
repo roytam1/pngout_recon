@@ -466,8 +466,8 @@ extern int      LenHuffIndex, LenHuffCount, DistTablesDone;
  */
 #define CurMatch     MatchCost[0]     /* 0x412678 */
 #define HashPrev     (MatchCost + 1)  /* 0x41267C, 511 entries */
-extern int      HashHead[4096];  /* 0x412EC0, used as shorts */
-extern int      DistSlot[32768]; /* 0x41CEC8, used as shorts */
+extern unsigned short HashHead[4096];  /* 0x412EC0: word, not dword */
+extern unsigned short DistSlot[32768]; /* 0x41CEC8: word, not dword */
 extern int      MatchArea[0x8000];   /* 0x6B4968 */
 
 extern int      Entropy[256];        /* dword_42E560, the trial histogram */
@@ -679,6 +679,9 @@ extern int      BestCost[256];        /* dword_6D5170 */
 int  LzCode(const unsigned char *data, int len);
 /* LzCode(0, 0): flush the coder, which is what loc_4075B0's step 1 is */
 void FlushLzCoder(void);
+#ifdef LZSTATS
+extern unsigned __int64 LzStatChain, LzStatXtreme, LzStatPos, LzStatEmit;
+#endif
 
 
 /* sub_407D80: filter one image byte and hand it to the trial''s sink */

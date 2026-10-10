@@ -950,25 +950,36 @@ static int RunRowLoop(int filtermode, void (*feedrow)(unsigned char *))
  *  a block, into the contiguous array the trial records are built from.
  *
  *  The bytes come from dword_42EE68, which is the row record's symbol stream at
- *  +0x510 - *not* the record's first field.  The copy loop reads one byte per
- *  dword and steps the record by its 0xA18 stride, so it takes dwords 0 .. 79 of
- *  that field.
+ *  +0x510 - *not* the record's first field.  The copy loop packs the low byte
+ *  out of 320 consecutive dwords (`mov dl, [ecx]` / `add ecx, 4` at `0x403A70`
+ *  and `0x404110`) and steps records by 0xA18; the restore expands 320 bytes
+ *  back into 320 dwords (`mov dl, [eax]` / `mov [ecx-4], edx` at `0x404990`
+ *  and `0x404B07`).  A plain 320-byte memcpy takes the wrong slots: every
+ *  byte of the first 80 dwords instead of the low byte of each of the 320.
  */
 static void SnapshotRowFilters(void)
 {
-    int b, n = RowCount;
+    int b, k, n = RowCount;
 
-    for (b = 0; b < n; b++)
-        memcpy(RowFilters + b * 320, ROWOF(b, ROW_SYMBOLS), 320);
+    for (b = 0; b < n; b++) {
+        unsigned char *syms = (unsigned char *)ROWOF(b, ROW_SYMBOLS);
+
+        for (k = 0; k < 320; k++)
+            RowFilters[b * 320 + k] = syms[k * 4];
+    }
 }
 
 /* and put a saved copy back, which is how a losing trial is undone */
 static void RestoreRowFilters(void)
 {
-    int b, n = RowCount;
+    int b, k, n = RowCount;
 
-    for (b = 0; b < n; b++)
-        memcpy(ROWOF(b, ROW_SYMBOLS), BestRowFilters + b * 320, 320);
+    for (b = 0; b < n; b++) {
+        int *syms = ROWOF(b, ROW_SYMBOLS);
+
+        for (k = 0; k < 320; k++)
+            syms[k] = BestRowFilters[b * 320 + k];
+    }
 }
 
 /*
@@ -1368,6 +1379,27 @@ int Optimize(SETTINGS *s)
         trial = Image->trial;
         if (trial <= 0)
             continue;                   /* the collecting pass just finished */
+#ifdef LZSTATS
+        {
+            static LARGE_INTEGER tfreq, tprev, tnow;
+
+            if (tfreq.QuadPart == 0) {
+                QueryPerformanceFrequency(&tfreq);
+                tprev = StartCount;
+            }
+            QueryPerformanceCounter(&tnow);
+            fprintf(stderr,
+                    "[lz] trial=%d %.1fs OutCount=%d RowCost=%d "
+                    "pos=%I64u chain=%I64u xtreme=%I64u matchcount=%d\n",
+                    trial,
+                    (double)(tnow.QuadPart - tprev.QuadPart) /
+                        (double)tfreq.QuadPart,
+                    OutCount, RowCost, LzStatPos, LzStatChain, LzStatXtreme,
+                    MatchCount);
+            tprev = tnow;
+            LzStatPos = LzStatChain = LzStatXtreme = 0;
+        }
+#endif
 
         if (HaveBestTrial)
             break;
@@ -1390,6 +1422,32 @@ int Optimize(SETTINGS *s)
             TrialFingerprint(trial, 320 * NumBlockList);
 
             /*
+             *  0x4076E6: the per-trial line the original prints while it is
+             *  still searching.  `Out:%8d` then, while `dword_180BA80` (a
+             *  winner has been chosen) is clear and `dword_18CBEEC` is
+             *  positive, the running figure `.%1d=%7d.%1d`: the trial number,
+             *  the size *so far* - `dword_185BECC - dword_18CBEEC >> 3` - and
+             *  the cost the rebuilds have saved, `/ 0x7D` twice over.  Both
+             *  divisions are the `imul 51EB851Fh / sar 5 / shr 31 / add`
+             *  sequence at `0x407741`, i.e. division by 125 rounded to zero.
+             */
+            if (Image->verbose == 0)
+                ProgressMsg("\r");
+            ProgressMsg("Out:%8d", OutCount);
+            if (!HaveBestTrial && RowCost > 0) {
+                int saved = RowCost / 125;
+                int whole = saved / 125;
+                int frac = saved - whole * 125;
+
+                ProgressMsg(".%1d=%7d.%1d", trial & 7,
+                            (OutCount - (RowCost >> 3)) - OutCount, frac);
+            } else {
+                ProgressMsg(" bytes               ");
+            }
+            if (Image->verbose)
+                ProgressMsg("\n");
+
+            /*
              *  Has this trial reproduced an earlier one?  Scanning backwards is
              *  what makes the *most recent* repeat the one that ends the search:
              *  a repeat of something far back means the search has been cycling.
@@ -1405,6 +1463,13 @@ int Optimize(SETTINGS *s)
             if (found >= 0) {
                 if (TrialSizes[trial] <= BestTrialSize)
                     break;              /* converged, and not an improvement */
+                /*
+                 *  Worse than the best: put the best filters and palette back
+                 *  and run once more to regenerate the best bytes (`jmp
+                 *  loc_404B1E`, which restores, sets HaveBestTrial and loops
+                 *  back to `loc_4036D0`); the head check above then ends the
+                 *  search.  Breaking here would keep the worse trial's bytes.
+                 */
                 if (NumBlockList > 0)
                     RestoreRowFilters();
                 memcpy(unk_180B578, BestPalette, 0x400);
@@ -1414,15 +1479,17 @@ int Optimize(SETTINGS *s)
             /*
              *  RowCost of zero means the row records never produced a cost, so
              *  there is nothing to compare and the first trial is taken as it
-             *  stands.
+             *  stands: a better-or-equal size finishes (`jle loc_404B60), a
+             *  worse one regenerates the best the same way as above.
              */
             if (OutCount > BestTrialSize) {
                 if (NumBlockList > 0)
                     RestoreRowFilters();
                 memcpy(unk_180B578, BestPalette, 0x400);
                 HaveBestTrial = 1;
+            } else {
+                break;
             }
-            break;
         }
 
         if (CheckEscHook(0)) {
@@ -1453,8 +1520,16 @@ int Optimize(SETTINGS *s)
     }
 
 finished:
-    if (Image->verbose) {
-        LARGE_INTEGER now;
+#ifdef LZSTATS
+    fprintf(stderr,
+            "[lz] pos=%I64u chain=%I64u xtreme=%I64u  pos/call=%.2f "
+            "chain/pos=%.2f xtreme/pos=%.2f\n",
+            LzStatPos, LzStatChain, LzStatXtreme,
+            (double)LzStatPos, (double)LzStatChain / (double)(LzStatPos + 1),
+            (double)LzStatXtreme / (double)(LzStatPos + 1));
+    LzStatPos = LzStatChain = LzStatXtreme = 0;
+#endif
+    if (Image->verbose) {        LARGE_INTEGER now;
 
         QueryPerformanceCounter(&now);
         ProgressMsg("Took %.3f sec.\n",

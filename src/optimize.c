@@ -18,6 +18,7 @@
 
 #include <math.h>
 #include <string.h>
+#include <stdlib.h>
 
 #include "pngout.h"
 
@@ -2040,10 +2041,12 @@ unsigned int Adler32Update(unsigned int sum, int byte)
  *  row needs, drop the "locked" bit the encoder sets on the samples it wants
  *  to keep in the next code, rebuild the literal/length and distance code
  *  lengths from the samples, and copy the result back into the record.  The
- *  running cost is the sum, over every sample, of how far its code length
- *  moved times how often the symbol occurred - which is the whole point of
- *  trying one filter at a time: a row whose samples need longer codes makes
- *  the cost go up and the trial lose.
+ *  running cost is the sum, over every sample, of how many bits the rebuild
+ *  saved times how often the symbol occurred - `(old length - new length) x
+ *  frequency`, so a positive cost means the code got better and the trial
+ *  loop (`RowCost > 0` at `0x404957`) keeps searching.  That sign is
+ *  load-bearing: read as `(new - old)` every trial ends the search after the
+ *  first one, and the build emits trial-0-grade compression forever.
  *
  *  The code lengths are built into a 320 entry scratch mirror of the sample
  *  array first, 286 entries from the literal/length samples and 30 more at
@@ -2071,7 +2074,7 @@ int AdvanceRow(void)
                      LensScratch + (ROW_DISTFREQ - ROW_SAMPLES), 16);
 
     for (i = 0; i < ROW_SAMPLE_MAX; i++) {
-        total += (LensScratch[i] - lens[i]) * samples[i];
+        total += (lens[i] - LensScratch[i]) * samples[i];
         lens[i] = LensScratch[i];
     }
     RowCost = total;
@@ -2145,6 +2148,32 @@ void FinishBlock(void)
         unsigned char *c = (unsigned char *)Image->chunks[i];
 
         EmitBytes(c, Swap32(*(unsigned int *)c) + 12);
+    }
+
+    /*
+     *  IEND, and the free of the LZ work area that follows it.  The three
+     *  dwords are staged in Scratch and written whole
+     *  (`push 0Ch / push offset dword_412E78` then `mov dword_412E78, 0`,
+     *  `444E4549h`, `826042AEh`, then `call sub_4052D0` at `0x407679`), so
+     *  the length, the tag and the CRC go out in one EmitBytes().  The
+     *  compressed path had no IEND at all: every small round trip still
+     *  passed because zlib stops at the end of the IDAT and never looks
+     *  past it, and only a large file - where the IDAT is one chunk rather
+     *  than several - shows the missing twelve bytes at the end.
+     */
+    memset(Scratch, 0, 4);
+    memcpy(Scratch + 4, "IEND", 4);
+    {
+        /* the CRC of "IEND", the constant the original stores: AE 42 60 82 */
+        static const unsigned char iend_crc[4] = { 0xAE, 0x42, 0x60, 0x82 };
+
+        memcpy(Scratch + 8, iend_crc, 4);
+    }
+    EmitBytes(Scratch, 12);
+
+    if (LinBuf != NULL) {
+        free(LinBuf);
+        LinBuf = NULL;
     }
 }
 
