@@ -3688,20 +3688,51 @@ With all four, the reconstruction is **1,598,722 bytes against the original's
 1,598,860** on that photograph (138 bytes *smaller*), and the two agree
 byte-for-byte on a 640x480 one.
 
-**Open: it is about 7x slower than the original** (858s against 144s on that
-photograph). The work is deterministic and identical on every trial - 24.84M
-positions, 6.84G hash-chain steps (275 per position) and 4.56G `LzXtreme`
-iterations (183 per position) - but trial 1 takes 27s and trials 2 onwards
-261s each. The step is `dword_180BA84`, the step-table cursor: it grows
-2.2M -> 4.1M -> 6.1M -> 8.0M entries as the codes improve, so the 16 MB
-step table goes from ~4 MB touched (L3) to fully touched, and every
-`LzXtreme` iteration does one random `StepTable[MatchStart[q] + len]` read.
-4.56G reads at DRAM latency accounts for the 261s almost exactly. Since the
-loop body, the chain walk, the hash and the per-trial `sub_4058A0` reset have
-all been checked instruction by instruction against the listing and against
-the call graph (`sub_405150` calls `sub_4058A0` once, as here), what is left is
-to find why the original's cursor grows far more slowly - the one region not
-yet compared line by line is the stepping and retry at `0x406A78`-`0x406B9A`.
+**Open: it is about 6x slower than the original** (858s against 144s on that
+photograph). This is *not* an algorithmic difference: on an image small enough
+to run quickly, the two binaries emit **byte-identical IDAT streams**, so the
+coder does exactly the same work. Instrumenting the coder (`LZSTATS`) shows
+the work is deterministic and identical on every trial - 24.84M positions, 6.84G
+hash-chain steps (275 per position) and 4.56G `LzXtreme` iterations (183 per
+position) - but trial 1 takes 27s and trials 2 onwards 261s each. The step is
+`dword_180BA84`, the step-table cursor: it grows 2.2M -> 4.1M -> 6.1M -> 8.0M
+entries as the codes improve, so the 16 MB step table goes from ~4 MB touched
+(L3) to fully touched, and every `LzXtreme` iteration does one random
+`StepTable[MatchStart[q] + len]` read. 4.56G reads at DRAM latency accounts
+for the 261s almost exactly.
+
+Ruled out by measurement rather than by reading: clearing `BestCost` per trial
+left the instruction counters bit-identical, and so did narrowing the hash
+tables to the original's 16 bits; the stepping and retry at
+`0x406A78`-`0x406B9A` matches the listing and Hex-Rays; and the per-trial
+`sub_4058A0` reset is confirmed by the call graph (`sub_405150` calls it once,
+as here). What is left is why the original's cursor grows more slowly, which
+needs a differential trace of the step table rather than a reading of it.
+
+
+**Settled: the residual 1-3 byte differences are tie-break noise, not a
+quality gap.** On a 256x256 case the two outputs differ by one byte, and the
+symbol streams are *identical* - 196,859 symbols, same lengths, same distances,
+same output positions - so the search is exact and only the Huffman *tree*
+differs: 18 of the 259 literal/length code lengths, every difference a +-1
+swap between two symbols. Both trees are complete (Kraft sum exactly 1), both
+peak at 15, and both have the same unweighted length total (2,269), so they
+are equally optimal; weighting them by the stream's own frequencies the
+original's tree costs 1,003,444 bits and ours 1,003,453 - nine bits, or
+0.0009%. That is why the difference is sometimes a byte larger and sometimes
+smaller: the big photograph comes out 138 bytes *under* the original.
+
+Every instruction of that path was compared against the reference and matches:
+`sub_404DA0`'s frequency setup (`0x7FFFFFFF` for an unused symbol,
+`(v24 + v7) >> i`), the tree bounds `v8 = v5 + a2 - 2`, the depth pass, the
+back-to-front length emission, the canonicalise block at `0x406AC9`
+(`6D5158h + len*4` is `BestCost[len-6]`, stepping -3, then `BestCost[len-4]`
+stepping -1), `sub_405020`, `sub_405050`'s `jle` (strict `>` to keep sifting)
+and `sub_4050C0`'s `setl` (strict `<`, so a tie takes the left child), and the
+heap layout - root `Heap[1]`, children `Heap[2s]`/`Heap[2s+1]`. `dword_42D7C4`
+in `sub_405020` is written once and never read anywhere in the listing, so it
+is dead. Byte-identical output would need a differential trace of the tree
+itself rather than a reading of it.
 
 `tools\pngcheck.cmd` found eleven. All are fixed; the round trip is clean over
 all 30 cases. The last four were found together and are worth reading together,
