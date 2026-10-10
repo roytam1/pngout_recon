@@ -1404,6 +1404,45 @@ int Optimize(SETTINGS *s)
         if (HaveBestTrial)
             break;
 
+        /*
+         *  0x4076E6, in `sub_4071D0`'s tail: the per-trial line the original
+         *  prints while it is still searching, in three messages rather than
+         *  one:
+         *
+         *      Out:%8d          OutCount
+         *      %7d             -(RowCost >> 3)
+         *      .%1d=%7d.%1d    ((-RowCost) & 7) * 5 / 4,
+         *                         (OutCount * 8 - RowCost) >> 3,
+         *                         (RowCost & 7) * 5 / 4
+         *
+         *  The two single digits come out of the two `imul 7Dh` "divisions" at
+         *  `0x407741` and `0x407762`, which are not divisions at all: `imul
+         *  0x51EB851F` then `sar edx,5` is a shift by 37, and 0x51EB851F / 2^37
+         *  is 1.25, so each is a multiply by 5/4 of a value already reduced
+         *  mod 8 - which is why a digit can come out as 8.  All three fields
+         *  were checked against the original's own output on four trials of
+         *  the 2296x3606 photograph and reproduce exactly.
+         *
+         *  A finished search - `dword_180BA80` set, or `dword_18CBEEC` no
+         *  longer positive (`0x407702`, `0x4076FC`) - prints " bytes" instead
+         *  of the two trailing fields, so the line is emitted on *every* pass,
+         *  which is why this sits outside the `RowCost > 0` arm.
+         */
+        if (Image->verbose == 0)
+            ProgressMsg("\r");
+        ProgressMsg("Out:%8d", OutCount);
+        if (!HaveBestTrial && RowCost > 0) {
+            ProgressMsg("%7d", -(RowCost >> 3));
+            ProgressMsg(".%1d=%7d.%1d",
+                        ((-RowCost) & 7) * 5 / 4,
+                        (OutCount * 8 - RowCost) >> 3,
+                        (RowCost & 7) * 5 / 4);
+        } else {
+            ProgressMsg(" bytes               ");
+        }
+        if (Image->verbose)
+            ProgressMsg("\n");
+
         if (RowCost > 0) {
             int found = -1;
 
@@ -1420,32 +1459,6 @@ int Optimize(SETTINGS *s)
             }
 
             TrialFingerprint(trial, 320 * NumBlockList);
-
-            /*
-             *  0x4076E6: the per-trial line the original prints while it is
-             *  still searching.  `Out:%8d` then, while `dword_180BA80` (a
-             *  winner has been chosen) is clear and `dword_18CBEEC` is
-             *  positive, the running figure `.%1d=%7d.%1d`: the trial number,
-             *  the size *so far* - `dword_185BECC - dword_18CBEEC >> 3` - and
-             *  the cost the rebuilds have saved, `/ 0x7D` twice over.  Both
-             *  divisions are the `imul 51EB851Fh / sar 5 / shr 31 / add`
-             *  sequence at `0x407741`, i.e. division by 125 rounded to zero.
-             */
-            if (Image->verbose == 0)
-                ProgressMsg("\r");
-            ProgressMsg("Out:%8d", OutCount);
-            if (!HaveBestTrial && RowCost > 0) {
-                int saved = RowCost / 125;
-                int whole = saved / 125;
-                int frac = saved - whole * 125;
-
-                ProgressMsg(".%1d=%7d.%1d", trial & 7,
-                            (OutCount - (RowCost >> 3)) - OutCount, frac);
-            } else {
-                ProgressMsg(" bytes               ");
-            }
-            if (Image->verbose)
-                ProgressMsg("\n");
 
             /*
              *  Has this trial reproduced an earlier one?  Scanning backwards is
