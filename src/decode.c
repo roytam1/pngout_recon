@@ -2641,7 +2641,7 @@ static void JpegDQT(int tq, int prec, const unsigned char *data)
 
     for (k = 0; k < 64; k++) {
         unsigned v;
-        u64 scaled;
+        unsigned s;
         int zz = JpegZigzag[k];
 
         if (!prec) {
@@ -2649,12 +2649,16 @@ static void JpegDQT(int tq, int prec, const unsigned char *data)
         } else {
             v = ((unsigned)data[2 * k] << 8) | data[2 * k + 1];
         }
-        scaled = (u64)v << 19;
+        /* `40B5F8-40B63F`: `shl eax,13h` is a 32-bit shift, and the running
+         * value lives in the dword `var_1B0` between the two axis scalings,
+         * so each `shrd eax,edx,18h` truncates its 64-bit product back to 32
+         * bits before the next axis reads it. */
+        s = v << 19;
         if (zz & 7)
-            scaled = ((u64)(unsigned)JpegScale[zz & 7] * scaled) >> 24;
+            s = (unsigned)(((u64)(unsigned)JpegScale[zz & 7] * (u64)s) >> 24);
         if (zz >> 3)
-            scaled = ((u64)(unsigned)JpegScale[zz >> 3] * scaled) >> 24;
-        JpegQuant[tq][zz] = (int)scaled;
+            s = (unsigned)(((u64)(unsigned)JpegScale[zz >> 3] * (u64)s) >> 24);
+        JpegQuant[tq][zz] = (int)s;
     }
 }
 

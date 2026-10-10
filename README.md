@@ -2606,6 +2606,68 @@ single-component file (561 MCUs) the old code refused outright. A
 single-component file carrying subsampling factors (grey with 2x2, as some
 encoders write) takes the subsampled output path with neutral chroma.
 
+#### Open: 16-bit DQT (`prec=1`) values ≳250 combined with a nonzero AC
+
+Hand-crafted files whose quantiser entries are encoded as 16-bit with values
+above ~250 diverge from the original; everything below that is bit-exact.
+Measured, with the originals regenerated to be sure the fixtures exist:
+
+| file | shape | quant table | C vs original |
+| --- | --- | --- | --- |
+| `nidc16small.jpg` | 16x16 grey progressive, DC + AC | `prec=1`, values ≤ 255 | 0 / 256 |
+| `nidc16.jpg` | same | `prec=1`, `STD_Q+256` | 32 / 256 |
+| `varA_dc.jpg` | DC only | `prec=1`, `STD_Q+256` | 0 / 256 |
+| `varB_smallac.jpg` | DC + AC of ±1 | `prec=1`, `STD_Q+256` | 40 / 256 |
+| `base16.jpg` | baseline SOF0 | `prec=1`, large | 3 / 256 |
+| `varB_seq_big.jpg` | baseline 16x16, DC 11/6/13/12 + AC ±1 | `prec=1`, `STD_Q+256` | 40 / 256 |
+| `varB_seq_small.jpg` | identical coefficients | `prec=0`, `STD_Q` | 0 / 256 |
+
+What is established:
+
+- **It is not the progressive merge.** `varB_seq_big.jpg` is a single-scan
+  baseline SOF0 file with the same coefficients and the same 40-pixel
+  signature, so the entropy/merge layer is not involved.
+- **It is not 16-bit DQT parsing.** The same 16-bit *encoding* with values
+  ≤ 255 is bit-exact (`nidc16small`), and raising the high byte on the DC
+  alone, or the AC alone, is also bit-exact. Both must be raised together.
+- **It is not DC-only transfer.** `varA_dc.jpg` and the DC-only sweep over
+  D/Q values up to 1000 are exact; an AC coefficient is required.
+- **It is not IDCT overflow.** For the diverging blocks the dequantised
+  coefficients are ~1.7e9 and ~1.9e8, and every IDCT intermediate stays inside
+  `int` range. Re-running the IDCT with wrap-around, saturation and full
+  64-bit intermediates produces byte-identical output in all three modes.
+- **The IDCT is a faithful transcription.** `sub_40C790` was re-read
+  instruction by instruction (`40C7A5-40CA60`), including the multiply-high
+  (`imul [mem]` → `edx`, which matches `(unsigned __int64)(K * diff) >> 32`
+  because both take the high half of the same two's-complement product), the
+  `shl eax,2` / `lea [eax*4]` scaling, and the *association order* of the
+  multi-term sums, which the decompiler's C had normalised
+  (`((e1-e3)-e7)+e5` in the original versus `(e5+e1)-e3-e7` in `JpegIdct`).
+  A register-for-register Python transcription using the original's
+  associations reproduces C's pixels exactly, so that difference is not it
+  either - it is invisible here only because nothing overflows.
+- **DQT scaling and dequantisation match the listing.** `40B5F8-40B63F`
+  (`shl eax,13h`; `imul [var_1B8]`; `shrd eax,edx,18h` per axis) is what
+  `JpegDQT` does, and the output dequant loop at `40C081` is a 32-bit
+  `imul` whose low half is what `(int)(__int64)dq` keeps.
+
+The visible effect is a linear luma ramp whose 448-entry boundary in the
+`T0/T1/T2` colour tables lands one pixel away from the original's, i.e. the
+two builds disagree on IDCT outputs of order 2e9.
+
+One real fidelity gap found during this audit *has* been closed: the original
+keeps the DQT scaling intermediate in the dword `var_1B0` and its `shl eax,13h`
+is a 32-bit shift, whereas `JpegDQT` carried `scaled` as `u64` throughout.
+`JpegDQT` now truncates to `unsigned` after each axis, matching
+`40B5F8-40B63F` exactly. That only bites for 16-bit DQT values above ~4096
+(where `v << 19` itself wraps) or when a scaled axis product reaches 2^56, so
+it is invisible on the whole corpus — but it was wrong, and the corpus is
+unchanged by the fix.
+
+Practical impact is nil: libjpeg and ImageMagick emit 8-bit DQT with values
+≤ 255, so no encoder in the corpus reaches this regime. All 33 sequential,
+34 ImageMagick and 17 progressive fuzz files remain bit-exact.
+
 #### Linear `v4` fails at MCU boundaries; per-MCU bases required
 
 Row 0 (single MCU in `x`) fits linear tables to worst 3; row 1 spanning three
