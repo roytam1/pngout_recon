@@ -117,6 +117,25 @@ listing line counts, which is how the remaining work gets sized.
 | `0x408690` `sub_408690` | `PutByte()` | `src/optimize.c` |
 | `0x4086B0` `sub_4086B0` | `InitProgressScale()` | `src/optimize.c` |
 | `0x402AD0` `sub_402AD0` | `Optimize()` | `src/trials.c` |
+| `0x409560` `sub_409560` | `DecodeImage()` | `src/decode.c` |
+| `0x40A340` `sub_40A340` | `Pump()` + bit reader | `src/decode.c` |
+| `0x40A440` `sub_40A440` | `DecodeSymbol()` | `src/decode.c` |
+| `0x40A4A0` `sub_40A4A0` | `BuildDecodeTables()` | `src/decode.c` |
+| `0x40A580` `sub_40A580` | `BuildHuffmanOffsets()` | `src/decode.c` |
+| `0x40A8D0` `sub_40A8D0` | `Unfilter()` + `ExpandRow()` | `src/decode.c` |
+| `0x40AF90` `sub_40AF90` | length/distance tables (as `LenBase`/`DistBase`) | `src/decode.c` |
+| `0x40B180` `sub_40B180` | `DecodeJpeg()` | `src/decode.c` |
+| `0x40C580` `sub_40C580` | one-time init (zigzag, IDCT basis, `T0`-`T2`, colour tables) | `src/decode.c` |
+| `0x40C700` `sub_40C700` | `JpegHuffSlow()` | `src/decode.c` |
+| `0x40C790` `sub_40C790` | `JpegIdct()` | `src/decode.c` |
+| `0x408D80` `sub_408D80` | `JpegOutput444()` + `JpegOutputSub()` | `src/decode.c` |
+| `0x40CA70` `sub_40CA70` | `DecodeGif()` | `src/decode.c` |
+| `0x40D150` `loc_40D150` | `DecodePal8()` | `src/decode.c` |
+| `0x40D250` `sub_40D250` | `DecodeTarga()` | `src/decode.c` |
+| `0x40D560` `sub_40D560` | `DecodeBmp()` | `src/decode.c` |
+| `0x40DAC0` `sub_40DAC0` | `DecodePcx()` | `src/decode.c` |
+| `0x40DD80` `sub_40DD80` | `DecodeDds()` | `src/decode.c` |
+| `0x405800` `sub_405800` | `RankValues()` | `src/optimize.c` |
 | `0x40E584` `UserMathErrorFunction` | `_UserMathErrorFunction()` | `src/stubs.c` |
 | `0x40AF40` `sub_40AF40` | `FilterPredict()` | `src/predict.c` |
 | `.data` initialised part | 22 globals + `BitTable[64]` | `src/globals.c` |
@@ -129,19 +148,19 @@ splitting modes. See **Verification so far**.
 
 ### Not yet reconstructed
 
-`src/stubs.c` aborts loudly for the one that is left, so a build can never
-silently produce a wrong PNG.
-
-| original | name | size | what it does |
-|---|---|---|---|
-| `0x409560` | `DecodeImage()` | 4 353 B | dispatches to the PNG/JPEG/GIF/BMP/PCX/DDS/TGA decoders and publishes `OutColType`, `OutBitDepth`, `NumBlocks`, `dword_190A420[]`, `unk_190A820` |
+Nothing decodable: all eight `DecodeImage()` paths are transcribed in
+`src/decode.c` (see **DecodeImage (0x409560): how it fits together** and
+**Still to do inside DecodeImage** for the deliberate refusals). `src/stubs.c`
+keeps only `_UserMathErrorFunction()`, the MSVC math-error handler the
+startup picks up by name.
 
 The inflate inside it is verified byte for byte against `zlib`, and `src/decode.c`
 implements the PNG path - chunk walk, bit reader and pump, Huffman, inflate,
 unfilter and row expansion - for colour types 0, 2, 3, 4 and 6 at bit depths 1,
-2, 4 and 8, plus the 8bpp palettised, GIF, BMP, PCX and Targa decoders.
-Interlaced PNG input is refused rather than guessed at, and JPEG and DDS are not
-written yet, so a build reports those two as unimplemented rather than guessing.
+2, 4 and 8, plus the JPEG (sequential with and without restart, progressive),
+8bpp palettised, GIF, BMP, PCX, DDS and Targa decoders.
+Interlaced PNG input is refused rather than guessed at, as are JPEG subset
+scans, DRI+progressive and exotic sampling.
 
 ## Optimize (0x402AD0): how it fits together
 
@@ -2606,11 +2625,27 @@ single-component file (561 MCUs) the old code refused outright. A
 single-component file carrying subsampling factors (grey with 2x2, as some
 encoders write) takes the subsampled output path with neutral chroma.
 
-#### Open: 16-bit DQT (`prec=1`) values ≳250 combined with a nonzero AC
+#### Fixed: 16-bit DQT (`prec=1`) T0 flat-top boundary misread 448 for 512
 
 Hand-crafted files whose quantiser entries are encoded as 16-bit with values
-above ~250 diverge from the original; everything below that is bit-exact.
-Measured, with the originals regenerated to be sure the fixtures exist:
+above ~250 diverged from the original; everything below that was bit-exact.
+Root cause, found by reproducing with an 8x8 single-block grey file (DC=15,
+no AC, `STD_Q+256`): the colour index lands at 510, which the old `JpegMakeT`
+put in the black region and the original puts on the flat-white top. The two
+`rep stosd` fills were read with the wrong base for the second one:
+`unk_18DFA88` is `0x18DF888 + 0x200` (index 128) but `unk_18E0088` is
+`0x18DF888 + 0x800` (index 512, not 448), each `0x180` = 384 dwords, so the
+fills are `T0[128..511] = 0xFF` and `T0[512..895] = 0` with no overlap -
+not `128..447` / `448..831`. `JpegMakeT` now uses 512 and the witness file
+decodes all-white, matching the original and the standard; a small-Q
+control (same DC, normal table) gives grey 158 either way. Pinned by the
+`largeq` case in `tools\decodetest.py --jpeg` (8x8 grey DC15: q16 white,
+q8 grey 158; DC7 with Q=584/586 pins the flip itself, index 511 white
+against 512 black - the standard clips both to white, so the black side
+pins listing fidelity, not the standard).
+
+Measured, with the originals regenerated to be sure the fixtures exist
+(history: every entry below diverged only through indices `448..511`):
 
 | file | shape | quant table | C vs original |
 | --- | --- | --- | --- |
@@ -2638,9 +2673,10 @@ What is established (corrected and extended after deeper probing):
   original white on all 256 pixels. DC=11/12/13 with no AC are exact (all
   white either way), and a DC-only sweep to Q=1000 is exact.
 - **It is the colour-index bucket, not the path.** The divergence happens
-  exactly when C's colour index `(Y + tables) >> 22` lands in `[448, 896)`
-  (the `T0 = 0` black region): there C emits black and the original emits
-  white. When the index lands in `[127, 448)` (white), `[0, 128)` (linear
+  exactly when C's colour index `(Y + tables) >> 22` lands in `[512, 896)`
+  (the `T0 = 0` black region): there the old code emitted black and the
+  original emits white for indices `448..511`. When the index lands in
+  `[128, 512)` (white), `[0, 128)` (linear
   ramp) or `[896, 1024)` (upper ramp), the builds agree — including
   informative greys at index 952 and 1020 (DC=28/30, exact) and full ramps
   with DC=0 + AC of any size 1..4 (exact).
@@ -2657,7 +2693,7 @@ What is established (corrected and extended after deeper probing):
 - **Large AC coincides again.** With DC=13, encoded AC 8 and 12 match fully
   (including wrapped informative pixels); AC 16 diverges again. So it is not
   a monotone AC-magnitude effect — it is whatever puts the index in or out
-  of `[448, 896)`.
+  of `[512, 896)`.
 - **DQT scaling and dequantisation match the listing.** `40B5F8-40B63F`
   (`shl eax,13h`; `imul [var_1B8]`; `shrd eax,edx,18h` per axis) is what
   `JpegDQT` does, and the output dequant loop at `40C081` is a 32-bit
@@ -2665,11 +2701,12 @@ What is established (corrected and extended after deeper probing):
   was read back exactly (142606336) from DC=1/2 outputs.
 
 In short: for identical coefficients, tables, IDCT arithmetic and colour
-tables, the original's effective `Y` (IDCT output) must differ from C's
-exactly when C's index would fall in `[448, 896)`. No stage checked so far
-(Huffman/extend, DQT parse/scale, dequant multiply, IDCT ops and order,
-colour tables/index) contains a value-dependent branch that explains it;
-the output function (`sub_408D80`) has no clamps, only shifts and bounds.
+tables, the old code's index fell in `[448, 896)` while the original's
+effective white top extends down to 448 - because the white fill really runs
+to 511. No stage (Huffman/extend, DQT parse/scale, dequant multiply, IDCT ops
+and order, colour tables/index) contains a value-dependent branch; the output
+function (`sub_408D80`) has no clamps, only shifts and bounds. The only wrong
+number was the fill boundary in `JpegMakeT`, and it is fixed.
 
 One real fidelity gap found during this audit *has* been closed: the original
 keeps the DQT scaling intermediate in the dword `var_1B0` and its `shl eax,13h`
@@ -2681,8 +2718,9 @@ it is invisible on the whole corpus — but it was wrong, and the corpus is
 unchanged by the fix.
 
 Practical impact is nil: libjpeg and ImageMagick emit 8-bit DQT with values
-≤ 255, so no encoder in the corpus reaches this regime. All 33 sequential,
-34 ImageMagick and 17 progressive fuzz files remain bit-exact.
+≤ 255, so no encoder in the corpus reaches this regime. All 34 sequential,
+35 ImageMagick and 17 progressive fuzz files remain bit-exact, and the
+`largeq` regression case in `--jpeg` pins the boundary.
 
 #### Linear `v4` fails at MCU boundaries; per-MCU bases required
 
@@ -3343,10 +3381,12 @@ G sums two tables, R and B one each - `decode.c` had it rotated and is
 corrected (`s = T2[i0]+T1[i1]+T0[i2]`).
 
 The white mechanism is the `rep stosd` pair this record already lists
-(`40C625/40C636`) but never connected: `T0[128..447] = 0xFF`,
-`T0[448..831] = 0` (T1/T2 derive verbatim at `40C665`), so near-white
+(`40C625/40C636`) but never connected: `T0[128..511] = 0xFF`,
+`T0[512..895] = 0` (T1/T2 derive verbatim at `40C665`), so near-white
 sums land on a flat 255 top instead of the dead zone. Black sits at
-idx 891 as before.
+idx 891 as before. (An earlier revision of this file said `128..447` and
+`448..831`: `0x18E0088 - 0x18DF888` is `0x800`, i.e. index 512, not 448 -
+see the 16-bit DQT record below, which is what caught it.)
 
 Open listing question (values unaffected - bit-exact either way): the Cb
 consumers sit at build `+0x1000` (pair 512) while Cr consumers sit at
@@ -3436,23 +3476,18 @@ formulas rather than against itself.
 
 The chunk walk, the bit reader and its pump, the three Huffman helpers, the
 inflate body, the unfilter and the row expansion are all transcribed and
-verified pixel for pixel. What is left:
+verified pixel for pixel, and so are all eight format decoders: PNG
+(`loc_409680`), JPEG (`sub_40B180`: sequential with and without restart, plus
+progressive), GIF (`sub_40CA70`), the 8bpp palettised format (`loc_40D150`),
+BMP (`sub_40D560`), PCX (`sub_40DAC0`), DDS (`sub_40DD80`) and Targa
+(`sub_40D250`). What is left is deliberate refusal rather than guessing:
 
 * `sub_40A630`, the Adam7 path. Interlaced input is refused rather than guessed
   at, because the pass table it reads is not a partition of the image and so
   could not be checked against anything - see **The Adam7 tables** above.
-* The other two decoders — JPEG and DDS — and re-declaring the 22 MB of
-  `.bss` they use. Seven of the eight input formats are transcribed now: PNG, the
-  8bpp palettised one, GIF, PCX, Targa, BMP and DDS. The one left, measured:
-
-  | original | listing lines | bytes | note |
-  |---|---|---|---|
-  | `0x40B180` JPEG | 3 491 | 5 058 | front end read, above; entropy body blocked on two reference gaps |
-
-  The corpus exists - `tools/jpeglib.py`, 33 cases, plus a progressive file -
-  and the IDCT, the Huffman reader, the progressive refinement and the colour
-  conversion are all read. What is missing is eight dwords at `0x4110D8` and
-  the writer of two `.bss` arrays; see the JPEG section.
+* JPEG subset scans (a scan naming fewer components than the frame),
+  DRI+progressive (the original never allocates its merge buffer there) and
+  exotic sampling the output paths decline refuse cleanly with -1.
 
 ## Verification so far
 
@@ -3480,15 +3515,18 @@ python tools\decodetest.py --bmp        BMP, 6 cases
 python tools\decodetest.py --bmp-roundtrip   the same six through pngout.exe
 python tools\decodetest.py --gif        GIF, 12 cases
 python tools\decodetest.py --gif-roundtrip   the same twelve through pngout.exe
-python tools\decodetest.py --jpeg       JPEG, 33 cases (see below)
-python tools\decodetest.py --jpeg-im    the same 33 through ImageMagick,
+python tools\decodetest.py --jpeg       JPEG, 34 cases (see below)
+python tools\decodetest.py --jpeg-im    the same 34 through ImageMagick,
                                     plus a progressive file it generates
 python tools\decodetest.py --dds        DDS, 8 cases
 python tools\decodetest.py --dds-roundtrip   the same eight through pngout.exe
 ```
 
-`--jpeg` now checks the wired decoder, not just the corpus: 33 cases
-(grey/444/422/420 × flat/ramp/grey/checker × restart 0/2, plus 16-bit DQT)
+`--jpeg` now checks the wired decoder, not just the corpus: 34 cases
+(grey/444/422/420 × flat/ramp/grey/checker × restart 0/2, plus 16-bit DQT,
+plus `largeq`, a hand-crafted 16-bit-DQT file with values above 250 that pins
+the `T0[128..511]` flat-top boundary: DC=15 decodes white, not black, and
+DC=7 with Q=584/586 pins the flip at index 511 white against 512 black)
 decode to pixels, asserted against ImageMagick within per-file bounds that
 measure IM's own distance from the original (the C output itself is
 bit-exact vs the original binary on the whole corpus, worst 0 - verified

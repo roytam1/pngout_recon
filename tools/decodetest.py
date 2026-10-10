@@ -1695,12 +1695,14 @@ def jpeg_cases():
             for restart in (0, 2):
                 out.append((name, comps, restart, 8))
     out.append(("ramp", "444", 0, 16))
+    out.append(("largeq", "grey", 0, 16))
     return out
 
 
 def run_jpeg(case):
     """
-    The JPEG front end, entropy body, IDCT and h=1 colour output are wired,
+    The JPEG decoder is wired (front end, entropy body including restart,
+    IDCT, h=1 and subsampled colour output, progressive merge),
     so working layouts check PIXELS against ImageMagick (the suite's only
     third-party JPEG decoder): dumpdec must decode to within per-file bounds
     tight enough to rule out garbage but honest about known edges (partial-MCU
@@ -1709,16 +1711,17 @@ def run_jpeg(case):
     externally, worst 0); the IM bounds below only measure IM's own
     conversion/filtering distance from the original (not our error), so
     high-contrast subsampled cases carry loose bounds (IM upsamples with a
-    filter, the original point-replicates).  Unsupported layouts
-    (subsampled h=2, single-component restart) must refuse
+    filter, the original point-replicates).  Every corpus layout must decode;
+    genuinely unsupported input (subset scans, DRI+progressive, corrupt
+    streams - none in the corpus) must refuse
     cleanly ("DecodeImage refused") rather than crash or half-decode.
-    (Progressive used to be in that list; it now decodes - see
-    run_jpeg_progressive.)
     Part 1 (jpeglib roundtrip) is unchanged sanity that the corpus is legal.
     """
     import jpeglib
 
     name, comps, restart, precision = case
+    if name == "largeq":
+        return run_jpeg_largeq()
     w, h = 17, 9
     rgb = jpeg_sources(w, h)[name]
     if comps == "grey" and name != "grey":
@@ -1748,8 +1751,9 @@ def run_jpeg(case):
     if bound is not None and worst > bound:
         return "%-22s re-read differs by %d (bound %d)" % (name, worst, bound)
 
-    # 2. the C decoder.  Working layouts ((name, comps, restart, precision)
-    #    below) must decode; unsupported ones must refuse cleanly.
+    # 2. the C decoder.  Every corpus layout ((name, comps, restart,
+    #    precision) below) must decode; the refuse arm after it is for
+    #    genuinely unsupported input, of which the corpus has none left.
     #    Tight bounds exclude only the (16,8) corner partial-MCU pixel (padding
     #    block; grey_grey carries a white corner at 85, hence its own loose
     #    corner bound - faithful padding behaviour, still far from garbage).
@@ -1839,9 +1843,10 @@ def run_jpeg(case):
     else:
         if os.path.exists(dst):
             return "%-22s pngout.exe wrote a PNG; expected a refusal" % name
-        # The front end still returns -1 here, so pngout reports
-        # "unsupported format" (h=2/progressive/subset scans all fall
-        # through).  Either refusal message is clean.
+        # Nothing in the corpus takes this arm any more (every layout
+        # decodes); it stays for genuinely unsupported input (subset scans,
+        # DRI+progressive, exotic sampling), which must refuse cleanly.
+        # Either refusal message is clean.
         out = (r.stdout + r.stderr).decode("latin1")
         if r.returncode == 0 or ("not been reconstructed" not in out
                                  and "unsupported format" not in out):
@@ -1911,6 +1916,8 @@ def run_jpeg_im(case):
     import jpeglib
 
     name, comps, restart, precision = case
+    if name == "largeq":
+        return run_jpeg_largeq()
     conv = _im_convert()
     if conv is None:
         return "%-22s skipped (no ImageMagick)" % name
@@ -2023,6 +2030,105 @@ def run_jpeg_progressive():
         return "j-progressive        pngout.exe wrote nothing; expected a PNG"
     return ("j-progressive        ok  (SOF2, %d scans, C-vs-IM %d of 10)"
             % (data.count(b"\xff\xda"), worst))
+
+
+def run_jpeg_largeq():
+    """
+    A 16-bit-DQT file no real encoder emits, which is exactly why it is
+    here: with quantisation values above ~250 a large DC lands the colour
+    index in T0[448..511], and that range is white (255) only when the
+    `rep stosd` pair in sub_40C580 is read with its real addresses -
+    unk_18DFA88 is T0+0x200 (index 128) and unk_18E0088 is T0+0x800
+    (index 512), each 0x180 dwords, so the fills are [128..511] and
+    [512..895] with no overlap.  Read as [128..447]/[448..831] the same
+    file decodes black.  DC=15 with STD_Q+256 (index 510) is the witness:
+    standard white, old code black.  The small-Q control (same DC, normal
+    table) pins the harness itself: DC=15 there is grey 158.  Two more
+    files pin the flip exactly against the listing (not the standard, which
+    clips both to white): DC=7 with Q=584 lands index 511 (white)
+    and with Q=586 index 512 (black).
+    """
+    import jpeglib
+    import struct as _st
+
+    def segment(marker, body):
+        return (bytes([0xFF, marker]) + _st.pack(">H", len(body) + 2)
+                + body)
+
+    def write_dc(path, quant, diff):
+        cat = 0
+        mag = abs(diff)
+        while mag:
+            mag >>= 1
+            cat += 1
+        out = bytearray(b"\xFF\xD8")
+        out += segment(0xDB, bytes([(1 << 4) | 0])
+                       + b"".join(_st.pack(">H", quant[jpeglib.ZIGZAG[k]])
+                                  for k in range(64)))
+        out += segment(0xC0, bytes([8]) + _st.pack(">HH", 8, 8)
+                       + bytes([1]) + bytes([1, 0x11, 0]))
+        for tc, th, counts, values in (
+                (0, 0, jpeglib.DC_LUMA_COUNTS, jpeglib.DC_LUMA_VALUES),
+                (1, 0, jpeglib.AC_LUMA_COUNTS, jpeglib.AC_LUMA_VALUES)):
+            out += segment(0xC4, bytes([(tc << 4) | th]) + bytes(counts)
+                           + bytes(values))
+        out += segment(0xDA, bytes([1, 1, 0x00, 0, 63, 0]))
+        bits = jpeglib.Bits()
+        dcc = jpeglib.huff_codes(jpeglib.DC_LUMA_COUNTS,
+                                 jpeglib.DC_LUMA_VALUES)
+        acc = jpeglib.huff_codes(jpeglib.AC_LUMA_COUNTS,
+                                 jpeglib.AC_LUMA_VALUES)
+        code, length = dcc[cat]
+        bits.put(code, length)
+        if cat:
+            bits.put(diff if diff > 0 else diff + (1 << cat) - 1, cat)
+        code, length = acc[0x00]              # EOB: no AC
+        bits.put(code, length)
+        out += bits.flush() + b"\xFF\xD9"
+        with open(path, "wb") as fh:
+            fh.write(bytes(out))
+
+    def check(path, want):
+        r = subprocess.run([DUMPDEC, path], stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE)
+        if r.returncode != 0:
+            return None, "dumpdec refused it"
+        n = (len(r.stdout) - 8) // 4
+        got = _st.unpack("<%dI" % n, r.stdout[8:8 + n * 4])
+        if len(got) != 64 or any(v != want for v in got):
+            bad = sum(1 for v in got if v != want)
+            return None, "%d/64 pixels differ from %08X" % (bad, want)
+        return len(got), None
+
+    qlarge = [q + 256 for q in jpeglib.QUANT_LUMA]
+    big = os.path.join(BUILD, "dt_j_largeq_16.jpg")
+    write_dc(big, qlarge, 15)
+    try:
+        gw, gh, _ = jpeglib.read_jpeg(big)
+    except Exception as exc:                       # noqa: BLE001
+        return "largeq                  not decodable: %s" % exc
+    if (gw, gh) != (8, 8):
+        return "largeq                  wrong size %dx%d" % (gw, gh)
+    _, err = check(big, 0xFFFFFFFF)
+    if err is not None:
+        return "largeq                  large-Q DC15 %s" % err
+    small = os.path.join(BUILD, "dt_j_largeq_8.jpg")
+    write_dc(small, list(jpeglib.QUANT_LUMA), 15)
+    _, err = check(small, 0xFF9E9E9E)
+    if err is not None:
+        return "largeq                  small-Q DC15 %s" % err
+    # the flip itself: index 511 must be white, 512 black
+    for qdc, want, tag in ((584, 0xFFFFFFFF, "idx511"),
+                           (586, 0xFF000000, "idx512")):
+        q = list(jpeglib.QUANT_LUMA)
+        q[0] = qdc
+        edge = os.path.join(BUILD, "dt_j_largeq_%s.jpg" % tag)
+        write_dc(edge, q, 7)
+        _, err = check(edge, want)
+        if err is not None:
+            return "largeq                  DC7 Q%d %s" % (qdc, err)
+    return ("largeq                  ok  (8x8 grey: DC15 q16 white, "
+            "q8 grey 158; DC7 Q584 white, Q586 black)")
 
 
 # ------------------------------------------------------------------ DDS

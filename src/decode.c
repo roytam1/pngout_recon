@@ -2882,14 +2882,14 @@ static void JpegIdct(int *a1, unsigned a2)
         } while ((unsigned)v19 < v47);
     }
 }
-/* Sequential entropy decode to integer coefficients, for verification.
- * Not called in production (DecodeJpeg still returns -1); exercised via
- * JPEGDEBUG dumps compared against the Python reference bit-for-bit.
- * Covers interleaved and non-interleaved sequential scans without restart;
- * restart/progressive fall back to -1 until those paths land.
+/* Sequential entropy decode to integer coefficients, then IDCT into
+ * `JpegIdctBuf`: the production sequential path (interleaved and
+ * non-interleaved scans, with and without restart - see `JpegDecodeSeq`).
+ * `JPEGDEBUG` dumps (`blk`/`dbl`/`idct`) compare against the Python
+ * reference bit-for-bit.
  */
 /* ------------------------------------------------------------------ */
-/*  JPEG colour tables (exact) + IDCT block buffer (WIP pixels)        */
+/*  JPEG colour tables (exact) + IDCT block buffer (exact pixels)     */
 /* ------------------------------------------------------------------ */
 
 /*
@@ -2922,9 +2922,11 @@ static int JpegTC[JPEG_TBL_N], JpegTD[JPEG_TBL_N];
 static int JpegTabsDone = 0;
 
 /* T0/T1/T2 result tables (verified replica of sub_40C580 outputs,
- * including the 0xFF fill of T0[128..447] and the zero fill of
- * T0[448..831] (`rep stosd` at 40C625/40C636) - the flat top that maps
- * near-white sums to 255.  T1/T2 derive from T0 verbatim (40C665). */
+ * including the 0xFF fill of T0[128..511] and the zero fill of
+ * T0[512..895] (`rep stosd` at 40C625/40C636: unk_18DFA88 is T0+0x200,
+ * i.e. index 128, and unk_18E0088 is T0+0x800, i.e. index 512, each
+ * 0x180 = 384 dwords, so the fills do not overlap) - the flat top that
+ * maps near-white sums to 255.  T1/T2 derive from T0 verbatim (40C665). */
 static int JpegT0[1024], JpegT1[1024], JpegT2[1024];
 static int JpegT0Done = 0;
 
@@ -2939,7 +2941,7 @@ static void JpegMakeT(void)
 
         if (i < 128)
             v = i + 128;
-        else if (i < 448)
+        else if (i < 512)
             v = 255;
         else if (i >= 896)
             v = i - 896;
@@ -3202,7 +3204,7 @@ static int JpegDecodeSeq(const unsigned char *scan, const unsigned char *end,
     return ok ? 0 : -1;
 }
 
-/* Grey + 4:4:4 h=1 sequential output (WIP pixels).
+/* Grey + 4:4:4 h=1 sequential output (exact pixels).
  * Per-MCU blocks from JpegIdctBuf (filled during decode): Y/Cb/Cr via
  * comp index 0/1/2 (grey: comp 0 only, chroma indices 0).  v6/result per
  * pixel from Cb/Cr samples (signed >>19 &~1, any sign).  Equation with
@@ -3906,10 +3908,11 @@ static int DecodeJpeg(const unsigned char *data, int size,
                 unsigned ss = q[0], se = q[1], ahal = q[2];
                 const unsigned char *scan = q + 3;
 
-                /* Sequential, no restart, no refinement: decode to
-                 * coefficients for verification (dumps under JPEGDEBUG),
-                 * then still return -1 - no pixels yet.  Anything else
-                 * (progressive, restart, subset scan) waits for its path. */
+                /* Sequential, no refinement: decode to coefficients
+                 * (dumps under JPEGDEBUG), IDCT into `JpegIdctBuf`, and
+                 * output pixels via the h=1/subsampled paths below.
+                 * Anything else (progressive scans) is handled in the
+                 * `else` arm; restart resyncs inside `JpegDecodeSeq`. */
                 if (ss == 0 && se == 63 && ahal == 0) {
                     if (JpegDecodeSeq(scan, end, JpegWidth, JpegHeight,
 #ifdef JPEGDEBUG
@@ -3918,15 +3921,14 @@ static int DecodeJpeg(const unsigned char *data, int size,
                                       0
 #endif
                                       ) == 0) {
-                        /*
-                         *  h=1 (all 1x1: `408ECD`) then subsampled Y-hs=2
+                        /*  h=1 (all 1x1: `408ECD`) then subsampled Y-hs=2
                          *  (422/420 paired: `408FB3`); disjoint gates, exact
                          *  tables shared (see JpegMakeTables).  Output only on
                          *  full interleaved scans (Ns==NComp); subset scans
                          *  decode their comps correctly (dumps) but have no
                          *  complete image - refuse.  Returns 0 on success;
-                         *  anything else (progressive, 1-comp restart gate,
-                         *  high-freq restart, subset) falls to -1.
+                         *  sampling the output paths decline, and subset
+                         *  scans, fall to -1.
                          */
                         if (JpegScanNs == JpegNComp) {
                             if (JpegOutput444(pixels, pitch, width, height,
@@ -4081,7 +4083,8 @@ static int DecodeJpeg(const unsigned char *data, int size,
         return JpegProgFinish(pixels, pitch, width, height,
                               xorigin, yorigin);
     }
-    return -1;                              /* entropy body not yet */
+    return -1;                  /* subset scans, DRI+progressive and
+                                     anything the output paths decline */
 }
 
 int DecodeImage(unsigned char *fileimg, int filesize, unsigned char *pixels,
@@ -4094,7 +4097,9 @@ int DecodeImage(unsigned char *fileimg, int filesize, unsigned char *pixels,
     /*
      *  sub_409560's dispatch, in its order.  The format codes it returns are
      *  1 PNG, 2 JPEG, 3 GIF, 4 the 8bpp palette below, 5 BMP, 6 PCX, 7 DDS and
-     *  8 Targa; of those 1, 3, 4, 5, 6, 7 and 8 are transcribed (2 parses only).
+     *  8 Targa; all eight are transcribed.  JPEG covers sequential scans
+     *  (with and without restart) and progressive scans; subset scans,
+     *  DRI+progressive and exotic sampling refuse cleanly.
      */
     if (fileimg && filesize >= 2) {
         if (fileimg[0] == 0x89 && fileimg[1] == 'P')
@@ -4143,8 +4148,8 @@ int DecodeImage(unsigned char *fileimg, int filesize, unsigned char *pixels,
     }
 
     printf("\n*** That input format has not been reconstructed yet.\n"
-           "*** This build decodes PNG, GIF, BMP, PCX, Targa, DDS and the 8bpp"
-           " palettised format; see README.md.\n\n");
+           "*** This build decodes PNG, JPEG, GIF, BMP, PCX, Targa, DDS and"
+           " the 8bpp palettised format; see README.md.\n\n");
     exit(3);
     return -1;
 }
