@@ -687,6 +687,13 @@ int BuildDeflateTables(void)
 /*  0x4058A0 */
 int InitBlockTables(void)
 {
+    AllocStepTable();
+#ifdef LZTRACE
+    {
+        extern void LzTraceInit(void);
+        LzTraceInit();
+    }
+#endif
     BuildDeflateTables();
 
     /* per block reset */
@@ -822,7 +829,25 @@ int BuildDistanceSlots(int row)
     }
 
     RankValues(ROWOF(row, ROW_SYMBOLS), ROW_SAMPLE_SYMS, LitCodes);
-    return RankValues(ROWOF(row, ROW_DISTBITS), ROW_DISTSLOTS, DistCodes);
+    {
+        int r = RankValues(ROWOF(row, ROW_DISTBITS), ROW_DISTSLOTS, DistCodes);
+        char *d = getenv("DUMPSLOTS");
+
+        if (d && row == atoi(d)) {
+            int i;
+
+            fprintf(stderr, "[slots] row=%d strategy=%d\n", row,
+                    Image->strategy);
+            fprintf(stderr, "[slots] DistSlots:");
+            for (i = 0; i < 64; i++)
+                fprintf(stderr, " %d", DistSlots[i]);
+            fprintf(stderr, "\n[slots] SlotOrder:");
+            for (i = 0; i < 32; i++)
+                fprintf(stderr, " %d", SlotOrder[i]);
+            fprintf(stderr, "\n");
+        }
+        return r;
+    }
 }
 
 /* ------------------------------------------------------------------ */

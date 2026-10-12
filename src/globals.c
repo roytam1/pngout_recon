@@ -203,7 +203,26 @@ int      MatchStart[32768];             /* 0x6D6670 */
 int      PrevReach;                     /* 0x185BEC8 */
 int      PrevMark;                      /* 0x185BEB8 */
 int      MatchList[0x80000];            /* 0x706B88 */
+#ifdef HEAPSTEP
+unsigned short *StepTable;               /* 0x806B82, but heap allocated */
+void AllocStepTable(void)
+{
+    static int done;
+
+    if (done)
+        return;
+    done = 1;
+    StepTable = (unsigned short *)VirtualAlloc(NULL,
+        (SIZE_T)(LZ_STEPCAP + 260) * 2,
+        MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!StepTable) {
+        fprintf(stderr, "out of memory (step table)\n");
+        ExitProcess(1);
+    }
+}
+#else
 unsigned short StepTable[LZ_STEPCAP + 260]; /* 0x806B82 */
+#endif
 int      BestCost[256];                 /* 0x6D5170 */
 
 /* 0x42E560: the histogram the filter trials fill, 256 dwords */
@@ -215,6 +234,21 @@ int      EntropyLutSize;               /* dword_18CBEE4                        *
 int     (*CheckEscHook)(int);            /* dword_6F6670: polled by the trials  */
 int      MinSample;                      /* dword_185BEC0: darkest sample in the image */
 int      unk_185BEC8, unk_180BA84, unk_185BEB8, unk_411D58, unk_41CEC0;
+#ifdef LZTRACE
+/* the LZTRACE window: which filtered-stream positions get a search trace.
+ * LZLO/LZHI in the environment move it; the default traces nothing. */
+int      LzTraceLo = 0x7FFFFFFF;
+int      LzTraceHi = -1;
+void LzTraceInit(void)
+{
+    char *lo = getenv("LZLO"), *hi = getenv("LZHI");
+
+    if (lo)
+        LzTraceLo = atoi(lo);
+    if (hi)
+        LzTraceHi = atoi(hi);
+}
+#endif
 int      unk_42D7C8;
 unsigned char unk_42E55C;
 

@@ -3504,7 +3504,28 @@ BMP (`sub_40D560`), PCX (`sub_40DAC0`), DDS (`sub_40DD80`) and Targa
 
 ## Verification so far
 
-Three independent checks, all runnable.
+Four independent checks, all runnable.
+
+### tools\libcheck.py - the standalone header
+
+`pngout_decode.h` is `DecodeImage()` and everything it calls as a
+single-header library in the style of stb_image: one translation unit defines
+`PNGOUT_DECODE_IMPLEMENTATION`, every other includes it plain. The decoder
+body is `src/decode.c` verbatim apart from `static` linkage for the
+optimiser's globals, portable 64 bit types, no `exit()` on unknown input,
+and a `pngout_decode()` front end that returns 8-bit RGBA (bytes the decoder
+never stores read 0 rather than heap garbage). `tools\libtest.cmd` builds a
+probe that links nothing else, and `tools\libcheck.py` runs it and
+`dumpdec.exe` over the whole corpus: same acceptance, same size, same
+samples.
+
+```
+tools\libtest.cmd                        build the probe
+tools\libtest.cmd gcc                    ditto with GCC (needs msys64 on PATH)
+python tools\libcheck.py                 all corpus files, both binaries
+set LIBTEST=build\libtest_gcc.exe && python tools\libcheck.py
+                                         same, against the GCC build
+```
 
 ### tools\decodetest.py - decoder verification
 
@@ -3689,25 +3710,63 @@ With all four, the reconstruction is **1,598,722 bytes against the original's
 byte-for-byte on a 640x480 one.
 
 **Open: it is about 6x slower than the original** (858s against 144s on that
-photograph). This is *not* an algorithmic difference: on an image small enough
-to run quickly, the two binaries emit **byte-identical IDAT streams**, so the
-coder does exactly the same work. Instrumenting the coder (`LZSTATS`) shows
-the work is deterministic and identical on every trial - 24.84M positions, 6.84G
-hash-chain steps (275 per position) and 4.56G `LzXtreme` iterations (183 per
-position) - but trial 1 takes 27s and trials 2 onwards 261s each. The step is
-`dword_180BA84`, the step-table cursor: it grows 2.2M -> 4.1M -> 6.1M -> 8.0M
-entries as the codes improve, so the 16 MB step table goes from ~4 MB touched
-(L3) to fully touched, and every `LzXtreme` iteration does one random
-`StepTable[MatchStart[q] + len]` read. 4.56G reads at DRAM latency accounts
-for the 261s almost exactly.
+photograph). The cursor theory below turned out to be wrong, and the real
+mechanism is narrower now but still open; what follows is what measurement
+actually says, so the next attempt does not re-measure it.
 
-Ruled out by measurement rather than by reading: clearing `BestCost` per trial
-left the instruction counters bit-identical, and so did narrowing the hash
-tables to the original's 16 bits; the stepping and retry at
-`0x406A78`-`0x406B9A` matches the listing and Hex-Rays; and the per-trial
-`sub_4058A0` reset is confirmed by the call graph (`sub_405150` calls it once,
-as here). What is left is why the original's cursor grows more slowly, which
-needs a differential trace of the step table rather than a reading of it.
+*The cursor is not the difference.* Sampling the original while it runs
+(`tools\watchmem.c`, reading `dword_180BA84` out of the live process) shows its
+cursor sweeping exactly the same `0..0x7FFF00` range at the same rate - peak
+8,388,387 against the cap's 8,388,352 - so both binaries fill the whole 16 MB
+table over and over. The cursor advances 15.97M entries/s in the original and
+the reconstruction writes within 9% of the same total (~1.0G against ~0.92G
+entries on a half-scale crop), over essentially the same number of positions
+(48.1M against 46.1M, with the same emitted match-length and match-distance
+distributions). The work is the same; each unit of it costs ~4x more here.
+
+*The cost is the step-table reads.* Removing `LzXtreme` drops a 234s run to
+7.6s, so 97% of the time is the match search, and strategy 1 (`LzSimple`,
+which shares no rank/slot/trim logic with Xtreme) is 4.8x slower too - so it is
+the shared step mechanism, `dist += StepTable[MatchStart[q] + len]`, not the
+Xtreme heuristics. Per trial that is 7.24G reads (6.8 per `LzXtreme` iteration,
+99.9% of them in the step loop rather than the restore loop, `rank` 30 in 99%
+of iterations so the search always steps to exhaustion). A sampling profiler
+(`tools\sampler.c`) lands the reconstruction on the instruction after the step
+load and on its dependents, and the original on the hash-chain compare instead
+- same code, same data, different stall.
+
+*It is not the table's size or address.* Rebuilding with `LZ_STEPCAP` cut 16x
+(to 1 MB) leaves the time *and the output bytes* identical, and so does moving
+the table out of `.bss` onto the heap (`/DHEAPSTEP`); forcing the trim
+(`BestCost` to `0x7FFFFFFF` per position) and inflating every `DistSlots` entry
+by 20 change neither time nor output beyond noise. The footprint is a red
+herring: what matters is the *lag* histogram (`/DLZFOOT`), which is bimodal -
+98% of reads land within 256 entries of the position's own base (L1), 2% land
+megabytes behind (DRAM). Those 2% cost on the order of half the run, and
+skipping just them (`/DLAGCUT`, an experiment, not a fix) is 2.8x faster at a
+1.1% size cost - which proves they are both load-bearing for quality and the
+dominant cost. The original must do far fewer of them, i.e. its reads must
+stay near the cursor while ours wander: gross entries written per position
+(~171 here, against ~20 net) spread `MatchStart[]` over megabytes, while the
+same net advance in the original evidently stays compact.
+
+What is left is *why* the read pattern differs when every instruction of the
+search, the reset, the slot builder, the row close and the tables has been
+checked against the listing - which is a differential trace of trial-1 history
+(`BestCost` and the step table persist across trials unreset, in both), not
+another reading. The tools for it are in the tree: `/DLZTRACE` dumps a
+position range's search decisions, `tools\lzdiff.py` diffs two symbol streams
+to the first divergent match, and `tools\snapstate.c` snapshots the small
+search state out of either binary at a chosen `LzScan`.
+
+*Fixed along the way - the strategy-1/2 skip-ahead took the wrong arm.*
+`0x406D7A` is `jle loc_406D9E`: strategy 1 takes the skip loop at once when the
+position is already 258 short of the furthest match, and only otherwise falls
+through to the rowstart check; strategy 2 always takes it. Ours read the middle
+arm as "skip when past the furthest" and never skipped at all for strategy 2,
+so positions that should only have been hash-linked got searched instead. It
+changes neither time nor output on the test images (that fast path needs a
+258+ match ahead, which is rare), but it is what the listing says.
 
 
 **Settled: the residual 1-3 byte differences are tie-break noise, not a

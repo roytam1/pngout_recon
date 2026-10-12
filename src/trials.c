@@ -1400,6 +1400,14 @@ int Optimize(SETTINGS *s)
             LzStatPos = LzStatChain = LzStatXtreme = 0;
         }
 #endif
+#ifdef LZFOOT
+        {
+            static char tag[32];
+            sprintf(tag, "trial%d", trial);
+            FpReport(tag);
+            FpReset();
+        }
+#endif
 
         if (HaveBestTrial)
             break;

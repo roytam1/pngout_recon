@@ -54,12 +54,29 @@
 #define LZ_LISTMASK 0x3FFFF          /* dword_706B88[], 0x40000 entries     */
 #define LZ_STEPMASK 0x7FFF           /* every 32K array is indexed like that */
 #define LZ_MAXDIST  0x8000
+#ifndef LZ_STEPCAP
 #define LZ_STEPCAP  0x7FFF00         /* `cmp eax, offset unk_7FFF00`        */
+#endif
 #define LZ_SCANBACK 0x40000          /* `(pos - rowstart + 260) >= 0x40000` */
 #define LZ_SKIPBACK 260              /* `lea ecx, [esi-104h]`              */
 #define LZ_STARTHACK  30              /* `cmp byte_185BA90[dl], 1Eh`        */
 
 #define LZ_STEPHOPS  258             /* word_806D86 - word_806B82 = 0x204 bytes */
+
+/*
+ *  Every step-table access goes through these two.  They are the whole point
+ *  of /DLZFOOT: the table is 16 MB and the coder's speed is the speed of these
+ *  loads, so the footprint has to be measured rather than argued about.  With
+ *  the define off both expand to the bare subscript.
+ *
+ *  FpRead is handed the lag rather than the index: the lag is the cursor minus
+ *  the read's own index, which is what decides whether the load lands in L1, and
+ *  it has to be taken inside LzXtreme because MatchStart[pos] is not known
+ *  there.  FPBASE sets the reference once per position.
+ */
+#define LzStepRead(q, i) (FPREAD(MatchStart[(q)] + (i) - base), \
+                          StepTable[MatchStart[(q)] + (i)])
+#define LzStepPairRead(k) (FPREAD((k) + 3 - base), LzStepPairAt(k))
 
 /*
  *  sub_406530: the sink FilterByte() points at when a trial really compresses.
@@ -88,6 +105,8 @@ int CompressByte(int byte)
 static void LzSimple(int pos, int savedCost, int cap, int maxlen, int dist)
 {
     int len, end, next, dslot, lslot, cost, q;
+    /* see LzXtreme: the cursor as it stood when this position opened its slot */
+    int base = MatchStart[pos & LZ_STEPMASK];
 
     for (len = 3, end = pos + 3; ; ) {
         LzStepWrite(MatchCount) = (unsigned short)dist;
@@ -122,7 +141,7 @@ static void LzSimple(int pos, int savedCost, int cap, int maxlen, int dist)
             q = (pos - dist) & LZ_STEPMASK;
             if (len - 3 >= MatchReach[q])
                 return;
-            dist += StepTable[MatchStart[q] + len];
+            dist += LzStepRead(q, len);
             if (dist > LZ_MAXDIST)
                 return;
             if (LzByte(pos - dist + len) == next) {
@@ -154,6 +173,9 @@ static void LzSimple(int pos, int savedCost, int cap, int maxlen, int dist)
 static void LzXtreme(int pos, int savedCost, int cap, int maxlen, int dist)
 {
     int len, seen, rank, target, here, saved, cost, end, next, q, t, s;
+    /* the cursor as it stood when this position opened its slot; every read
+     * below is measured against it (see the FPREAD note in pngout.h) */
+    int base = MatchStart[pos & LZ_STEPMASK];
 
     seen = 0;
     rank = 0;
@@ -173,6 +195,12 @@ static void LzXtreme(int pos, int savedCost, int cap, int maxlen, int dist)
          */
         here = DistCodeOf(dist);
         target = DistSlots[here];
+#ifdef LZTRACE
+        if (LZTRACING(pos))
+            fprintf(stderr, "[lx] pos=%d len=%d dist=%d here=%d target=%d "
+                    "savedCost=%d maxlen=%d cap=%d\n",
+                    pos, len, dist, here, target, savedCost, maxlen, cap);
+#endif
 
         if (len - 3 >= seen) {
             LzStepWrite(MatchCount) = (unsigned short)dist;
@@ -186,6 +214,14 @@ static void LzXtreme(int pos, int savedCost, int cap, int maxlen, int dist)
         /* loc_406989: what a match of this length would cost */
         end = pos + len;
         cost = savedCost + DistSlots[LenCodeOf(len)] + target;
+#ifdef LZTRACE
+        if (LZTRACING(pos))
+            fprintf(stderr, "[lx]   cost len=%d dist=%d end=%d cost=%d "
+                    "have=%d cap=%d %s\n",
+                    len, dist, end, cost, MatchCost[end & LZ_COSTMASK], cap,
+                    (cost < MatchCost[end & LZ_COSTMASK] && end <= cap) ?
+                    "SET" : "no");
+#endif
         if (cost < MatchCost[end & LZ_COSTMASK] && end <= cap) {
             if (end > MatchLimit)
                 MatchLimit = end;
@@ -202,7 +238,7 @@ static void LzXtreme(int pos, int savedCost, int cap, int maxlen, int dist)
                 dist += RunLen[(pos - dist) & 0xFFFF];
             q = (pos - dist) & LZ_STEPMASK;
             if (MatchReach[q] > 0xFF) {
-                dist += StepTable[MatchStart[q] + LZ_STEPHOPS];
+                dist += LzStepRead(q, LZ_STEPHOPS);
                 if (dist <= LZ_MAXDIST)
                     continue;
             }
@@ -212,10 +248,16 @@ static void LzXtreme(int pos, int savedCost, int cap, int maxlen, int dist)
         rank = SlotOrder[here];
         next = LzByte(end);
         saved = dist;
+        FPRANK(rank);
 
         for (;;) {
             /* loc_406A22: can the match grow by one more byte here? */
             if (LzByte(pos - dist + len) == next) {
+#ifdef LZTRACE
+                if (LZTRACING(pos))
+                    fprintf(stderr, "[lx]   len %d -> %d at dist %d\n",
+                            len, len + 1, dist);
+#endif
                 len++;
                 break;
             }
@@ -226,7 +268,13 @@ static void LzXtreme(int pos, int savedCost, int cap, int maxlen, int dist)
 
             q = (pos - dist) & LZ_STEPMASK;
             if (len - 3 < MatchReach[q]) {
-                dist += StepTable[MatchStart[q] + len];
+                dist += LzStepRead(q, len);
+                FPSTEP();
+#ifdef LZTRACE
+                if (LZTRACING(pos))
+                    fprintf(stderr, "[lx]   step len=%d dist->%d rank=%d slot=%d\n",
+                            len, dist, rank, DistCodeOf(dist));
+#endif
                 if (dist <= LZ_MAXDIST) {
                     /* loc_406A8D: is there a cheaper slot to land on? */
                     if (rank > DistCodeOf(dist))
@@ -236,13 +284,23 @@ static void LzXtreme(int pos, int savedCost, int cap, int maxlen, int dist)
                     while (SlotOrder[s] <= t)
                         s = SlotOrder[s];
                     target = DistSlots[s];
+#ifdef LZTRACE
+                    if (LZTRACING(pos))
+                        fprintf(stderr, "[lx]   slotwalk s=%d t=%d target=%d\n",
+                                s, t, target);
+#endif
                     goto trim;
                 }
             }
 
             /* loc_406B7D: nothing cheaper in range; keep the rank we had */
-            if (rank >= LZ_STARTHACK)
+            if (rank >= LZ_STARTHACK) {
+#ifdef LZTRACE
+                if (LZTRACING(pos))
+                    fprintf(stderr, "[lx]   exit: rank %d >= 30\n", rank);
+#endif
                 return;
+            }
             target = DistSlots[rank];
 
         trim:
@@ -260,11 +318,22 @@ static void LzXtreme(int pos, int savedCost, int cap, int maxlen, int dist)
 
             /* loc_406B05: and try that shorter length against the rank */
             dist = saved;
+#ifdef LZTRACE
+            if (LZTRACING(pos))
+                fprintf(stderr, "[lx]   trim %d -> rank %d target %d\n",
+                        len, rank, target);
+#endif
             for (;;) {
                 if (len == maxlen) {
                     dist += RunLen[(pos - dist) & 0xFFFF];
-                    if (dist > LZ_MAXDIST)
+                    if (dist > LZ_MAXDIST) {
+#ifdef LZTRACE
+                        if (LZTRACING(pos))
+                            fprintf(stderr, "[lx]   exit: restore dist %d > 32768\n",
+                                    dist);
+#endif
                         return;
+                    }
                     if (DistCodeOf(dist) >= rank) {
                         /*
                          *  loc_406B8E: give up on this distance and start
@@ -278,11 +347,24 @@ static void LzXtreme(int pos, int savedCost, int cap, int maxlen, int dist)
                     }
                 }
                 q = (pos - dist) & LZ_STEPMASK;
-                if (len - 3 >= MatchReach[q])
+                if (len - 3 >= MatchReach[q]) {
+#ifdef LZTRACE
+                    if (LZTRACING(pos))
+                        fprintf(stderr, "[lx]   exit: restore reach %d at q\n",
+                                MatchReach[q]);
+#endif
                     return;
-                dist += StepTable[MatchStart[q] + len];
-                if (dist > LZ_MAXDIST)
+                }
+                dist += LzStepRead(q, len);
+                FPRESTORE();
+                if (dist > LZ_MAXDIST) {
+#ifdef LZTRACE
+                    if (LZTRACING(pos))
+                        fprintf(stderr, "[lx]   exit: restore step to %d\n",
+                                dist);
+#endif
                     return;
+                }
                 if (DistCodeOf(dist) < rank)
                     continue;
                 break;
@@ -318,7 +400,10 @@ int LzCode(const unsigned char *data, int len)
 {
     int writePos, limit, rowend, cap;
     int pos, savedCost, hash, furthest, runEnd, start, dist, prev, word;
-    int reach, left, k, same;
+    int reach, left, k, same, alias;
+#ifdef LZFOOT
+    int chainSteps, base;
+#endif
     int *samples, *lens, *lencnt, *distfreq, *lenbits, *distbits;
 
     /* ---- 0x4065A9: append to the window ---- */
@@ -397,9 +482,15 @@ int LzCode(const unsigned char *data, int len)
         dist = ((pos - prev - 1) & LZ_STEPMASK) + 1;
 
         /* ---- 0x406740: walk the hash chain while the 3 low bytes agree ---- */
+#ifdef LZFOOT
+        chainSteps = 0;
+#endif
         for (;;) {
 #ifdef LZSTATS
             LzStatChain++;
+#endif
+#ifdef LZFOOT
+            chainSteps++;
 #endif
             if (((LzDword(pos - dist) ^ (unsigned)word) & 0xFFFFFF) == 0)
                 break;
@@ -410,22 +501,38 @@ int LzCode(const unsigned char *data, int len)
             }
             dist = ((pos - prev - 1) & LZ_STEPMASK) + 1;
         }
+#ifdef LZFOOT
+        FpChain(chainSteps);
+#endif
 
         if (dist > 0 && pos >= dist) {
             /* loc_40677C: a real candidate */
             int maxlen = RunEnd - pos;
 
+#ifdef LZTRACE
+            if (LZTRACING(pos))
+                fprintf(stderr, "[lx] search pos=%d chainDist=%d maxlen=%d\n",
+                        pos, dist, maxlen);
+#endif
             if (Image->strategy == 0) {
                 LzXtreme(pos, savedCost, cap, maxlen, dist);
             } else {
                 LzSimple(pos, savedCost, cap, maxlen, dist);
             }
+#ifdef LZTRACE
+            if (LZTRACING(pos))
+                fprintf(stderr, "[lx] done pos=%d reach=%d\n",
+                        pos, MatchCount - MatchStart[start]);
+#endif
         }
 
         /* ---- 0x406C02: close this position's slot ---- */
         reach = MatchCount - MatchStart[start];
         MatchReach[start] = reach;
 
+#ifdef LZFOOT
+        base = MatchStart[start];
+#endif
         if (reach <= PrevReach) {
             /*
              *  loc_406C29: the same list of distances as the position before?
@@ -437,15 +544,15 @@ int LzCode(const unsigned char *data, int len)
              */
             same = 1;
             if (reach & 1) {
-                if (StepTable[MatchStart[start] + 3] !=
+                if (LzStepRead(start, 3) !=
                     StepTable[PrevMark + 3 - reach])
                     same = 0;
             }
             if (same) {
                 left = reach & 0xFFFFFFFE;
                 for (k = 0; k < left; k += 2) {
-                    if (LzStepPairAt(MatchCount - left + k) !=
-                        LzStepPairAt(PrevMark - left + k)) {
+                    if (LzStepPairRead(MatchCount - left + k) !=
+                        LzStepPairRead(PrevMark - left + k)) {
                         same = 0;
                         break;
                     }
@@ -455,7 +562,11 @@ int LzCode(const unsigned char *data, int len)
                 MatchCount = PrevMark;
                 MatchStart[start] = PrevMark - reach;
             }
+            alias = same;
+        } else {
+            alias = 0;
         }
+        FPREACH(reach, alias);
 
         PrevMark = MatchCount;
         PrevReach = MatchReach[start];
@@ -499,45 +610,70 @@ int LzCode(const unsigned char *data, int len)
         }
 
         /* ---- 0x406D68: keep scanning, or skip ahead ---- */
-        if (Image->strategy != 2 &&
-            (Image->strategy == 0 || pos + LZ_MAXMATCH > furthest) &&
-            pos - unk_42D7C8 + LZ_SKIPBACK >= LZ_SCANBACK) {
-            /*
-             *  0x406D9E: the match is as long as it can get from here on, so
-             *  everything up to `furthest` only has to go into the hash chains -
-             *  no match list, no costs.
-             */
-            for (k = RunCount; pos < furthest; ) {
-                int h, p, q;
-                unsigned int w;
+        /*
+         *  0x406D68 decides it in three steps, and the shape matters: strategy
+         *  2 always takes the skip loop, strategy 0 skips the distance check
+         *  and goes straight to the rowstart check, and strategy 1 takes the
+         *  skip loop at once when the position is already 258 short of the
+         *  furthest match - `jle loc_406D9E` - and only otherwise falls through
+         *  to the rowstart check.  Reading the middle arm as "skip when past
+         *  the furthest" inverts it: that is exactly when the original does
+         *  *not* take the fast path, and the positions that should have been
+         *  hash-linked get searched instead.
+         */
+        {
+            int takeSkip = 0;
 
-                p = pos & 0xFFFF;
-                MatchCost[pos & LZ_COSTMASK] = 0x7FFFFFFF;
-                w = LzDword(pos);
-                h = (((int)(w >> 12) - (unsigned short)w) & 0xFFF);
+            if (Image->strategy == 2) {
+                takeSkip = 1;
+            } else if (Image->strategy == 0) {
+                if (pos - unk_42D7C8 + LZ_SKIPBACK >= LZ_SCANBACK)
+                    takeSkip = 1;
+            } else {
+                if (pos + LZ_MAXMATCH <= furthest)
+                    takeSkip = 1;
+                else if (pos - unk_42D7C8 + LZ_SKIPBACK >= LZ_SCANBACK)
+                    takeSkip = 1;
+            }
 
-                if (Image->strategy < 3) {
-                    int c = LzByte(pos);
+            if (takeSkip) {
+                /*
+                 *  0x406D9E: the match is as long as it can get from here on, so
+                 *  everything up to `furthest` only has to go into the hash chains -
+                 *  no match list, no costs.
+                 */
+                for (k = RunCount; pos < furthest; ) {
+                    int h, p, q;
+                    unsigned int w;
 
-                    if (c == unk_42E55C) {
-                        k++;
-                        if (k > 0x7FFF)
-                            k = 0x7FFF;
-                    } else {
-                        k = 0;
-                        unk_42E55C = (unsigned char)c;
+                    p = pos & 0xFFFF;
+                    MatchCost[pos & LZ_COSTMASK] = 0x7FFFFFFF;
+                    w = LzDword(pos);
+                    h = (((int)(w >> 12) - (unsigned short)w) & 0xFFF);
+
+                    if (Image->strategy < 3) {
+                        int c = LzByte(pos);
+
+                        if (c == unk_42E55C) {
+                            k++;
+                            if (k > 0x7FFF)
+                                k = 0x7FFF;
+                        } else {
+                            k = 0;
+                            unk_42E55C = (unsigned char)c;
+                        }
+                        RunCount = k;
+                        RunLen[p] = (unsigned short)k;
+                        MatchReach[pos & LZ_STEPMASK] = 0;
+                        PrevReach = 0;
                     }
-                    RunCount = k;
-                    RunLen[p] = (unsigned short)k;
-                    MatchReach[pos & LZ_STEPMASK] = 0;
-                    PrevReach = 0;
-                }
 
-                q = pos & LZ_STEPMASK;
-                DistSlot[q] = HashHead[h];
-                HashHead[h] = q;
-                pos++;
-                LzScan = pos;
+                    q = pos & LZ_STEPMASK;
+                    DistSlot[q] = HashHead[h];
+                    HashHead[h] = q;
+                    pos++;
+                    LzScan = pos;
+                }
             }
         }
 

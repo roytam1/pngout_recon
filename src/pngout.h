@@ -630,8 +630,24 @@ extern int      MatchList[0x80000];   /* 0x706B88: length, then distance    */
  *  entries for word_806D86 is simply wrong.  It is 16MB of .bss that nothing
  *  touches until a block actually gets that big.
  */
+#ifndef LZ_STEPCAP
 #define LZ_STEPCAP    0x7FFF00         /* `cmp eax, offset unk_7FFF00` */
+#endif
+/*
+ *  /DHEAPSTEP allocates the step table with VirtualAlloc instead of taking it
+ *  out of .bss.  The contents and the indices are identical, but the virtual
+ *  address is wherever the allocator puts it rather than wherever the linker
+ *  put it, which is the experiment that says whether the table's *address*
+ *  rather than its *size* is what the coder's memory behaviour turns on.
+ *  StepTable is then a pointer, filled in once by AllocStepTable().
+ */
+#ifdef HEAPSTEP
+extern unsigned short *StepTable;
+void AllocStepTable(void);
+#else
 extern unsigned short StepTable[LZ_STEPCAP + 260];
+#define AllocStepTable() ((void)0)
+#endif
 extern int      BestCost[256];        /* dword_6D5170 */
 #define MatchReach MatchArea          /* 0x6B4968: how far a position's list
                                             is still good for                    */
@@ -681,6 +697,51 @@ int  LzCode(const unsigned char *data, int len);
 void FlushLzCoder(void);
 #ifdef LZSTATS
 extern unsigned __int64 LzStatChain, LzStatXtreme, LzStatPos, LzStatEmit;
+#endif
+
+/*
+ *  /DLZFOOT builds tools\lzfootprint.c, which histograms every touch of the
+ *  step table so the live footprint can be measured rather than guessed at.
+ *  FPWRITE/FPREAD wrap the store and the load; both compile away to nothing
+ *  unless the define is there.
+ */
+#ifdef LZFOOT
+void FpReset(void);
+void FpReport(const char *tag);
+void FpRead(int lag);
+void FpChain(int steps);
+void FpReach(int reach, int aliased);
+void FpStepPart(void);
+void FpRestorePart(void);
+void FpRank(int rank);
+#define FPWRITE(i) ((void)0)
+#define FPREAD(i)  FpRead(i)
+#define FPCHAIN(n) FpChain(n)
+#define FPREACH(r, a) FpReach(r, a)
+#define FPSTEP() FpStepPart()
+#define FPRESTORE() FpRestorePart()
+#define FPRANK(r) FpRank(r)
+#else
+#define FPWRITE(i) ((void)0)
+#define FPREAD(i)  ((void)0)
+#define FPCHAIN(n) ((void)0)
+#define FPREACH(r, a) ((void)0)
+#define FPSTEP() ((void)0)
+#define FPRESTORE() ((void)0)
+#define FPRANK(r) ((void)0)
+#endif
+
+/*
+ *  /DLZTRACE dumps the match search's decisions for one position range, so a
+ *  divergence between the two binaries can be pinned to the exact step that
+ *  caused it.  LZTRACE_LO/HI select the positions (filtered-stream offsets).
+ *  It is only for debugging; it slows the coder to a crawl.
+ */
+#ifdef LZTRACE
+extern int LzTraceLo, LzTraceHi;
+#define LZTRACING(p) ((p) >= LzTraceLo && (p) <= LzTraceHi)
+#else
+#define LZTRACING(p) 0
 #endif
 
 
