@@ -56,10 +56,14 @@ int CheckEsc(int unused)
 {
     (void)unused;
 
+#ifdef NOESC
+    return 0;                     /* measurement: is the console poll the cost? */
+#else
     if (!_kbhit())
         return 0;
 
     return _getch() == 27;
+#endif
 }
 
 /* ------------------------------------------------------------------ */

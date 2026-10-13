@@ -79,7 +79,8 @@ int main(int argc, char **argv)
     long dbgpoll = 0;
     DWORD t0tick = GetTickCount();
     unsigned long a_ms, a_ma, a_rl, a_hh, a_ds2;
-    unsigned long a_slots, a_order, a_best, a_cost, a_img;
+    unsigned long a_slots, a_order, a_best, a_cost, a_img, a_win;
+    char winout[300];
     char tabsout[300];
     char auxout[300];
     char outbase[256];
@@ -166,6 +167,13 @@ int main(int argc, char **argv)
     /* Image record: strategy is at +0x4C, and the first 0x60 bytes
      * are dumped so the whole per-trial header can be diffed. */
     a_img   = EnvAddr("WATCH_IMG",   0x42E960UL);
+    /* LzWindow: the filtered bytes the coder actually searches, 0x10004 */
+    a_win   = EnvAddr("WATCH_WIN",   0x6F6B80UL);
+    winout[0] = 0;
+    if (getenv("DUMPWIN")) {
+        strncpy(winout, getenv("DUMPWIN"), sizeof(winout) - 1);
+        winout[sizeof(winout) - 1] = 0;
+    }
     if (tabsout[0] && !outname)
         dumplen = 0;                      /* tables only: no step text dump */
 
@@ -382,6 +390,29 @@ int main(int argc, char **argv)
                 fclose(tf);
                 fprintf(stderr, "[t] tabs -> %s (scan %lu count %lu)\n",
                         tabsout, scan, count);
+            }
+        }
+        /* the search window itself, in the recon's lzdump_win layout */
+        if (winout[0]) {
+            static unsigned char wbuf[8192];
+            FILE *wf = fopen(winout, "wb");
+            long wtotal = 0x10004;
+
+            if (wf) {
+                while (wtotal > 0) {
+                    long want = wtotal > 8192 ? 8192 : wtotal;
+
+                    if (!ReadProcessMemory(pi.hProcess,
+                               (void *)(ULONG_PTR)(a_win + (0x10004 - wtotal)),
+                               wbuf, (SIZE_T)want, NULL)) {
+                        fprintf(stderr, "[t] window read fail\n");
+                        break;
+                    }
+                    fwrite(wbuf, 1, (size_t)want, wf);
+                    wtotal -= want;
+                }
+                fclose(wf);
+                fprintf(stderr, "[t] window -> %s (scan %lu)\n", winout, scan);
             }
         }
         /* the five work arrays, in the recon's lzdump_aux layout */

@@ -115,6 +115,10 @@ unsigned long DbgSweeps, DbgXstep, DbgXouter;
  * searches that took 2^b..2^(b+1)-1 steps) - measurement only. */
 unsigned long ZxHist[24];
 unsigned long ZxCalls;
+/* how many LzXtreme calls re-search a position that was already searched
+ * (pos != furthest keeps the scan in place while MatchLimit runs ahead) */
+unsigned long ZxResearch;
+static int ZxLastPos = -1;
 /* steps taken by the current LzXtreme call: reset on entry, so the caller
  * does not have to snapshot a running total */
 unsigned long ZxCur;
@@ -502,6 +506,7 @@ void DumpLzState(int pos, int savedCost, int cap, int maxlen, int dist,
     static int posat = 0;
     static long scantrig = -1;
     static int scanfired = 0;
+    static int dumpptrial = -2;
     char txtname[64], stepname[64], winname[64], auxname[64];
     char *e, *n, *c;
     FILE *f;
@@ -539,6 +544,8 @@ void DumpLzState(int pos, int savedCost, int cap, int maxlen, int dist,
         posat = (e ? atoi(e) : 0);
         e = getenv("DUMPSCAN");
         scantrig = (e ? atol(e) : -1);
+        e = getenv("DUMPPOSTRIAL");
+        dumpptrial = (e ? atoi(e) : -1);
     }
     /* Sweep tracking: the cursor wraps to 0 at LZ_STEPCAP.  A big
      * instantaneous drop with the scan still climbing is a wrap (alias
@@ -555,8 +562,9 @@ void DumpLzState(int pos, int savedCost, int cap, int maxlen, int dist,
     /* The two call sites split the triggers: the loop-top call (dist -1,
      * before the chain walk) only honours DUMPCOUNT, the post-chain call
      * only DUMPPOS.  Otherwise DUMPPOS dumps would carry no search inputs. */
-    byPos = (!atTop && pos == dumppos) ||
-            (atTop && posat && pos == dumppos);
+    byPos = ((!atTop && pos == dumppos) ||
+             (atTop && posat && pos == dumppos)) &&
+            (dumpptrial < 0 || trialnow == dumpptrial);
     byCount = (atTop && listn > 0 && listi < listn && trialnow == dumptrial &&
                sweeps == dumpsweep && MatchCount >= dumplist[listi]);
     /* DUMPSCAN: the loop-top trigger by scan position, gated on the trial, so
@@ -875,6 +883,11 @@ int LzCode(const unsigned char *data, int len)
             zbefore = ZxStep;
 #endif
             if (Image->strategy == 0) {
+#if defined ZTIME || defined PHASE || defined DUMPSTATE
+                if (pos == ZxLastPos)
+                    ZxResearch++;
+                ZxLastPos = pos;
+#endif
                 LzXtreme(pos, savedCost, cap, maxlen, dist);
 #if defined ZTIME || defined PHASE || defined DUMPSTATE
                 {
@@ -886,6 +899,12 @@ int LzCode(const unsigned char *data, int len)
                         b++;
                     ZxHist[b]++;
                     ZxCalls++;
+#ifdef DUMPSTATE
+                    if ((ZxCalls % 10000000UL) == 0)
+                        fprintf(stderr, "[rs] calls=%lu research=%lu (%.1f%%)\n",
+                                ZxCalls, ZxResearch,
+                                100.0 * (double)ZxResearch / (double)ZxCalls);
+#endif
 #ifdef DUMPSTATE
                     /* LZMINSTEPS: report the positions of the long searches,
                      * which is where the step-loop time actually goes. */
@@ -899,8 +918,8 @@ int LzCode(const unsigned char *data, int len)
                         }
                         if (minsteps && (long)d0 >= minsteps) {
                             LzMinPos = LzScan;
-                            fprintf(stderr, "[long] pos=%d steps=%lu\n", pos,
-                                    d0);
+                            fprintf(stderr, "[long] trial=%d pos=%d steps=%lu\n",
+                                    (Image ? Image->trial : -1), pos, d0);
                         }
                     }
 #endif
