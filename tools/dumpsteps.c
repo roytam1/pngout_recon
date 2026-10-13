@@ -80,6 +80,7 @@ int main(int argc, char **argv)
     DWORD t0tick = GetTickCount();
     unsigned long a_ms, a_ma, a_rl, a_hh, a_ds2;
     unsigned long a_slots, a_order, a_best, a_cost, a_img, a_win;
+    unsigned long a_lzw, a_runend, a_mlim, a_rowidx;
     char winout[300];
     char tabsout[300];
     char auxout[300];
@@ -167,6 +168,13 @@ int main(int argc, char **argv)
     /* Image record: strategy is at +0x4C, and the first 0x60 bytes
      * are dumped so the whole per-trial header can be diffed. */
     a_img   = EnvAddr("WATCH_IMG",   0x42E960UL);
+    /* LzWrite and RunEnd: the forward slack (cap) and the run extent
+     * (maxlen) that bound every match.  If these differ, the searches
+     * differ even when every table matches. */
+    a_lzw   = EnvAddr("WATCH_LZW",   0x6D4968UL);
+    a_runend = EnvAddr("WATCH_RUNEND", 0x41CEC0UL);
+    a_mlim  = EnvAddr("WATCH_MLIM",  0x412668UL);   /* MatchLimit */
+    a_rowidx = EnvAddr("WATCH_ROWIDX", 0x42D7CCUL); /* RowIndex */
     /* LzWindow: the filtered bytes the coder actually searches, 0x10004 */
     a_win   = EnvAddr("WATCH_WIN",   0x6F6B80UL);
     winout[0] = 0;
@@ -386,6 +394,18 @@ int main(int argc, char **argv)
                     if (ReadProcessMemory(pi.hProcess,
                                           (void *)(ULONG_PTR)ip, tbuf, 0x60, NULL))
                         fwrite(tbuf, 4, 0x18, tf);
+                if (ReadProcessMemory(pi.hProcess, (void *)(ULONG_PTR)a_lzw,
+                                      tbuf, 4, NULL))
+                    fwrite(tbuf, 4, 1, tf);
+                if (ReadProcessMemory(pi.hProcess, (void *)(ULONG_PTR)a_runend,
+                                      tbuf, 4, NULL))
+                    fwrite(tbuf, 4, 1, tf);
+                if (ReadProcessMemory(pi.hProcess, (void *)(ULONG_PTR)a_mlim,
+                                      tbuf, 4, NULL))
+                    fwrite(tbuf, 4, 1, tf);
+                if (ReadProcessMemory(pi.hProcess, (void *)(ULONG_PTR)a_rowidx,
+                                      tbuf, 4, NULL))
+                    fwrite(tbuf, 4, 1, tf);
                 }
                 fclose(tf);
                 fprintf(stderr, "[t] tabs -> %s (scan %lu count %lu)\n",

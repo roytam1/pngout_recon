@@ -115,6 +115,8 @@ unsigned long DbgSweeps, DbgXstep, DbgXouter;
  * searches that took 2^b..2^(b+1)-1 steps) - measurement only. */
 unsigned long ZxHist[24];
 unsigned long ZxCalls;
+/* how often the restore-dist path fires (len==maxlen, slot>=rank) */
+unsigned long ZxDistBase;
 /* how many LzXtreme calls re-search a position that was already searched
  * (pos != furthest keeps the scan in place while MatchLimit runs ahead) */
 unsigned long ZxResearch;
@@ -414,6 +416,9 @@ static void LzXtreme(int pos, int savedCost, int cap, int maxlen, int dist)
                         return;
                     }
                     if (DistCodeOf(dist) >= rank) {
+#if defined ZTIME || defined PHASE || defined DUMPSTATE
+                        ZxDistBase++;
+#endif
                         /*
                          *  loc_406B8E: give up on this distance and start
                          *  again from the base of the code `rank` names.  It
@@ -901,9 +906,10 @@ int LzCode(const unsigned char *data, int len)
                     ZxCalls++;
 #ifdef DUMPSTATE
                     if ((ZxCalls % 10000000UL) == 0)
-                        fprintf(stderr, "[rs] calls=%lu research=%lu (%.1f%%)\n",
+                        fprintf(stderr, "[rs] calls=%lu research=%lu (%.1f%%) distbase=%lu\n",
                                 ZxCalls, ZxResearch,
-                                100.0 * (double)ZxResearch / (double)ZxCalls);
+                                100.0 * (double)ZxResearch / (double)ZxCalls,
+                                ZxDistBase);
 #endif
 #ifdef DUMPSTATE
                     /* LZMINSTEPS: report the positions of the long searches,
