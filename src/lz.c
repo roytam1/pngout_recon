@@ -46,6 +46,9 @@
  */
 
 #include <stdio.h>
+#ifdef DUMPSTATE
+#include <stdlib.h>
+#endif
 #include "pngout.h"
 
 /* ---- the geometry, straight out of the immediates in the listing ---- */
@@ -102,6 +105,14 @@ int CompressByte(int byte)
  *  keeps it if it beats what is already there.  Then it either extends the
  *  match by a byte or steps the distance forward and tries again.
  */
+#if defined ZTIME || defined PHASE
+unsigned __int64 ZxOuter, ZxStep, ZxRestore, ZxTrim, ZxRank;
+unsigned __int64 ZxStepC;
+unsigned long DbgSweeps, DbgXstep, DbgXouter;
+#else
+#define ZCOUNT(x) ((void)0)
+#endif
+
 static void LzSimple(int pos, int savedCost, int cap, int maxlen, int dist)
 {
     int len, end, next, dslot, lslot, cost, q;
@@ -110,6 +121,11 @@ static void LzSimple(int pos, int savedCost, int cap, int maxlen, int dist)
 
     for (len = 3, end = pos + 3; ; ) {
         LzStepWrite(MatchCount) = (unsigned short)dist;
+#ifdef LZTRACE
+        if (RECLOGGING(MatchCount))
+            fprintf(stderr, "[rec] entry=%d pos=%d len=%d dist=%d\n",
+                    MatchCount, pos, len, dist);
+#endif
         MatchCount++;
 
         dslot = DistCodeOf(dist);
@@ -177,6 +193,10 @@ static void LzXtreme(int pos, int savedCost, int cap, int maxlen, int dist)
      * below is measured against it (see the FPREAD note in pngout.h) */
     int base = MatchStart[pos & LZ_STEPMASK];
 
+#ifdef ZTIME
+    ZxStepC++;
+#endif
+    HIRESET();
     seen = 0;
     rank = 0;
     saved = dist;
@@ -185,6 +205,9 @@ static void LzXtreme(int pos, int savedCost, int cap, int maxlen, int dist)
     next = 0;
 
     for (len = 3; ; ) {
+#if defined ZTIME || defined PHASE
+        ZxOuter++;
+#endif
 #ifdef LZSTATS
         LzStatXtreme++;
 #endif
@@ -204,6 +227,11 @@ static void LzXtreme(int pos, int savedCost, int cap, int maxlen, int dist)
 
         if (len - 3 >= seen) {
             LzStepWrite(MatchCount) = (unsigned short)dist;
+#ifdef LZTRACE
+            if (RECLOGGING(MatchCount))
+                fprintf(stderr, "[rec] entry=%d pos=%d len=%d dist=%d\n",
+                        MatchCount, pos, len, dist);
+#endif
             MatchCount++;
             seen++;
             BestCost[len - 3] = target;
@@ -239,6 +267,7 @@ static void LzXtreme(int pos, int savedCost, int cap, int maxlen, int dist)
             q = (pos - dist) & LZ_STEPMASK;
             if (MatchReach[q] > 0xFF) {
                 dist += LzStepRead(q, LZ_STEPHOPS);
+                HICOUNT();
                 if (dist <= LZ_MAXDIST)
                     continue;
             }
@@ -268,8 +297,12 @@ static void LzXtreme(int pos, int savedCost, int cap, int maxlen, int dist)
 
             q = (pos - dist) & LZ_STEPMASK;
             if (len - 3 < MatchReach[q]) {
+#if defined ZTIME || defined PHASE
+                ZxStep++;
+#endif
                 dist += LzStepRead(q, len);
                 FPSTEP();
+                HICOUNT();
 #ifdef LZTRACE
                 if (LZTRACING(pos))
                     fprintf(stderr, "[lx]   step len=%d dist->%d rank=%d slot=%d\n",
@@ -281,8 +314,12 @@ static void LzXtreme(int pos, int savedCost, int cap, int maxlen, int dist)
                         continue;
                     s = rank;
                     t = DistCodeOf(dist);
-                    while (SlotOrder[s] <= t)
+                    while (SlotOrder[s] <= t) {
+#ifdef ZTIME
+                        ZxRank++;
+#endif
                         s = SlotOrder[s];
+                    }
                     target = DistSlots[s];
 #ifdef LZTRACE
                     if (LZTRACING(pos))
@@ -311,10 +348,18 @@ static void LzXtreme(int pos, int savedCost, int cap, int maxlen, int dist)
              *  they read BestCost at len-6 and len-4 - BestCost is indexed by
              *  len-3 everywhere else.
              */
-            while (len > 5 && BestCost[len - 6] > target)
+            while (len > 5 && BestCost[len - 6] > target) {
+#ifdef ZTIME
+                ZxTrim++;
+#endif
                 len -= 3;
-            while (len > 3 && BestCost[len - 4] > target)
+            }
+            while (len > 3 && BestCost[len - 4] > target) {
+#ifdef ZTIME
+                ZxTrim++;
+#endif
                 len--;
+            }
 
             /* loc_406B05: and try that shorter length against the rank */
             dist = saved;
@@ -355,8 +400,12 @@ static void LzXtreme(int pos, int savedCost, int cap, int maxlen, int dist)
 #endif
                     return;
                 }
+#ifdef ZTIME
+                ZxRestore++;
+#endif
                 dist += LzStepRead(q, len);
                 FPRESTORE();
+                HICOUNT();
                 if (dist > LZ_MAXDIST) {
 #ifdef LZTRACE
                     if (LZTRACING(pos))
@@ -375,10 +424,215 @@ static void LzXtreme(int pos, int savedCost, int cap, int maxlen, int dist)
 }
 
 /* ------------------------------------------------------------------ */
+/*  /DZTIME: cycle attribution for the position loop                   */
+/* ------------------------------------------------------------------ */
+#ifdef ZTIME
+unsigned __int64 ZtCall, ZtChain, ZtSearch, ZtSkip, ZtRest, ZtPos;
+unsigned __int64 ZtXtre, ZtEmit, ZtLit;
+static unsigned __int64 zt(void)
+{
+    unsigned lo, hi;
+
+    __asm {
+        rdtsc
+        mov lo, eax
+        mov hi, edx
+    }
+    return ((unsigned __int64)hi << 32) | lo;
+}
+#define ZT(x) x
+#else
+#define ZT(x) ((void)0)
+#endif
+
+/* ------------------------------------------------------------------ */
 /*  sub_4065A0                                                         */
 /* ------------------------------------------------------------------ */
 
 void (*LzTraceHook)(int, int, int, int, int, int);
+
+#ifdef DUMPSTATE
+/* ---- DUMPSTATE: frozen search inputs for the offline oracle ---- */
+void DumpLzState(int pos, int savedCost, int cap, int maxlen, int dist,
+                 int atTop)
+{
+    static int hits = 0;
+    static int dumppos = -2;
+    static int dumpnth = 1;
+    static int dumpcount = -2;
+    static int countFired = 0;
+    static int dumptrial = -2;
+    static int dumpsweep = -2;
+    static int sweeps = 1;
+    static int lastcount = 0;
+    static int lasttrial = -9999;
+    static int dumplist[16];
+    static int listn = 0;
+    static int listi = 0;
+    static int posat = 0;
+    static long scantrig = -1;
+    static int scanfired = 0;
+    char txtname[64], stepname[64], winname[64], auxname[64];
+    char *e, *n, *c;
+    FILE *f;
+    int i, q;
+    int byPos, byCount;
+    int trialnow;
+
+    if (dumppos == -2) {
+        e = getenv("DUMPPOS");
+        n = getenv("DUMPNTH");
+        c = getenv("DUMPCOUNT");
+        dumppos = (e ? atoi(e) : -1);
+        dumpnth = (n ? atoi(n) : 1);
+        dumpcount = (c ? atoi(c) : -1);
+        if (dumpnth < 1)
+            dumpnth = 1;
+        /* DUMPCOUNT takes a comma separated list, so one run yields a series
+         * of whole-table images and the first differing one can be bisected
+         * out of them.  A bare number behaves as a one-entry list. */
+        if (c) {
+            char *p = c;
+            while (*p && listn < 16) {
+                dumplist[listn++] = atoi(p);
+                while (*p && *p != ',')
+                    p++;
+                if (*p == ',')
+                    p++;
+            }
+        }
+        e = getenv("DUMPTRIAL");
+        dumptrial = (e ? atoi(e) : 0);
+        e = getenv("DUMPSWEEP");
+        dumpsweep = (e ? atoi(e) : 1);
+        e = getenv("DUMPPOSAT");
+        posat = (e ? atoi(e) : 0);
+        e = getenv("DUMPSCAN");
+        scantrig = (e ? atol(e) : -1);
+    }
+    /* Sweep tracking: the cursor wraps to 0 at LZ_STEPCAP.  A big
+     * instantaneous drop with the scan still climbing is a wrap (alias
+     * rewinds are reach-scale, never 1M); a trial reset restarts the sweep
+     * count instead (Image->trial is authoritative, no pointer hops). */
+    trialnow = (Image ? Image->trial : -999);
+    if (trialnow != lasttrial) {
+        lasttrial = trialnow;
+        sweeps = 1;
+    } else if (MatchCount + 1000000 < lastcount) {
+        sweeps++;
+    }
+    lastcount = MatchCount;
+    /* The two call sites split the triggers: the loop-top call (dist -1,
+     * before the chain walk) only honours DUMPCOUNT, the post-chain call
+     * only DUMPPOS.  Otherwise DUMPPOS dumps would carry no search inputs. */
+    byPos = (!atTop && pos == dumppos) ||
+            (atTop && posat && pos == dumppos);
+    byCount = (atTop && listn > 0 && listi < listn && trialnow == dumptrial &&
+               sweeps == dumpsweep && MatchCount >= dumplist[listi]);
+    /* DUMPSCAN: the loop-top trigger by scan position, gated on the trial, so
+     * a later trial's state can be frozen at a chosen point. */
+    if (atTop && scantrig >= 0 && !scanfired && trialnow == dumptrial &&
+        LzScan > scantrig) {
+        byCount = 1;
+        scanfired = 1;
+    }
+    if (!byPos && !byCount)
+        return;
+    if (atTop) {
+        /* Phase-build cross-check: how much work one trial really did. */
+        extern unsigned long DbgSweeps, DbgXstep, DbgXouter;
+
+        DbgSweeps = (unsigned long)sweeps;
+        DbgXstep = ZxStep;
+        DbgXouter = ZxOuter;
+    }
+    if (byCount) {
+        countFired = ++listi;
+        fprintf(stderr, "[dmp] count=%d pos=%d trial=%d sweep=%d (trigger %d/%d)\n",
+                MatchCount, pos, trialnow, sweeps, listi, listn);
+    }
+    if (byPos) {
+        hits++;
+        if (hits != dumpnth)
+            return;
+    }
+
+    sprintf(txtname, "lzstate_%d.txt", pos);
+    sprintf(stepname, "lzdump_step_%d.bin", pos);
+    sprintf(winname, "lzdump_win_%d.bin", pos);
+    sprintf(auxname, "lzdump_aux_%d.bin", pos);
+    if (countFired > 1) {            /* DUMPCOUNT list: keep the files apart */
+        txtname[strlen(txtname) - 4] = 0;
+        sprintf(txtname + strlen(txtname), "_%d.txt", countFired);
+        stepname[strlen(stepname) - 4] = 0;
+        sprintf(stepname + strlen(stepname), "_%d.bin", countFired);
+        winname[strlen(winname) - 4] = 0;
+        sprintf(winname + strlen(winname), "_%d.bin", countFired);
+        auxname[strlen(auxname) - 4] = 0;
+        sprintf(auxname + strlen(auxname), "_%d.bin", countFired);
+    }
+
+    f = fopen(txtname, "w");
+    if (f) {
+        fprintf(f, "pos=%d savedCost=%d cap=%d maxlen=%d dist=%d\n",
+                pos, savedCost, cap, maxlen, dist);
+        fprintf(f, "scan=%d write=%d count=%d limit=%d strategy=%d row=%d\n",
+                LzScan, LzWrite, MatchCount, MatchLimit,
+                (Image ? Image->strategy : -999), RowIndex);
+        fprintf(f, "trial=%d sweep=%d rowend=%d\n",
+                trialnow, sweeps, ROW_LIMIT(RowIndex));
+        fprintf(f, "prevmark=%d prevreach=%d runcount=%d runend=%d\n",
+                PrevMark, PrevReach, RunCount, RunEnd);
+        fprintf(f, "slots:");
+        for (i = 0; i < 64; i++)
+            fprintf(f, " %d", DistSlots[i]);
+        fprintf(f, "\norder:");
+        for (i = 0; i < 32; i++)
+            fprintf(f, " %u", SlotOrder[i]);
+        fprintf(f, "\nbest:");
+        for (i = 0; i < 256; i++)
+            fprintf(f, " %d", BestCost[i]);
+        fprintf(f, "\ncost:");
+        for (i = 0; i < 512; i++)
+            fprintf(f, " %d", MatchCost[i]);
+        fprintf(f, "\nnear: (q start reach)");
+        for (i = -32; i <= 32; i++) {
+            q = (pos + i) & LZ_STEPMASK;
+            fprintf(f, " [%d %d %d]", (pos + i), MatchStart[q], MatchArea[q]);
+        }
+        fprintf(f, "\naux=%s win=%s step=%s\n", auxname, winname, stepname);
+        fprintf(f, "aux-layout: MatchStart[32768]s32 MatchArea[32768]s32 "
+                "RunLen[65536]u16 HashHead[4096]u16 DistSlot[32768]u16\n");
+        fclose(f);
+    }
+
+    /* DUMPAUXONLY: skip the 16 MB step image (and the window) when only the
+     * work arrays are wanted - the step image dominates the dump cost. */
+    if (getenv("DUMPAUXONLY") == NULL) {
+        f = fopen(stepname, "wb");
+        if (f) {
+            fwrite(StepTable, sizeof(StepTable[0]), LZ_STEPCAP + 260, f);
+            fclose(f);
+        }
+        f = fopen(winname, "wb");
+        if (f) {
+            fwrite(LzWindow, 1, sizeof(LzWindow), f);
+            fclose(f);
+        }
+    }
+    f = fopen(auxname, "wb");
+    if (f) {
+        fwrite(MatchStart, sizeof(MatchStart[0]), 32768, f);
+        fwrite(MatchArea, sizeof(MatchArea[0]), 0x8000, f);
+        fwrite(RunLen, sizeof(RunLen[0]), 65536, f);
+        fwrite(HashHead, sizeof(HashHead[0]), 4096, f);
+        fwrite(DistSlot, sizeof(DistSlot[0]), 32768, f);
+        fclose(f);
+    }
+    fprintf(stderr, "[dumpstate] pos=%d hit=%d wrote %s\n",
+            pos, hits, txtname);
+}
+#endif
 
 #ifdef LZSTATS
 unsigned __int64 LzStatChain, LzStatXtreme, LzStatPos, LzStatEmit;
@@ -401,10 +655,16 @@ int LzCode(const unsigned char *data, int len)
     int writePos, limit, rowend, cap;
     int pos, savedCost, hash, furthest, runEnd, start, dist, prev, word;
     int reach, left, k, same, alias;
+#ifdef ZTIME
+    unsigned __int64 t0, t1, t2, t3, tprev;
+#endif
 #ifdef LZFOOT
     int chainSteps, base;
 #endif
     int *samples, *lens, *lencnt, *distfreq, *lenbits, *distbits;
+#ifdef ZTIME
+    unsigned __int64 tcall0 = zt();
+#endif
 
     /* ---- 0x4065A9: append to the window ---- */
     writePos = LzWrite;
@@ -428,11 +688,58 @@ int LzCode(const unsigned char *data, int len)
     if (LzScan >= limit)
         return 0;
 
+    ZT(tprev = zt());
     while (LzScan < limit) {
+#ifdef ZTIME
+        t0 = zt();
+        ZtPos++;
+        ZtRest += t0 - tprev;
+#endif
         pos = LzScan;
         runEnd = RunEnd;
+#ifdef DUMPSTATE
+        /* DUMPCOUNT sync: dump the moment the cursor first reaches the
+         * target, before this position writes anything (dist -1: the
+         * chain has not been walked yet).  Zero-cost when off. */
+        DumpLzState(pos, MatchCost[pos & LZ_COSTMASK],
+                    cap, runEnd - pos, -1, 1);
+#endif
+#ifdef ZTIME
+        if ((ZtPos & 0x3FFFF) == 0)
+            fprintf(stderr,
+                    "[zt] pos=%I64u xtre=%I64u | per-pos call=%.0f xtre=%.0f "
+                    "chain=%.0f lit=%.0f emit=%.0f | inner per-call: "
+                    "outer=%.1f step=%.1f restore=%.1f trim=%.1f rank=%.1f "
+                    "(c/iter: step=%.0f restore=%.0f trim=%.0f rank=%.0f) "
+                    "scan=%d count=%d\n",
+                    ZtPos, ZtXtre,
+                    (double)ZtCall / (double)ZtPos,
+                    (double)ZtXtre / (double)ZtPos,
+                    (double)ZtChain / (double)ZtPos,
+                    (double)ZtLit / (double)ZtPos,
+                    (double)ZtEmit / (double)ZtPos,
+                    (double)ZxOuter / (double)ZxStepC,
+                    (double)ZxStep / (double)ZxStepC,
+                    (double)ZxRestore / (double)ZxStepC,
+                    (double)ZxTrim / (double)ZxStepC,
+                    (double)ZxRank / (double)ZxStepC,
+                    (double)ZtXtre / (double)(ZxStep + ZxRestore + 1),
+                    (double)ZtXtre / (double)(ZxStep + ZxRestore + 1),
+                    (double)ZtXtre / (double)(ZxTrim + 1),
+                    (double)ZtXtre / (double)(ZxRank + 1),
+                    LzScan, MatchCount);
+#endif
 #ifdef LZSTATS
         LzStatPos++;
+        /* Periodic so a long run can be sampled without waiting for the
+         * end-of-trial line in trials.c. */
+        if ((LzStatPos & 0xFFFFF) == 0)
+            fprintf(stderr,
+                    "[lz] pos=%I64u chain=%I64u xtreme=%I64u scan=%d count=%d "
+                    "chain/pos=%.2f xtreme/pos=%.2f\n",
+                    LzStatPos, LzStatChain, LzStatXtreme, LzScan, MatchCount,
+                    (double)LzStatChain / (double)LzStatPos,
+                    (double)LzStatXtreme / (double)LzStatPos);
 #endif
 
         savedCost = MatchCost[pos & LZ_COSTMASK];
@@ -504,28 +811,54 @@ int LzCode(const unsigned char *data, int len)
 #ifdef LZFOOT
         FpChain(chainSteps);
 #endif
+#ifdef ZTIME
+        t1 = zt();
+        ZtChain += t1 - t0;
+#endif
 
         if (dist > 0 && pos >= dist) {
             /* loc_40677C: a real candidate */
             int maxlen = RunEnd - pos;
 
+#ifdef DUMPSTATE
+            DumpLzState(pos, savedCost, cap, maxlen, dist, 0);
+#endif
 #ifdef LZTRACE
             if (LZTRACING(pos))
                 fprintf(stderr, "[lx] search pos=%d chainDist=%d maxlen=%d\n",
                         pos, dist, maxlen);
 #endif
+#ifdef ZTIME
+            t2 = zt();
+#endif
             if (Image->strategy == 0) {
                 LzXtreme(pos, savedCost, cap, maxlen, dist);
+#ifdef HIREACH
+                if (HiReachReads > 2000 && pos > 500000) {
+                    static int hr2count = 0;
+
+                    if (hr2count < 2) {
+                        fprintf(stderr, "[hr2] pos=%d reads=%d\n", pos,
+                                HiReachReads);
+                        hr2count++;
+                    }
+                }
+#endif
             } else {
                 LzSimple(pos, savedCost, cap, maxlen, dist);
             }
+#ifdef ZTIME
+            ZtXtre += zt() - t2;
+#endif
 #ifdef LZTRACE
             if (LZTRACING(pos))
                 fprintf(stderr, "[lx] done pos=%d reach=%d\n",
                         pos, MatchCount - MatchStart[start]);
 #endif
         }
-
+#ifdef ZTIME
+        t3 = zt();
+#endif
         /* ---- 0x406C02: close this position's slot ---- */
         reach = MatchCount - MatchStart[start];
         MatchReach[start] = reach;
@@ -567,7 +900,20 @@ int LzCode(const unsigned char *data, int len)
             alias = 0;
         }
         FPREACH(reach, alias);
+#ifdef HIREACH
+        if (reach >= 5 && reach <= 12 && pos > 5000 && pos < 8000) {
+            static int hrcount = 0;
 
+            if (hrcount < 2) {
+                fprintf(stderr, "[hr] pos=%d reach=%d\n", pos, reach);
+                hrcount++;
+            }
+        }
+#endif
+
+#ifdef ZTIME
+        t3 = zt();
+#endif
         PrevMark = MatchCount;
         PrevReach = MatchReach[start];
         DistSlot[start] = HashHead[hash];
@@ -610,6 +956,13 @@ int LzCode(const unsigned char *data, int len)
         }
 
         /* ---- 0x406D68: keep scanning, or skip ahead ---- */
+#ifdef ZTIME
+        t2 = zt();
+        ZtSearch += t2 - t1;
+        if (t2 != t3)
+            ZtLit += t2 - t3;
+        t3 = zt();
+#endif
         /*
          *  0x406D68 decides it in three steps, and the shape matters: strategy
          *  2 always takes the skip loop, strategy 0 skips the distance check
@@ -677,6 +1030,9 @@ int LzCode(const unsigned char *data, int len)
             }
         }
 
+#ifdef ZTIME
+        tprev = zt();
+#endif
         if (pos != furthest)
             continue;
 
@@ -728,6 +1084,9 @@ int LzCode(const unsigned char *data, int len)
             lenbits = ROWOF(RowIndex, ROW_LENBITS);
             distbits = ROWOF(RowIndex, ROW_DISTBITS);
 
+#ifdef ZTIME
+            t0 = zt();
+#endif
             /* loc_406ED4: emit them */
             for (; i <= MatchLimit; i++) {
                 int mlen = MatchLenAt(i);
@@ -735,6 +1094,19 @@ int LzCode(const unsigned char *data, int len)
                 if (LzTraceHook)
                     LzTraceHook(i, mlen, MatchValAt(i), furthest, MatchLimit,
                                 unk_42D7C8);
+#ifdef EMITLOG
+                {
+                    /* one line per emitted symbol, so a byte offset from
+                     * tools\lzdiff.py can be turned into a scan position */
+                    extern int EmitMax, EmitCount;
+
+                    if (EmitCount < EmitMax) {
+                        EmitCount++;
+                        fprintf(stderr, "[emit] n=%d i=%d len=%d val=%d limit=%d\n",
+                                EmitCount, i, mlen, MatchValAt(i), MatchLimit);
+                    }
+                }
+#endif
 
                 /*
                  *  Each entry stands for the run of bytes that *ends* at its own
@@ -770,6 +1142,9 @@ int LzCode(const unsigned char *data, int len)
             }
         }
 
+#ifdef ZTIME
+        ZtEmit += zt() - t0;
+#endif
         /* ---- 0x407000: close the row if it is full ---- */
         unk_42D7C8 = LzScan;
         if (LzScan >= ROW_LIMIT(RowIndex)) {
@@ -781,5 +1156,8 @@ int LzCode(const unsigned char *data, int len)
         }
     }
 
+#ifdef ZTIME
+    ZtCall += zt() - tcall0;
+#endif
     return 0;
 }

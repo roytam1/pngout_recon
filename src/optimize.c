@@ -685,9 +685,40 @@ int BuildDeflateTables(void)
 }
 
 /*  0x4058A0 */
+#ifdef PHASE
+/* Coarse phase timing: where a run's wall clock actually goes.  The LZ
+ * position loop is only part of it, and on the big photo the rest dominates. */
+static double ph_t0 = -1.0;
+static unsigned long ph_blocks;
+static double ph_now(void)
+{
+    if (ph_t0 < 0.0)
+        ph_t0 = (double)GetTickCount() / 1000.0;
+    return (double)GetTickCount() / 1000.0 - ph_t0;
+}
+void PhaseMark(const char *what)
+{
+    fprintf(stderr, "[ph] %6.1fs %s\n", ph_now(), what);
+}
+#endif
+
 int InitBlockTables(void)
 {
+#ifdef PHASE
+    ph_blocks++;
+    fprintf(stderr, "[ph] %6.1fs block %lu\n", ph_now(), ph_blocks);
+#endif
     AllocStepTable();
+#ifdef TRACEINIT
+    {
+        static int initcount = 0;
+        char *e = getenv("TRACEINIT");
+
+        if (e)
+            fprintf(stderr, "[init] call %d strategy=%d\n", ++initcount,
+                    Image ? Image->strategy : -999);
+    }
+#endif
 #ifdef LZTRACE
     {
         extern void LzTraceInit(void);

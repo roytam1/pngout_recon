@@ -920,9 +920,24 @@ static void FeedIndexedRow(unsigned char *src)
  *
  *  Returns -1 if ESC was pressed or a filter could not be scored.
  */
+#ifdef PHASE
+double PhFilter, PhFeed, PhRowLoop;
+static double PhNow(void)
+{
+    LARGE_INTEGER f, c;
+
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c);
+    return (double)c.QuadPart / (double)f.QuadPart;
+}
+#endif
+
 static int RunRowLoop(int filtermode, void (*feedrow)(unsigned char *))
 {
     int rowacc = 0, row;
+#ifdef PHASE
+    double t0 = PhNow(), tf = 0.0;
+#endif
 
     for (row = 0; row < Image->height; row++) {
         unsigned char *src =
@@ -931,12 +946,28 @@ static int RunRowLoop(int filtermode, void (*feedrow)(unsigned char *))
         if (RowProgress(rowacc))
             return -1;
 
-        if (ChooseRowFilter(filtermode, row, feedrow))
+#ifdef PHASE
+        { double a = PhNow(); tf = a; }
+#endif
+        if (ChooseRowFilter(filtermode, row, feedrow)) {
+#ifdef PHASE
+            PhFilter += PhNow() - tf;
+#endif
             return -1;
+        }
+#ifdef PHASE
+        { double b = PhNow(); PhFilter += b - tf; tf = b; }
+#endif
 
         feedrow(src);                /* the winning filter, for real this time */
+#ifdef PHASE
+        PhFeed += PhNow() - tf;
+#endif
         rowacc += 100;
     }
+#ifdef PHASE
+    PhRowLoop += PhNow() - t0;
+#endif
 
     return 0;
 }
@@ -1298,6 +1329,13 @@ int Optimize(SETTINGS *s)
                     int b;
 
                     ProgressMsg("Out:\nBlock boundaries: ");
+                #ifdef PHASE
+    {
+        extern void PhaseMark(const char *what);
+
+        PhaseMark("trials done");
+    }
+#endif
                     if (NumBlockList <= 1) {
                         ProgressMsg("none");
                     } else {
@@ -1375,6 +1413,25 @@ int Optimize(SETTINGS *s)
 
         /* ---- loc_40492D: record this trial and decide whether to go on ---- */
 
+#ifdef PHASE
+        {
+            extern void PhaseMark(const char *what);
+            char buf[256];
+
+            {
+                extern int MatchCount;
+                extern unsigned long DbgSweeps, DbgXstep, DbgXouter;
+
+                sprintf(buf,
+                        "trial %d recorded (filter=%.1fs feed=%.1fs rowloop=%.1fs "
+                        "sweeps=%lu count=%d xstep=%lu xouter=%lu)",
+                        Image->trial, PhFilter, PhFeed, PhRowLoop, DbgSweeps,
+                        MatchCount, DbgXstep, DbgXouter);
+            }
+            PhaseMark(buf);
+            PhFilter = PhFeed = PhRowLoop = 0.0;
+        }
+#endif
         Image->trial++;
         trial = Image->trial;
         if (trial <= 0)
@@ -1517,6 +1574,23 @@ int Optimize(SETTINGS *s)
             ProgressMsg("\nEarly ESC! ");
             break;
         }
+#ifdef TRIALCAP
+        {
+            /* /DTRIALCAP + TRIALMAX=n stops after trial n, returning that
+             * trial's bytes as-is.  Debugging only: it bisects trial-level
+             * divergences and makes single-trial runs fast.  The break sits
+             * at the loop bottom so the trial is fully recorded first. */
+            static int trialmax = -2;
+            char *e;
+
+            if (trialmax == -2) {
+                e = getenv("TRIALMAX");
+                trialmax = (e ? atoi(e) : -1);
+            }
+            if (trialmax >= 0 && trial >= trialmax)
+                break;
+        }
+#endif
     }
 
     /*

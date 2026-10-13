@@ -234,23 +234,40 @@ int      EntropyLutSize;               /* dword_18CBEE4                        *
 int     (*CheckEscHook)(int);            /* dword_6F6670: polled by the trials  */
 int      MinSample;                      /* dword_185BEC0: darkest sample in the image */
 int      unk_185BEC8, unk_180BA84, unk_185BEB8, unk_411D58, unk_41CEC0;
+#ifdef HIREACH
+int      HiReachReads = 0;
+#endif
 #ifdef LZTRACE
 /* the LZTRACE window: which filtered-stream positions get a search trace.
  * LZLO/LZHI in the environment move it; the default traces nothing. */
 int      LzTraceLo = 0x7FFFFFFF;
 int      LzTraceHi = -1;
+/* entry-range record log, off by default (empty range). */
+int      RecLo = 0x7FFFFFFF;
+int      RecHi = -1;
 void LzTraceInit(void)
 {
     char *lo = getenv("LZLO"), *hi = getenv("LZHI");
+    char *rlo = getenv("RECLO"), *rhi = getenv("RECHI");
 
     if (lo)
         LzTraceLo = atoi(lo);
     if (hi)
         LzTraceHi = atoi(hi);
+    if (rlo)
+        RecLo = atoi(rlo);
+    if (rhi)
+        RecHi = atoi(rhi);
 }
 #endif
 int      unk_42D7C8;
 unsigned char unk_42E55C;
+#ifdef EMITLOG
+/* EMITMAX: how many emitted symbols to log (tools\lzdiff.py counts them the
+ * same way, so its "symbol N" can be turned into a scan position here). */
+int      EmitMax = 0x7FFFFFFF;
+int      EmitCount;
+#endif
 
 /*
  *  What Optimize() decides once, before the trials: the colour type and bit

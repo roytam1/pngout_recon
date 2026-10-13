@@ -740,8 +740,47 @@ void FpRank(int rank);
 #ifdef LZTRACE
 extern int LzTraceLo, LzTraceHi;
 #define LZTRACING(p) ((p) >= LzTraceLo && (p) <= LzTraceHi)
+/* Entry-range record log: RECLO/RECHI bound step-table *entry indices*
+ * (not positions).  Every LzStepWrite with entry in range prints
+ * `[rec] entry= pos= len= dist='.  Inverts the bisection: given a first
+ * differing entry, it names the exact (pos, len) that wrote it. */
+extern int RecLo, RecHi;
+#define RECLOGGING(k) ((k) >= RecLo && (k) <= RecHi)
 #else
 #define LZTRACING(p) 0
+#define RECLOGGING(k) 0
+#endif
+/*
+ *  /DDUMPSTATE dumps the full LZ search state the Nth time LzScan reaches
+ *  DUMPPOS (DUMPPOS/DUMPNTH from the environment, 1-based), so an independent
+ *  oracle (a Python port of the x64 logic) can re-run the search offline and
+ *  say whether this binary's decisions match correct logic.  External sampling
+ *  cannot sync to an exact position (too fast, jumps via skips); internal
+ *  hooks can.  The call site is after the hash-chain walk, before
+ *  LzXtreme/LzSimple, so dist/maxlen/cap are the search's real inputs.
+ *  Files land beside the binary's cwd: lzstate_<pos>.txt plus the step table
+ *  (lzdump_step_<pos>.bin), the window (lzdump_win_<pos>.bin) and the small
+ *  tables packed in the .txt.  One shot; costs zero when off.
+ *
+ *  DUMPCOUNT=<n> (default -1 = off) fires once when MatchCount first reaches
+ *  n, dumping at the top of the position loop (dist is -1 there: the hash
+ *  chain has not been walked yet).  That syncs a step-table window dump to
+ *  an exact cursor value, which external sampling cannot do on fast runs
+ *  (the cursor crosses 8K entries in <1 ms, a poll cycle is ~50 ms).
+ */
+#ifdef DUMPSTATE
+void DumpLzState(int pos, int savedCost, int cap, int maxlen, int dist,
+                 int atTop);
+#else
+#define DumpLzState(p, s, c, m, d, t) ((void)0)
+#endif
+#ifdef HIREACH
+extern int HiReachReads;
+#define HIRESET() (HiReachReads = 0)
+#define HICOUNT() (HiReachReads++)
+#else
+#define HIRESET() ((void)0)
+#define HICOUNT() ((void)0)
 #endif
 
 

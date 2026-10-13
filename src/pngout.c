@@ -575,6 +575,13 @@ int main(int argc, char **argv, char **envp)
             FilterChoice = trns;
         }
 
+#ifdef PHASE
+    {
+        extern void PhaseMark(const char *what);
+
+        PhaseMark("entering DecodeImage");
+    }
+#endif
         if (DecodeImage(fileimg, insize, s.pixels, s.pitch,
                         (unsigned)s.width, (unsigned)s.height, 0, 0) < 0) {
             Msg("%s unsupported format\n", infilename);
@@ -588,7 +595,14 @@ int main(int argc, char **argv, char **envp)
          *  colour type that really makes it: naming one index and leaving
          *  every other entry opaque still counts as a plain palette.
          */
-        if (fmt == FMT_PNG && trns) {
+        #ifdef PHASE
+    {
+        extern void PhaseMark(const char *what);
+
+        PhaseMark("DecodeImage done");
+    }
+#endif
+if (fmt == FMT_PNG && trns) {
             unsigned char first = trns[0];
             unsigned int   mask = 0;
             int            r;
@@ -706,6 +720,13 @@ int main(int argc, char **argv, char **envp)
 
     /* ---------------- optimise ---------------- */
 
+#ifdef PHASE
+    {
+        extern void PhaseMark(const char *what);
+
+        PhaseMark("decode done, entering Optimize");
+    }
+#endif
     delta = Optimize(&s);
     Msg("\n");
 
