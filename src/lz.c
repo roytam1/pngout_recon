@@ -109,6 +109,11 @@ int CompressByte(int byte)
 unsigned __int64 ZxOuter, ZxStep, ZxRestore, ZxTrim, ZxRank;
 unsigned __int64 ZxStepC;
 unsigned long DbgSweeps, DbgXstep, DbgXouter;
+/* log2 histogram of the step-loop trip count per search: bucket b counts
+ * searches that took 2^b..2^(b+1)-1 steps. */
+unsigned long ZxHist[24];
+unsigned long ZxCalls;
+#define ZCOUNT(x) ((void)(x))
 #else
 #define ZCOUNT(x) ((void)0)
 #endif
@@ -664,6 +669,7 @@ int LzCode(const unsigned char *data, int len)
     int *samples, *lens, *lencnt, *distfreq, *lenbits, *distbits;
 #ifdef ZTIME
     unsigned __int64 tcall0 = zt();
+    unsigned __int64 zbefore;
 #endif
 
     /* ---- 0x4065A9: append to the window ---- */
@@ -711,23 +717,24 @@ int LzCode(const unsigned char *data, int len)
                     "chain=%.0f lit=%.0f emit=%.0f | inner per-call: "
                     "outer=%.1f step=%.1f restore=%.1f trim=%.1f rank=%.1f "
                     "(c/iter: step=%.0f restore=%.0f trim=%.0f rank=%.0f) "
-                    "scan=%d count=%d\n",
+                    "scan=%d count=%d | steps/search log2:",
                     ZtPos, ZtXtre,
                     (double)ZtCall / (double)ZtPos,
                     (double)ZtXtre / (double)ZtPos,
                     (double)ZtChain / (double)ZtPos,
                     (double)ZtLit / (double)ZtPos,
                     (double)ZtEmit / (double)ZtPos,
-                    (double)ZxOuter / (double)ZxStepC,
-                    (double)ZxStep / (double)ZxStepC,
-                    (double)ZxRestore / (double)ZxStepC,
-                    (double)ZxTrim / (double)ZxStepC,
-                    (double)ZxRank / (double)ZxStepC,
-                    (double)ZtXtre / (double)(ZxStep + ZxRestore + 1),
-                    (double)ZtXtre / (double)(ZxStep + ZxRestore + 1),
-                    (double)ZtXtre / (double)(ZxTrim + 1),
-                    (double)ZtXtre / (double)(ZxRank + 1),
-                    LzScan, MatchCount);
+                    (double)ZtRest / (double)ZtPos, LzScan, MatchCount);
+            {
+                int hi2;
+
+                for (hi2 = 0; hi2 < 24; hi2++)
+                    if (ZxHist[hi2])
+                        fprintf(stderr, " 2^%d=%lu(%.1f%%)", hi2, ZxHist[hi2],
+                                100.0 * (double)ZxHist[hi2] /
+                                (double)(ZxCalls ? ZxCalls : 1));
+                fprintf(stderr, "\n");
+            }
 #endif
 #ifdef LZSTATS
         LzStatPos++;
@@ -830,9 +837,21 @@ int LzCode(const unsigned char *data, int len)
 #endif
 #ifdef ZTIME
             t2 = zt();
+            zbefore = ZxStep;
 #endif
             if (Image->strategy == 0) {
                 LzXtreme(pos, savedCost, cap, maxlen, dist);
+#if defined ZTIME || defined PHASE
+                {
+                    unsigned long d = (unsigned long)(ZxStep - zbefore);
+                    int b = 0;
+
+                    while ((d >>= 1) != 0 && b < 23)
+                        b++;
+                    ZxHist[b]++;
+                    ZxCalls++;
+                }
+#endif
 #ifdef HIREACH
                 if (HiReachReads > 2000 && pos > 500000) {
                     static int hr2count = 0;

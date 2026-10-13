@@ -14,7 +14,7 @@ $env:DUMPSCAN = [string]($Pos - 300)
 $env:DUMPAUX = "$T\$Tag`_o.bin"
 cmd /c "$ROOT\build\dumpsteps.exe $ROOT\pngout_original.exe $T\$Tag`_o.png /b0 2> $T\$Tag`_o.log" | Out-Null
 Remove-Item Env:\DUMPSCAN, Env:\DUMPAUX
-$frozen = (Select-String -Path "$T\$Tag`_o.log" -Pattern 'frozen scan=(\d+)' |
+$frozen = (Select-String -Path "$T\$Tag`_o.log" -Pattern 'frozen scan=\d+ stop=(\d+)' |
            Select-Object -First 1).Matches[0].Groups[1].Value
 Write-Host "orig frozen at scan $frozen"
 

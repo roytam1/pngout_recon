@@ -27,7 +27,10 @@ def main(opath, opos, rpath, rpos):
         av = A[nm]
         bv = B[nm]
         if n >= 32768 and n in (32768, 65536):
-            lo = max(ap - n + 1, bp - n + 1)
+            # Clamp to positions both sides have actually written: RunLen is
+            # never reset, so entries for positions before the current one are
+            # stale in one binary and untouched (0) in the other.
+            lo = max(0, ap - n + 1, bp - n + 1)
             hi = min(ap, bp)
             diffs = []
             for p in range(lo, hi + 1):
