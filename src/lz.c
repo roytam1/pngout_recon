@@ -126,6 +126,12 @@ long LzMinPos = 0;
 #define ZCOUNT(x) ((void)0)
 #endif
 
+#ifdef WALKCAP
+/* the current search's step-loop trip count, for the WALKCAP experiment.
+ * Kept outside the ZTIME block so the experiment builds standalone. */
+unsigned long ZxWalkSteps;
+#endif
+
 static void LzSimple(int pos, int savedCost, int cap, int maxlen, int dist)
 {
     int len, end, next, dslot, lslot, cost, q;
@@ -211,6 +217,9 @@ static void LzXtreme(int pos, int savedCost, int cap, int maxlen, int dist)
 #endif
 #if defined ZTIME || defined PHASE || defined DUMPSTATE
     ZxCur = 0;                    /* this call's step-loop trip count */
+#endif
+#ifdef WALKCAP
+    ZxWalkSteps = 0;
 #endif
     HIRESET();
     seen = 0;
@@ -316,6 +325,10 @@ static void LzXtreme(int pos, int savedCost, int cap, int maxlen, int dist)
 #if defined ZTIME || defined PHASE || defined DUMPSTATE
                 ZxStep++;
                 ZxCur++;
+#endif
+#ifdef WALKCAP
+                if ((int)++ZxWalkSteps >= WALKCAP)
+                    return;
 #endif
                 dist += LzStepRead(q, len);
                 FPSTEP();
@@ -619,7 +632,8 @@ void DumpLzState(int pos, int savedCost, int cap, int maxlen, int dist,
         }
         fprintf(f, "\naux=%s win=%s step=%s\n", auxname, winname, stepname);
         fprintf(f, "aux-layout: MatchStart[32768]s32 MatchArea[32768]s32 "
-                "RunLen[65536]u16 HashHead[4096]u16 DistSlot[32768]u16\n");
+                "RunLen[65536]u16 HashHead[4096]u16 DistSlot[32768]u16 "
+                "DistCodeToSlot[32768]u8 LenCodeToSlot[259]u8\n");
         fclose(f);
     }
 
@@ -639,11 +653,16 @@ void DumpLzState(int pos, int savedCost, int cap, int maxlen, int dist,
     }
     f = fopen(auxname, "wb");
     if (f) {
+        extern unsigned char DistCodeToSlot[];
+        extern unsigned char LenCodeToSlotStore[];
         fwrite(MatchStart, sizeof(MatchStart[0]), 32768, f);
         fwrite(MatchArea, sizeof(MatchArea[0]), 0x8000, f);
         fwrite(RunLen, sizeof(RunLen[0]), 65536, f);
         fwrite(HashHead, sizeof(HashHead[0]), 4096, f);
         fwrite(DistSlot, sizeof(DistSlot[0]), 32768, f);
+        /* the static code tables, so the offline oracle can index them too */
+        fwrite(DistCodeToSlot, 1, 32768, f);
+        fwrite(LenCodeToSlotStore, 1, 259, f);
         fclose(f);
     }
     fprintf(stderr, "[dumpstate] pos=%d hit=%d wrote %s\n",
