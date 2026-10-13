@@ -105,14 +105,22 @@ int CompressByte(int byte)
  *  keeps it if it beats what is already there.  Then it either extends the
  *  match by a byte or steps the distance forward and tries again.
  */
-#if defined ZTIME || defined PHASE
+#if defined ZTIME || defined PHASE || defined DUMPSTATE
 unsigned __int64 ZxOuter, ZxStep, ZxRestore, ZxTrim, ZxRank;
 unsigned __int64 ZxStepC;
 unsigned long DbgSweeps, DbgXstep, DbgXouter;
 /* log2 histogram of the step-loop trip count per search: bucket b counts
  * searches that took 2^b..2^(b+1)-1 steps. */
+/* log2 histogram of the step-loop trip count per search (bucket b counts
+ * searches that took 2^b..2^(b+1)-1 steps) - measurement only. */
 unsigned long ZxHist[24];
 unsigned long ZxCalls;
+/* steps taken by the current LzXtreme call: reset on entry, so the caller
+ * does not have to snapshot a running total */
+unsigned long ZxCur;
+/* only report long searches once LzScan is past this, so the early trials
+ * (empty table, no steps at all) do not fill the log */
+long LzMinPos = 0;
 #define ZCOUNT(x) ((void)(x))
 #else
 #define ZCOUNT(x) ((void)0)
@@ -201,6 +209,9 @@ static void LzXtreme(int pos, int savedCost, int cap, int maxlen, int dist)
 #ifdef ZTIME
     ZxStepC++;
 #endif
+#if defined ZTIME || defined PHASE || defined DUMPSTATE
+    ZxCur = 0;                    /* this call's step-loop trip count */
+#endif
     HIRESET();
     seen = 0;
     rank = 0;
@@ -210,7 +221,7 @@ static void LzXtreme(int pos, int savedCost, int cap, int maxlen, int dist)
     next = 0;
 
     for (len = 3; ; ) {
-#if defined ZTIME || defined PHASE
+#if defined ZTIME || defined PHASE || defined DUMPSTATE
         ZxOuter++;
 #endif
 #ifdef LZSTATS
@@ -302,8 +313,9 @@ static void LzXtreme(int pos, int savedCost, int cap, int maxlen, int dist)
 
             q = (pos - dist) & LZ_STEPMASK;
             if (len - 3 < MatchReach[q]) {
-#if defined ZTIME || defined PHASE
+#if defined ZTIME || defined PHASE || defined DUMPSTATE
                 ZxStep++;
+                ZxCur++;
 #endif
                 dist += LzStepRead(q, len);
                 FPSTEP();
@@ -669,6 +681,8 @@ int LzCode(const unsigned char *data, int len)
     int *samples, *lens, *lencnt, *distfreq, *lenbits, *distbits;
 #ifdef ZTIME
     unsigned __int64 tcall0 = zt();
+#endif
+#if defined ZTIME || defined DUMPSTATE
     unsigned __int64 zbefore;
 #endif
 
@@ -838,18 +852,39 @@ int LzCode(const unsigned char *data, int len)
 #ifdef ZTIME
             t2 = zt();
             zbefore = ZxStep;
+#elif defined DUMPSTATE
+            zbefore = ZxStep;
 #endif
             if (Image->strategy == 0) {
                 LzXtreme(pos, savedCost, cap, maxlen, dist);
-#if defined ZTIME || defined PHASE
+#if defined ZTIME || defined PHASE || defined DUMPSTATE
                 {
-                    unsigned long d = (unsigned long)(ZxStep - zbefore);
+                    unsigned long d0 = ZxCur;   /* before the bucket shift */
+                    unsigned long d = d0;
                     int b = 0;
 
                     while ((d >>= 1) != 0 && b < 23)
                         b++;
                     ZxHist[b]++;
                     ZxCalls++;
+#ifdef DUMPSTATE
+                    /* LZMINSTEPS: report the positions of the long searches,
+                     * which is where the step-loop time actually goes. */
+                    {
+                        static long minsteps = -2;
+
+                        if (minsteps == -2) {
+                            char *e = getenv("LZMINSTEPS");
+
+                            minsteps = (e ? atol(e) : 0);
+                        }
+                        if (minsteps && (long)d0 >= minsteps) {
+                            LzMinPos = LzScan;
+                            fprintf(stderr, "[long] pos=%d steps=%lu\n", pos,
+                                    d0);
+                        }
+                    }
+#endif
                 }
 #endif
 #ifdef HIREACH
