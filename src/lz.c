@@ -51,6 +51,19 @@
 #endif
 #include "pngout.h"
 
+/*
+ *  /DLZINLINE: ask VC6 to inline the two search routines into LzCode.  The
+ *  original has them inlined (there is no call to a separate LzXtreme in
+ *  sub_4065A0); the reconstruction's out-of-line copies spill pos/rank/slot
+ *  base to the stack on every step-loop iteration.  Measurement define,
+ *  off by default.
+ */
+#ifdef LZINLINE
+#define LZSEARCH_INLINE __forceinline
+#else
+#define LZSEARCH_INLINE
+#endif
+
 /* ---- the geometry, straight out of the immediates in the listing ---- */
 #define LZ_MAXMATCH 258              /* `cmp esi, 102h`                     */
 #define LZ_COSTMASK 0x1FF            /* dword_412678[], 512 entries         */
@@ -138,7 +151,7 @@ long LzMinPos = 0;
 unsigned long ZxWalkSteps;
 #endif
 
-static void LzSimple(int pos, int savedCost, int cap, int maxlen, int dist)
+static LZSEARCH_INLINE void LzSimple(int pos, int savedCost, int cap, int maxlen, int dist)
 {
     int len, end, next, dslot, lslot, cost, q;
     /* see LzXtreme: the cursor as it stood when this position opened its slot */
@@ -211,7 +224,7 @@ static void LzSimple(int pos, int savedCost, int cap, int maxlen, int dist)
  *    3. when a shorter length is already at least as cheap the search drops
  *       the length rather than emit a match nobody wants.
  */
-static void LzXtreme(int pos, int savedCost, int cap, int maxlen, int dist)
+static LZSEARCH_INLINE void LzXtreme(int pos, int savedCost, int cap, int maxlen, int dist)
 {
     int len, seen, rank, target, here, saved, cost, end, next, q, t, s;
     /* the cursor as it stood when this position opened its slot; every read
@@ -760,17 +773,23 @@ int LzCode(const unsigned char *data, int len)
         if ((ZtPos & 0x3FFFF) == 0)
             fprintf(stderr,
                     "[zt] pos=%I64u xtre=%I64u | per-pos call=%.0f xtre=%.0f "
-                    "chain=%.0f lit=%.0f emit=%.0f | inner per-call: "
-                    "outer=%.1f step=%.1f restore=%.1f trim=%.1f rank=%.1f "
-                    "(c/iter: step=%.0f restore=%.0f trim=%.0f rank=%.0f) "
-                    "scan=%d count=%d | steps/search log2:",
+                    "chain=%.0f lit=%.0f emit=%.0f rest=%.0f search=%.0f "
+                    "| inner per-call: outer=%.1f step=%.1f restore=%.1f "
+                    "trim=%.1f rank=%.1f scan=%d count=%d | steps/search log2:",
                     ZtPos, ZtXtre,
                     (double)ZtCall / (double)ZtPos,
                     (double)ZtXtre / (double)ZtPos,
                     (double)ZtChain / (double)ZtPos,
                     (double)ZtLit / (double)ZtPos,
                     (double)ZtEmit / (double)ZtPos,
-                    (double)ZtRest / (double)ZtPos, LzScan, MatchCount);
+                    (double)ZtRest / (double)ZtPos,
+                    (double)ZtSearch / (double)ZtPos,
+                    (double)ZxOuter / (double)(ZxStepC ? ZxStepC : 1),
+                    (double)ZxStep / (double)(ZxStepC ? ZxStepC : 1),
+                    (double)ZxRestore / (double)(ZxStepC ? ZxStepC : 1),
+                    (double)ZxTrim / (double)(ZxStepC ? ZxStepC : 1),
+                    (double)ZxRank / (double)(ZxStepC ? ZxStepC : 1),
+                    LzScan, MatchCount);
             {
                 int hi2;
 

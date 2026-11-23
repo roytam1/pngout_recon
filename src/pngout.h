@@ -536,7 +536,7 @@ extern int      unk_180A570;      /* dword_180A570: the bit depth to write */
 extern int      unk_185BED0;      /* dword_185BED0: the colour type to write */
 extern int      unk_180B978;      /* dword_180B978: /ks, and the palette length */
 extern int      unk_180B578[MAX_COLORS];   /* dword_180B578, the palette */
-extern int      unk_185BEC8, unk_180BA84, unk_185BEB8, unk_411D58, unk_41CEC0;
+extern int      unk_180BA84;   /* MatchCount - the one real extra global here */
 extern int      unk_42D7C8;
 extern unsigned char unk_42E55C;
 
@@ -654,6 +654,21 @@ extern int      BestCost[256];        /* dword_6D5170 */
 #define MatchCount unk_180BA84
 #define unk_6D4968 LzWrite
 #define unk_6F6B78 LzScan
+
+/*
+ *  These four are the SAME addresses as the live names above - IDA's
+ *  unk_ names in sub_4058A0 are just another view of them.  They were once
+ *  separate .bss objects, so InitBlockTables()' per-block reset cleared the
+ *  shadows while LzCode kept using the live copies.  Trial 0 hid the bug
+ *  (.bss starts at zero); from trial 1 on, RunEnd/RunCount/PrevReach/PrevMark
+ *  carried trial 0's end-of-image values, maxlen became millions instead of
+ *  260, and the step loop walked the whole distance space on every position.
+ *  Make them aliases so the existing reset clears what the coder reads.
+ */
+#define unk_185BEC8 PrevReach
+#define unk_185BEB8 PrevMark
+#define unk_411D58  RunCount
+#define unk_41CEC0  RunEnd
 
 /* one window byte, the dword that starts there, and the saved first dword */
 #define LzByte(i)      (LzWindow[(i) & 0xFFFF])

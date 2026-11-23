@@ -59,21 +59,52 @@ offline oracle; zero-cost when off),
 table). `tools\linkmap.cmd` writes `build\pngout.map` (reconstruction `.bss`
 addresses for the watch tools).
 
-## The speed problem (open, read this before touching `lz.c`)
+## The speed problem (FIXED - root cause below)
 
 Measured with `/b0` on `150650258_p0.png` (8.28 M positions, 4 trials):
 original **144 s** (9 s, then ~45 s per trial), reconstruction **858 s**
 (28 s, then ~225 s per trial). Decode is 0.1 s and filter selection 0.7 s per
-trial, so **96% is `LzCode`**, and inside it ~93% is `LzXtreme`'s step loop. The
-gap is **3.5x even on a cache-resident image** (`1790_still.png`: 36.6 s vs
-128.9 s), so it is not memory-hierarchy bound.
+trial, so **96% is `LzCode`**, and inside it ~93% is `LzXtreme`'s step loop.
+The gap was trial-dependent: trial 0 was only ~3x, trials 1+ were ~5x.
+
+### Root cause and fix
+
+`src/globals.c` declared four of the LZ block variables twice, under both the
+live name and IDA's `unk_` name for the same address:
+
+| address | shadow (reset by `InitBlockTables`) | live (read by `LzCode`) |
+|---|---|---|
+| 0x41CEC0 | `unk_41CEC0` | `RunEnd` |
+| 0x411D58 | `unk_411D58` | `RunCount` |
+| 0x185BEC8 | `unk_185BEC8` | `PrevReach` |
+| 0x185BEB8 | `unk_185BEB8` | `PrevMark` |
+
+The linker gave these four pairs *different* `.bss` addresses, so the per-block
+reset at `src/optimize.c:740-748` cleared the shadows while the coder kept
+reading the live copies. Trial 0 hid the bug (both start zeroed); from trial 1
+on `RunEnd` held trial 0's end-of-image value (~7.56 M), so `maxlen = RunEnd -
+pos` was millions instead of 261, the `len == maxlen` step-loop exits never
+fired, and the record rate jumped from ~9 to ~59 per position. The saved
+`lzstate_89547.txt` (trial 1) shows `runend=7564800 maxlen=7475253 count=5287216`.
+
+Fix: the four `unk_*` names are now macros aliasing the live variables in
+`src/pngout.h`, and the duplicate definitions are gone from `globals.c`.
+`InitBlockTables()`' existing reset now clears what `LzCode` actually reads.
+Measured after the fix, clean side-by-side on `150650258_p0.png` `/b0`:
+original **150.4 s**, reconstruction **156.6 s** (ratio **1.04**); before the
+fix the recon took 858 s. On `1790_still.png`: 45.8 s (was 150 s, original
+36.6 s). Output stayed within the known ~140-byte difference (1,598,717 vs the
+original's 1,598,860). All 30 round-trip cases and the unit tests still pass.
 
 ### RULED OUT - do not re-derive these
 
-* **The work is identical.** Same record rate (9.35 per position, ~77 M records
-  per trial), same mean `MatchArea` reach (256 - every searched position writes
-  the whole length range), same alias rate (96.8% vs 96.0%), same skipped
-  fraction, output size within 138 bytes (the recon is 138 bytes *smaller*).
+* **The work is identical in trial 0** (where all the whole-table comparisons
+  below were made). Same record rate (9.35 per position, ~77 M records per
+  trial), same mean `MatchArea` reach (256 - every searched position writes the
+  whole length range), same alias rate (96.8% vs 96.0%), same skipped fraction,
+  output size within 138 bytes (the recon is 138 bytes *smaller*). Do not extend
+  these claims to trial 1+: the stale-`RunEnd` bug inflated the recon's record
+  rate there to ~59/position until the alias fix above.
 * **The step table is bit-identical in trial 0**: the whole 16.8 MB table was
   dumped and diffed at six cursor checkpoints through sweeps 1 and 2
   (`tools\dumpsteps.exe` `DUMPOUT`/`DUMPCNT`, `tools\stepfull.py`) with zero

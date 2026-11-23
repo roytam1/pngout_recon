@@ -233,7 +233,8 @@ int      EntropyLutSize;               /* dword_18CBEE4                        *
 
 int     (*CheckEscHook)(int);            /* dword_6F6670: polled by the trials  */
 int      MinSample;                      /* dword_185BEC0: darkest sample in the image */
-int      unk_185BEC8, unk_180BA84, unk_185BEB8, unk_411D58, unk_41CEC0;
+int      unk_180BA84;   /* MatchCount; the other four unk_* names are aliases
+                          * of PrevReach/PrevMark/RunCount/RunEnd in pngout.h */
 #ifdef HIREACH
 int      HiReachReads = 0;
 #endif

@@ -3,8 +3,10 @@
  *
  *  0x40B060  CpuFeatures()
  *
- *  Called once, from sub_40AF90(), to decide whether the MMX/SSE2 paths of
- *  the entropy coder may be used.  What it actually computes is:
+ *  Called once, from sub_40AF90() (the length/distance table builder).  The
+ *  original's entire .text contains no MMX or SSE instruction - this CPUID
+ *  result only gates a scalar fallback in the table builder.  What it
+ *  computes is:
  *
  *    flags = CPUID(1).EDX & 0x3FBFFFFF        (drops bits 31, 30 and 22)
  *    if (the 0x80000000 leaf exists) {
@@ -20,9 +22,10 @@
  *  survives the mask untouched.
  *
  *  The caller then tests bit 15, which CPUID(1).EDX leaves reserved and which
- *  reads back as 0 on everything tested, so the SSE2 path is in practice
- *  never taken and PNGOUT always uses its plain MMX code.  That is how the
- *  original behaves; reproduced here rather than "corrected".
+ *  reads back as 0 on everything tested, so this branch never executes.  When
+ *  it does it only sets dword_4110CC = 4 (a table end pointer) and fills a
+ *  513-entry table - there is no SIMD code behind it.  Reproduced here rather
+ *  than "corrected".
  *
  *  Returns 0 when the CPU has no CPUID at all.
  */
