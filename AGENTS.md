@@ -90,10 +90,19 @@ fired, and the record rate jumped from ~9 to ~59 per position. The saved
 Fix: the four `unk_*` names are now macros aliasing the live variables in
 `src/pngout.h`, and the duplicate definitions are gone from `globals.c`.
 `InitBlockTables()`' existing reset now clears what `LzCode` actually reads.
-Measured after the fix, clean side-by-side on `150650258_p0.png` `/b0`:
-original **150.4 s**, reconstruction **156.6 s** (ratio **1.04**); before the
-fix the recon took 858 s. On `1790_still.png`: 45.8 s (was 150 s, original
-36.6 s). Output stayed within the known ~140-byte difference (1,598,717 vs the
+Measured after the fix, clean side-by-side on `150650258_p0.png` `/b0` with
+`/O2`: original **150.4 s**, reconstruction **156.6 s** (ratio **1.04**);
+before the fix the recon took 858 s.
+
+A second, independent win came from compiler flags: `/G6` (schedule for
+Pentium Pro and later) is **17% faster** than `/O2` alone on
+`1790_still.png` (41.3 s -> 34.5 s), and a clean paired run on the big photo
+gave 148.9 s -> 123.9 s (20%), both with byte-identical output. `/Ox` alone
+does not help (42.1 s); `/Ox /G6` is only marginally better than `/O2 /G6`.
+Forcing the two search routines inline (a `/DLZINLINE` experiment) was
+*2.7% slower* and was removed. `build.cmd` and `buildvar.cmd` now use `/G6`.
+
+Output stays within the known ~140-byte difference (1,598,717 vs the
 original's 1,598,860). All 30 round-trip cases and the unit tests still pass.
 
 ### RULED OUT - do not re-derive these

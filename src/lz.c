@@ -51,19 +51,6 @@
 #endif
 #include "pngout.h"
 
-/*
- *  /DLZINLINE: ask VC6 to inline the two search routines into LzCode.  The
- *  original has them inlined (there is no call to a separate LzXtreme in
- *  sub_4065A0); the reconstruction's out-of-line copies spill pos/rank/slot
- *  base to the stack on every step-loop iteration.  Measurement define,
- *  off by default.
- */
-#ifdef LZINLINE
-#define LZSEARCH_INLINE __forceinline
-#else
-#define LZSEARCH_INLINE
-#endif
-
 /* ---- the geometry, straight out of the immediates in the listing ---- */
 #define LZ_MAXMATCH 258              /* `cmp esi, 102h`                     */
 #define LZ_COSTMASK 0x1FF            /* dword_412678[], 512 entries         */
@@ -151,7 +138,7 @@ long LzMinPos = 0;
 unsigned long ZxWalkSteps;
 #endif
 
-static LZSEARCH_INLINE void LzSimple(int pos, int savedCost, int cap, int maxlen, int dist)
+static void LzSimple(int pos, int savedCost, int cap, int maxlen, int dist)
 {
     int len, end, next, dslot, lslot, cost, q;
     /* see LzXtreme: the cursor as it stood when this position opened its slot */
@@ -224,7 +211,7 @@ static LZSEARCH_INLINE void LzSimple(int pos, int savedCost, int cap, int maxlen
  *    3. when a shorter length is already at least as cheap the search drops
  *       the length rather than emit a match nobody wants.
  */
-static LZSEARCH_INLINE void LzXtreme(int pos, int savedCost, int cap, int maxlen, int dist)
+static void LzXtreme(int pos, int savedCost, int cap, int maxlen, int dist)
 {
     int len, seen, rank, target, here, saved, cost, end, next, q, t, s;
     /* the cursor as it stood when this position opened its slot; every read
