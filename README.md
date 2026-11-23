@@ -146,6 +146,11 @@ compares sample by sample against the source, over 30 cases covering all five
 strategies, colour types 0, 2, 3 and 6, all five filters and both block
 splitting modes. See **Verification so far**.
 
+Speed is no longer an open defect: after fixing a trial-boundary state leak
+and switching the build to `/G6`, the reconstruction is ~123-128 s against the
+original's ~147-158 s on `150650258_p0.png` `/b0` (it was 858 s). See
+**Known defects** for the root cause and the measurements.
+
 ### Not yet reconstructed
 
 Nothing decodable: all eight `DecodeImage()` paths are transcribed in
@@ -3705,59 +3710,54 @@ same photograph (`2296x3606`, RGBA in, `/b0`) and comparing sizes and timings.
   never looks past it; only a large file - one IDAT rather than several - shows
   the missing tail. `WriteStored()` already wrote it.
 
-With all four, the reconstruction is **1,598,722 bytes against the original's
-1,598,860** on that photograph (138 bytes *smaller*), and the two agree
-byte-for-byte on a 640x480 one.
+With all four (and the trial-state fix below), the reconstruction is
+**1,598,717 bytes against the original's 1,598,860** on that photograph
+(143 bytes *smaller*), and the two agree byte-for-byte on a 640x480 one.
 
-**Open: it is about 6x slower than the original** (858s against 144s on that
-photograph). The cursor theory below turned out to be wrong, and the real
-mechanism is narrower now but still open; what follows is what measurement
-actually says, so the next attempt does not re-measure it.
+**Fixed - the ~6x slowdown was a trial-boundary state leak, not a search-cost
+difference.** The 858 s against the original's 144 s was measured on that
+photograph with `/b0`, and the gap was trial-dependent: trial 0 took ~28 s
+(against ~9 s), trials 1+ took ~225 s each (against ~45 s). All the
+"same work" comparisons above - the cursor sweep, the ~9 records/position,
+the bit-identical step table, the matched windows - were made in **trial 0**
+only and must not be extended to later trials.
 
-*The cursor is not the difference.* Sampling the original while it runs
-(`tools\watchmem.c`, reading `dword_180BA84` out of the live process) shows its
-cursor sweeping exactly the same `0..0x7FFF00` range at the same rate - peak
-8,388,387 against the cap's 8,388,352 - so both binaries fill the whole 16 MB
-table over and over. The cursor advances 15.97M entries/s in the original and
-the reconstruction writes within 9% of the same total (~1.0G against ~0.92G
-entries on a half-scale crop), over essentially the same number of positions
-(48.1M against 46.1M, with the same emitted match-length and match-distance
-distributions). The work is the same; each unit of it costs ~4x more here.
+`src/globals.c` declared four of the LZ block variables twice: once under the
+live name `LzCode` reads, once under IDA's `unk_` name for the *same* original
+address:
 
-*The cost is the step-table reads.* Removing `LzXtreme` drops a 234s run to
-7.6s, so 97% of the time is the match search, and strategy 1 (`LzSimple`,
-which shares no rank/slot/trim logic with Xtreme) is 4.8x slower too - so it is
-the shared step mechanism, `dist += StepTable[MatchStart[q] + len]`, not the
-Xtreme heuristics. Per trial that is 7.24G reads (6.8 per `LzXtreme` iteration,
-99.9% of them in the step loop rather than the restore loop, `rank` 30 in 99%
-of iterations so the search always steps to exhaustion). A sampling profiler
-(`tools\sampler.c`) lands the reconstruction on the instruction after the step
-load and on its dependents, and the original on the hash-chain compare instead
-- same code, same data, different stall.
+| address | shadow (reset by `InitBlockTables`) | live (read by `LzCode`) |
+|---|---|---|
+| `0x41CEC0` | `unk_41CEC0` | `RunEnd` |
+| `0x411D58` | `unk_411D58` | `RunCount` |
+| `0x185BEC8` | `unk_185BEC8` | `PrevReach` |
+| `0x185BEB8` | `unk_185BEB8` | `PrevMark` |
 
-*It is not the table's size or address.* Rebuilding with `LZ_STEPCAP` cut 16x
-(to 1 MB) leaves the time *and the output bytes* identical, and so does moving
-the table out of `.bss` onto the heap (`/DHEAPSTEP`); forcing the trim
-(`BestCost` to `0x7FFFFFFF` per position) and inflating every `DistSlots` entry
-by 20 change neither time nor output beyond noise. The footprint is a red
-herring: what matters is the *lag* histogram (`/DLZFOOT`), which is bimodal -
-98% of reads land within 256 entries of the position's own base (L1), 2% land
-megabytes behind (DRAM). Those 2% cost on the order of half the run, and
-skipping just them (`/DLAGCUT`, an experiment, not a fix) is 2.8x faster at a
-1.1% size cost - which proves they are both load-bearing for quality and the
-dominant cost. The original must do far fewer of them, i.e. its reads must
-stay near the cursor while ours wander: gross entries written per position
-(~171 here, against ~20 net) spread `MatchStart[]` over megabytes, while the
-same net advance in the original evidently stays compact.
+VC6 linked them as *separate* `.bss` objects (see `build\pngout.map`), so the
+per-block reset at `0x4059E7-0x405A06` cleared only the shadows. Trial 0 hid
+the bug because `.bss` starts zeroed; from trial 1 on `RunEnd` kept trial 0's
+end-of-image value (~7.56 M), so `maxlen = RunEnd - pos` was millions instead
+of 261, the `len == maxlen` exits in the search never fired, and the step loop
+walked the whole 32 K distance space at every position. The record rate went
+from ~9 to ~59 per position. `lzstate_89547.txt` (a saved trial-1 state) shows
+`runend=7564800 maxlen=7475253 count=5287216`. The four `unk_*` names are now
+macros aliasing the live variables, so the existing reset clears what the
+coder actually reads - exactly what the listing does.
 
-What is left is *why* the read pattern differs when every instruction of the
-search, the reset, the slot builder, the row close and the tables has been
-checked against the listing - which is a differential trace of trial-1 history
-(`BestCost` and the step table persist across trials unreset, in both), not
-another reading. The tools for it are in the tree: `/DLZTRACE` dumps a
-position range's search decisions, `tools\lzdiff.py` diffs two symbol streams
-to the first divergent match, and `tools\snapstate.c` snapshots the small
-search state out of either binary at a chosen `LzScan`.
+That alone took the photograph from 858 s to ~156 s (original ~150 s). A
+second, independent 17-20% came from compiler flags: `/G6` (schedule for
+Pentium Pro and later). `tools\build.cmd` now uses `/O2 /G6`; `/Ox` alone does
+not help, and forcing `LzXtreme`/`LzSimple` inline measured 2.7% *slower* and
+was removed. The combined result is ~123-128 s against the original's
+~147-158 s, with byte-identical output across builds. No SIMD is involved:
+the original's `.text` has zero MMX/SSE instructions, and both remaining hot
+loops are dependent-load pointer chains that vectorisation cannot help.
+
+The earlier measurements remain useful as *explanations of the symptom*:
+`LzXtreme` is 97% of the runtime, the step load and its dependents are where
+samples land, and the lag histogram is bimodal because `MatchStart[]` was
+spread over megabytes by the inflated record rate. They were effects of the
+stale `RunEnd`, not an independent cost difference.
 
 *Fixed along the way - the strategy-1/2 skip-ahead took the wrong arm.*
 `0x406D7A` is `jle loc_406D9E`: strategy 1 takes the skip loop at once when the
