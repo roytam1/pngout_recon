@@ -38,18 +38,22 @@
 
 static void CpuidLeaf(unsigned int leaf, unsigned int *regs)
 {
-    unsigned int a, b, c, d;
+    unsigned int a = 0, b = 0, c = 0, d = 0;
 
+#ifdef _M_IX86
     __asm {
         push    ebx
         mov     eax, leaf
-        cpuid
+        /*cpuid*/
+        __emit 0fh
+        __emit 0a2h
         mov     a, eax
         mov     b, ebx
         mov     c, ecx
         mov     d, edx
         pop     ebx
     }
+#endif
     regs[0] = a;
     regs[1] = b;
     regs[2] = c;
@@ -58,15 +62,16 @@ static void CpuidLeaf(unsigned int leaf, unsigned int *regs)
 
 unsigned CpuFeatures(void)
 {
-    unsigned int flags;
-    unsigned int regs[4];
-    unsigned int before, after;
+    unsigned int flags = 0;
+    unsigned int regs[4] = {0};
+    unsigned int before = 0, after = 0;
 
     /*
      *  Toggle EFLAGS.ID and see whether it sticks.  Every CPUID capable
      *  processor leaves the flag settable, so if the read-back is unchanged
      *  there is no CPUID and we give up.
      */
+#ifdef _M_IX86
     __asm {
         pushfd
         pop     eax
@@ -78,6 +83,7 @@ unsigned CpuFeatures(void)
         pop     eax
         mov     after, eax
     }
+#endif
     if (before == after)
         return 0;
 
