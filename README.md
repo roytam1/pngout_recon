@@ -151,13 +151,13 @@ and switching the build to `/G6`, the reconstruction is ~123-128 s against the
 original's ~147-158 s on `150650258_p0.png` `/b0` (it was 858 s). See
 **Known defects** for the root cause and the measurements.
 
-### Not yet reconstructed
+### No missing decoders - deliberate refusals only
 
-Nothing decodable: all eight `DecodeImage()` paths are transcribed in
-`src/decode.c` (see **DecodeImage (0x409560): how it fits together** and
-**Still to do inside DecodeImage** for the deliberate refusals). `src/stubs.c`
-keeps only `_UserMathErrorFunction()`, the MSVC math-error handler the
-startup picks up by name.
+All eight `DecodeImage()` paths are transcribed in `src/decode.c` (see
+**DecodeImage (0x409560): how it fits together** and **Still to do inside
+DecodeImage** for the deliberate refusals). `src/stubs.c` keeps only
+`_UserMathErrorFunction()`, the MSVC math-error handler the startup picks up by
+name. Nothing decodable is left out.
 
 The inflate inside it is verified byte for byte against `zlib`, and `src/decode.c`
 implements the PNG path - chunk walk, bit reader and pump, Huffman, inflate,
@@ -165,7 +165,8 @@ unfilter and row expansion - for colour types 0, 2, 3, 4 and 6 at bit depths 1,
 2, 4 and 8, plus the JPEG (sequential with and without restart, progressive),
 8bpp palettised, GIF, BMP, PCX, DDS and Targa decoders.
 Interlaced PNG input is refused rather than guessed at, as are JPEG subset
-scans, DRI+progressive and exotic sampling.
+scans, DRI+progressive and exotic sampling - these are faithful refusals
+matching the original's `-1` returns, not unimplemented code.
 
 ## Optimize (0x402AD0): how it fits together
 
@@ -3490,7 +3491,7 @@ DXT3, DXT5 and uncompressed32, in two sizes - with the expected pixels computed
 by an independent block decoder in the harness, so the C is checked against the
 formulas rather than against itself.
 
-### Still to do inside DecodeImage
+### Deliberate refusals inside DecodeImage
 
 The chunk walk, the bit reader and its pump, the three Huffman helpers, the
 inflate body, the unfilter and the row expansion are all transcribed and
